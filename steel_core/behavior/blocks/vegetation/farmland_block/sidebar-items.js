@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["MAX_MOISTURE","TRAMPLE_VOLUME_THRESHOLD"],"struct":["FarmlandBlock"]};

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["AddEntityError","EntityMoveError","EntityOwnership","EntityVisibility"],"struct":["ChunkEntityLoadResult","ChunkEntityUnloadStart","EntityEntry","EntityLifecycleChanges","EntityMoveUpdate","EntityTickList","ManagerState","OrderedEntityIds","UnsavedEntityReport","WorldEntityManager"]};

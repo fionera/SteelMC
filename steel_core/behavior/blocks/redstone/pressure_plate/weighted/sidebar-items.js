@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["PRESSED_TIME"],"struct":["WeightedPressurePlateBlock"]};

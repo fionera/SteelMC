@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["double_plant_can_survive","double_plant_update_shape","survival_update_shape","vegetation_can_survive"],"trait":["Vegetation"]};

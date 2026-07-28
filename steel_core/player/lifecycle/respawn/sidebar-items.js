@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["PlayerRespawnJobPhase","RespawnRequestKind"],"struct":["DeathRespawnSpawn","PlayerRespawnJob"]};

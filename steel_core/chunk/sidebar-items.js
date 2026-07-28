@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"mod":["block_entity_listener","chunk_access","chunk_generation_task","chunk_holder","chunk_map","chunk_pyramid","chunk_request","chunk_scheduler","chunk_status_tasks","chunk_ticket_manager","full_chunk_readiness","gameplay_chunk_lookup_cache","heightmap","level_chunk","light","paletted_container","player_chunk_view","proto_chunk","section"]};

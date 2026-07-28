@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["init_test_registry"],"static":["INIT_REGISTRY"]};

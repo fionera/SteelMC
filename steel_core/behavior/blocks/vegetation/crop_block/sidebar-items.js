@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["destroy_crop_on_ravager_contact","ravager_breaks_crop"],"struct":["CropBlock"],"trait":["CropLike"]};

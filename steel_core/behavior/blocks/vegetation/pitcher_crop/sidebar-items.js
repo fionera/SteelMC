@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["AGE_PROPERTY","HALF_PROPERTY"],"struct":["PitcherCropBlock"]};

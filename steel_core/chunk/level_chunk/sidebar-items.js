@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["LevelChunkBlockSetResult","PendingPromotionCommit"],"fn":["empty_postprocessing","random_tick_kinds"],"struct":["BlockEntityActivation","BlockEntityActivationBatch","BlockRandomPositionGenerator","LevelChunk","LevelChunkPromotion"]};

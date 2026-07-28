@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["default_can_be_replaced"],"mod":["collision","context","registry","waterlogging"],"trait":["BlockBehavior"]};

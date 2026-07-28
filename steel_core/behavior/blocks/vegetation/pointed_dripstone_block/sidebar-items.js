@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["DRIP_THROUGH_COLUMN_BOXES","GROWTH_PROBABILITY_PER_RANDOM_TICK","MAX_GROWTH_LENGTH","MAX_STALAGMITE_SEARCH_RANGE_WHEN_GROWING","REQUIRED_SPACE_TO_DRIP_THROUGH_NON_SOLID_BLOCK"],"enum":["SpeleothemKind"],"struct":["PointedDripstoneBlock","SpeleothemBlockBehavior","SulfurSpikeBlock"]};
