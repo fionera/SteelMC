@@ -54,8 +54,10 @@ use crate::player::player_data_storage::{GlobalPlayerData, PlayerDataStorage};
 use crate::player::player_inventory::MenuRemovalStatus;
 use crate::player::{
     DomainResidenceToken, GameProfile, KnownPlayer, KnownPlayerNameLookup, KnownPlayers, Player,
-    ProfileLookupError, ResetReason, is_valid_player_name, lookup_online_profile, offline_uuid,
+    ProfileLookupError, ResetReason, is_valid_player_name, offline_uuid,
 };
+#[cfg(feature = "profile-lookup")]
+use crate::player::lookup_online_profile;
 use crate::portal::{
     PortalKind, TeleportPostTransition, TeleportTransition, WorldChangeRequest, end_gateway,
     end_portal, nether_portal,
@@ -442,6 +444,7 @@ pub struct Server {
     /// Wakes shutdown when the single known-player save worker becomes idle.
     known_player_save_idle: Notify,
     /// HTTP client used by online-mode name-to-profile lookups.
+    #[cfg(feature = "profile-lookup")]
     profile_lookup_client: reqwest::Client,
     /// Player joins prepared by async I/O and finalized at the game tick safe point.
     pending_player_joins: PlayerJoinQueue,
@@ -720,6 +723,7 @@ impl Server {
             player_permission_updates: AsyncMutex::new(()),
             known_players: SyncMutex::new(KnownPlayerCacheState::new(known_players)),
             known_player_save_idle: Notify::new(),
+            #[cfg(feature = "profile-lookup")]
             profile_lookup_client: reqwest::Client::new(),
             pending_player_joins: PlayerJoinQueue::new(),
             pending_player_disconnects: PlayerDisconnectQueue::new(),

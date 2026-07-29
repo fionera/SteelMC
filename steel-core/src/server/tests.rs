@@ -252,6 +252,7 @@ async fn test_server_with_worlds(
         player_permission_updates: AsyncMutex::new(()),
         known_players: SyncMutex::new(KnownPlayerCacheState::new(KnownPlayers::new())),
         known_player_save_idle: Notify::new(),
+        #[cfg(feature = "profile-lookup")]
         profile_lookup_client: reqwest::Client::new(),
         pending_player_joins: PlayerJoinQueue::new(),
         pending_player_disconnects: PlayerDisconnectQueue::new(),

@@ -8,6 +8,7 @@ members = [
     "steel-protocol",
     "steel-registry",
     "steel-worldgen",
+    "steel-worldgen-ffi",
     "steel-utils",
     "steel-core",
     "steel-crypto",
@@ -30,6 +31,7 @@ steel-protocol = { path = "steel-protocol" }
 steel-registry = { path = "steel-registry" }
 steel-utils = { path = "steel-utils" }
 steel-worldgen = { path = "steel-worldgen" }
+steel-worldgen-ffi = { path = "steel-worldgen-ffi" }
 steel-math = { path = "steel-math" }
 
 # Async runtime
@@ -75,10 +77,20 @@ arc-swap = "1.9.2"
 glam = { version = "0.33.2", features = ["serde"] }
 rustc-hash = "2.1.3"
 small-map = "0.1.5"
-smallvec = "1.15.2"
+# `const_new` (which implies `const_generics`) is required: steel-core uses
+# SmallVec<[SourceChunk; 289]> in the carver path, and without const generics
+# smallvec only implements Array for sizes up to 32. This was previously satisfied
+# by accident through reqwest -> url -> idna -> icu_normalizer, so making reqwest
+# optional broke the carver build until it was declared here.
+smallvec = { version = "1.15.2", features = ["const_new"] }
 bitflags = "2.13.1"
 phf = { version = "0.14.0", features = ["macros"] }
-chrono = "0.4.45"
+# `now` rather than the default `clock`. Both give Utc::now(), which is all
+# steel-core uses, but `clock` additionally pulls `iana-time-zone` for local-timezone
+# detection -- and on Apple targets that needs the CoreFoundation framework, which
+# cannot be linked when cross-compiling to macOS from a non-Apple host. The `steel`
+# binary re-enables `clock` for its log timestamps, which use Local.
+chrono = { version = "0.4.45", default-features = false, features = ["now", "std"] }
 
 # UUID
 uuid = { version = "1.24.0", features = ["serde", "v4"] }
@@ -147,6 +159,16 @@ criterion = "0.8.2"
 lto = true
 codegen-units = 1
 panic = "abort"
+
+# Build profile for the `steel-worldgen-ffi` cdylib.
+#
+# `release` sets `panic = "abort"`, which strips unwind landing pads and makes
+# `catch_unwind` inert. Loaded into a JVM that turns any generation panic into a
+# SIGABRT of the whole server process, so the FFI artifact must unwind instead.
+# Build with: cargo build --profile ffi-release -p steel-worldgen-ffi
+[profile.ffi-release]
+inherits = "release"
+panic = "unwind"
 
 [profile.profiling]
 inherits = "release"

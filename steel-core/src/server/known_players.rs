@@ -1,7 +1,9 @@
 use super::{
     Arc, GameProfile, KnownPlayer, KnownPlayerNameLookup, KnownPlayers, ProfileLookupError, Server,
-    Uuid, io, is_valid_player_name, lookup_online_profile, offline_uuid,
+    Uuid, io, is_valid_player_name, offline_uuid,
 };
+#[cfg(feature = "profile-lookup")]
+use super::lookup_online_profile;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum UncachedPlayerTarget {
@@ -140,6 +142,15 @@ impl Server {
     /// # Errors
     ///
     /// Returns an error when the profile is unknown or the profile service fails.
+    // Stays `async` without the `profile-lookup` feature so the signature does not
+    // change with feature selection; only the HTTP call inside it is conditional.
+    #[cfg_attr(
+        not(feature = "profile-lookup"),
+        expect(
+            clippy::unused_async,
+            reason = "signature is part of the public API and must not vary by feature"
+        )
+    )]
     pub async fn resolve_player_profile(
         self: &Arc<Self>,
         name: &str,
@@ -165,14 +176,24 @@ impl Server {
             return Err(ProfileLookupError::UnknownPlayer(name.to_owned()));
         }
 
-        let profile = lookup_online_profile(
-            &self.profile_lookup_client,
-            self.config.profile_server.as_deref(),
-            name,
-        )
-        .await?;
-        self.record_known_profile(profile.uuid(), profile.last_known_name().to_owned());
-        Ok(profile)
+        // Without the `profile-lookup` feature there is no HTTP client to ask, so
+        // an online name that missed every local cache cannot be resolved. Reported
+        // as its own error rather than as UnknownPlayer so callers can tell "no such
+        // player" from "this build cannot ask".
+        #[cfg(not(feature = "profile-lookup"))]
+        return Err(ProfileLookupError::LookupUnavailable(name.to_owned()));
+
+        #[cfg(feature = "profile-lookup")]
+        {
+            let profile = lookup_online_profile(
+                &self.profile_lookup_client,
+                self.config.profile_server.as_deref(),
+                name,
+            )
+            .await?;
+            self.record_known_profile(profile.uuid(), profile.last_known_name().to_owned());
+            Ok(profile)
+        }
     }
 
     fn cached_player_profile(self: &Arc<Self>, name: &str) -> Option<KnownPlayer> {

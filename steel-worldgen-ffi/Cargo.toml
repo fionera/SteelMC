@@ -1,0 +1,37 @@
+[package]
+name = "steel-worldgen-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "C ABI exposing SteelMC's world generation to a host process over Panama FFM"
+
+[lib]
+# `cdylib` is the artifact the JVM loads; `rlib` keeps the crate testable from
+# ordinary Rust integration tests.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# default-features off drops `profile-lookup`, and with it `reqwest` and the whole
+# TLS stack. A world generator makes no HTTP requests, and reqwest pulls
+# rustls-platform-verifier -> security-framework, which needs Apple's Security and
+# CoreFoundation frameworks -- unavailable when cross-compiling to macOS from a
+# non-Apple host, since the macOS SDK is not redistributable.
+#
+# A direct path rather than `workspace = true`: cargo rejects
+# `default-features = false` on an inherited workspace dependency.
+steel-core = { path = "../steel-core", default-features = false }
+steel-registry.workspace = true
+steel-utils.workspace = true
+steel-worldgen.workspace = true
+
+rayon.workspace = true
+tokio.workspace = true
+futures.workspace = true
+toml.workspace = true
+parking_lot.workspace = true
+rustc-hash.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

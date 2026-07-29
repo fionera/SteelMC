@@ -6,6 +6,7 @@ mod lookup;
 pub(crate) use known_players::{GAME_PROFILE_CACHE_LIMIT, KnownPlayerNameLookup};
 pub use known_players::{KnownPlayer, KnownPlayers};
 pub use lookup::ProfileLookupError;
+#[cfg(feature = "profile-lookup")]
 pub(crate) use lookup::lookup_online_profile;
 
 use serde::{Deserialize, Serialize};

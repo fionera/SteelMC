@@ -1,18 +1,27 @@
 //! Online player name-to-identity lookup.
 
+#[cfg(feature = "profile-lookup")]
 use reqwest::{StatusCode, Url};
+#[cfg(feature = "profile-lookup")]
 use serde::Deserialize;
 use thiserror::Error;
+#[cfg(feature = "profile-lookup")]
 use tokio::time::{Duration, sleep};
+#[cfg(feature = "profile-lookup")]
 use uuid::Uuid;
 
+#[cfg(feature = "profile-lookup")]
 use super::known_players::KnownPlayer;
 
+#[cfg(feature = "profile-lookup")]
 const DEFAULT_PROFILE_SERVER: &str =
     "https://api.minecraftservices.com/minecraft/profile/lookup/name";
+#[cfg(feature = "profile-lookup")]
 const MAX_PROFILE_LOOKUP_ATTEMPTS: usize = 3;
+#[cfg(feature = "profile-lookup")]
 const PROFILE_LOOKUP_RETRY_DELAY: Duration = Duration::from_millis(750);
 /// Bounds every attempt so suspended administrative commands always release their ordering barrier.
+#[cfg(feature = "profile-lookup")]
 const PROFILE_LOOKUP_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Failure while resolving a player identity through the configured profile service.
@@ -25,6 +34,7 @@ pub enum ProfileLookupError {
     #[error("Invalid profile server URL configured: {0}")]
     InvalidProfileServer(String),
     /// The request failed before a response was received.
+    #[cfg(feature = "profile-lookup")]
     #[error("Profile lookup failed for {name}: {source}")]
     Request {
         /// Requested player name.
@@ -33,6 +43,7 @@ pub enum ProfileLookupError {
         source: reqwest::Error,
     },
     /// The service returned an unexpected status.
+    #[cfg(feature = "profile-lookup")]
     #[error("Profile lookup service returned status {status} for {name}")]
     ServiceResponse {
         /// Requested player name.
@@ -40,6 +51,14 @@ pub enum ProfileLookupError {
         /// HTTP response status.
         status: StatusCode,
     },
+    /// This build cannot query the profile service.
+    ///
+    /// Only produced when the `profile-lookup` feature is off. Kept a distinct
+    /// variant rather than reusing `UnknownPlayer` so callers can tell "no such
+    /// player" from "this build cannot ask".
+    #[cfg(not(feature = "profile-lookup"))]
+    #[error("Online profile lookup is unavailable in this build (requested {0})")]
+    LookupUnavailable(String),
     /// The service returned malformed identity data.
     #[error("Invalid profile lookup response for {name}: {reason}")]
     InvalidResponse {
@@ -50,6 +69,7 @@ pub enum ProfileLookupError {
     },
 }
 
+#[cfg(feature = "profile-lookup")]
 #[derive(Deserialize)]
 struct ProfileLookupResponse {
     id: String,
@@ -59,6 +79,7 @@ struct ProfileLookupResponse {
 /// Resolves one online-mode profile through the configured service.
 ///
 /// The caller handles local caches, offline mode, and name validation first.
+#[cfg(feature = "profile-lookup")]
 pub async fn lookup_online_profile(
     client: &reqwest::Client,
     profile_server: Option<&str>,
@@ -80,6 +101,7 @@ pub async fn lookup_online_profile(
     unreachable!("the profile lookup attempt range is non-empty")
 }
 
+#[cfg(feature = "profile-lookup")]
 async fn lookup_online_profile_once(
     client: &reqwest::Client,
     url: &str,
@@ -108,6 +130,7 @@ async fn lookup_online_profile_once(
     }
 }
 
+#[cfg(feature = "profile-lookup")]
 fn profile_lookup_url(
     profile_server: Option<&str>,
     normalized_name: &str,
@@ -117,6 +140,7 @@ fn profile_lookup_url(
     Url::parse(&endpoint).map_err(|_| ProfileLookupError::InvalidProfileServer(endpoint))
 }
 
+#[cfg(feature = "profile-lookup")]
 async fn parse_profile_response(
     response: reqwest::Response,
     requested_name: &str,
