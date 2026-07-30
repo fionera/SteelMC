@@ -46,7 +46,7 @@ use crate::status::{Status, clear_last_error, fail, with_last_error};
 
 /// ABI version. Bumped on any incompatible change to a signature or struct
 /// layout below; the host must refuse to load a library it does not recognise.
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
 
 /// A chunk position, as it crosses the ABI.
 #[repr(C)]
@@ -153,10 +153,16 @@ pub unsafe extern "C" fn swg_world_open(
 /// Generation must never run on a host thread: the transpiled density functions
 /// need far more stack than a typical JVM thread has.
 ///
+/// `keep_inset` trims that many chunks from each edge of the requested rectangle
+/// before encoding. Callers request a margin because the `Features` step writes
+/// into neighbouring chunks, so an edge chunk is not finished until its neighbours
+/// have run features too; passing the margin here means it is generated but never
+/// encoded, copied or decoded.
+///
 /// The required size is always written to `out_len`, so passing a null or short
 /// buffer is the way to size one: the call then returns
-/// [`Status::BufferTooSmall`] and the chunks stay resident, so retrying with a
-/// large enough buffer does not regenerate them.
+/// [`Status::BufferTooSmall`], and the encoding is retained, so retrying with a
+/// large enough buffer is a copy rather than a regeneration.
 ///
 /// # Safety
 /// `positions` must point to `count` readable [`SwgChunkPos`] values. `out` must
@@ -168,6 +174,7 @@ pub unsafe extern "C" fn swg_generate_batch(
     positions: *const SwgChunkPos,
     count: usize,
     target_status: u32,
+    keep_inset: u32,
     out: *mut u8,
     out_capacity: usize,
     out_len: *mut usize,
@@ -208,8 +215,9 @@ pub unsafe extern "C" fn swg_generate_batch(
         // A panic here means Steel's own invariants were violated, so the world
         // is retired rather than reused. Caught separately from `guard` so the
         // handle can be poisoned.
+        let inset = i32::try_from(keep_inset).unwrap_or(0);
         let encoded = catch_unwind(AssertUnwindSafe(|| {
-            generation_world.generate_snapshot(&centers, target)
+            generation_world.generate_snapshot(&centers, target, inset)
         }));
 
         let bytes = match encoded {

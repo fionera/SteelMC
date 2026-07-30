@@ -116,6 +116,7 @@ fn generate(
             positions.as_ptr(),
             positions.len(),
             status,
+            0,
             out,
             buffer.len(),
             &raw mut needed,

@@ -22,6 +22,7 @@ use steel_core::level_data::WorldGenerationSettings;
 use steel_core::world::{World, WorldConfig, WorldStorageConfig};
 use steel_core::worldgen::WorldGeneratorRegistry;
 use steel_registry::{REGISTRY, Registry};
+use steel_utils::locks::SyncRwLock;
 use steel_utils::types::{Difficulty, GameType};
 use steel_utils::{ChunkPos, Identifier};
 use tokio::runtime::{Builder as TokioBuilder, Runtime as TokioRuntime};
@@ -30,12 +31,36 @@ use toml::map::Map;
 
 use crate::snapshot;
 
+/// A cached encoding: the request that produced it, and the bytes.
+type EncodedBatch = (Vec<ChunkPos>, ChunkStatus, Vec<u8>);
+
 /// Stack size for generation worker threads.
 ///
-/// The transpiled density functions nest deeply enough that Steel's own tests
-/// spawn 16 MB threads. Host (JVM) threads are typically 1 MB, which is why
-/// generation must never run on one — see `swg_generate_batch`.
-const GENERATION_STACK_SIZE: usize = 16 * 1024 * 1024;
+/// The transpiled density functions nest deeply, so the default 2 MB is not
+/// enough; Steel itself raises this to 8 MB under `debug_assertions`
+/// (`steel-core/src/server/mod.rs`). 8 MB matches that and is half what this
+/// crate previously reserved. Host (JVM) threads are typically 1 MB, which is
+/// why generation must never run on one — see `swg_generate_batch`.
+const GENERATION_STACK_SIZE: usize = 8 * 1024 * 1024;
+
+/// Generation threads used when the caller asks for 0 (auto).
+///
+/// Deliberately not `available_parallelism()`. Steel caps concurrent generation
+/// pipelines at `pool_threads * 2`, so on a 128-core box that is 256 in-flight
+/// chunk pipelines, each allocating its own neighbour cache — and measured
+/// throughput at the batch sizes a server actually requests is *worse*: on this
+/// machine a 10x10 batch ran at 421 chunks/s with 32 threads and 297 with 127.
+/// Past ~32 the pool spends more time on scheduling and light-window contention
+/// than on generation.
+const DEFAULT_GENERATION_THREADS: usize = 32;
+
+/// Tokio workers driving the per-step futures.
+///
+/// Every pyramid step spawns a bookkeeping future on the chunk map's task
+/// tracker, so a single batch can queue thousands of them. Two workers made that
+/// a funnel; the real work still happens on the rayon pool, so these only need to
+/// keep up with polling.
+const RUNTIME_WORKER_THREADS: usize = 8;
 
 /// Guards the process-global registries.
 ///
@@ -90,6 +115,13 @@ pub struct GenerationWorld {
     _world: Arc<World>,
     chunk_map: Arc<ChunkMap>,
     pool: Arc<rayon::ThreadPool>,
+    /// The most recently encoded batch, keyed by the request that produced it.
+    ///
+    /// Exists so a `BufferTooSmall` retry costs a memcpy instead of regenerating.
+    /// The host cannot know a batch's encoded size in advance, so the first call
+    /// from every host thread used to size its buffer by failing — and each of
+    /// those failures re-ran the whole pyramid.
+    last_encoded: SyncRwLock<Option<EncodedBatch>>,
     min_y: i32,
     height: i32,
 }
@@ -104,7 +136,9 @@ impl GenerationWorld {
         init_runtime()?;
 
         let threads = if spec.threads == 0 {
-            available_parallelism().map_or(1, NonZero::get)
+            available_parallelism()
+                .map_or(1, NonZero::get)
+                .min(DEFAULT_GENERATION_THREADS)
         } else {
             spec.threads
         };
@@ -144,7 +178,7 @@ impl GenerationWorld {
         // Generation still happens on `pool`; these workers only drive futures.
         let tokio = Arc::new(
             TokioBuilder::new_multi_thread()
-                .worker_threads(2)
+                .worker_threads(RUNTIME_WORKER_THREADS)
                 .thread_name("steel-worldgen-rt")
                 .enable_all()
                 .build()
@@ -185,6 +219,7 @@ impl GenerationWorld {
             _world: world,
             chunk_map,
             pool,
+            last_encoded: SyncRwLock::new(None),
             min_y,
             height,
         })
@@ -230,16 +265,24 @@ impl GenerationWorld {
             }
         }
 
-        Ok(centers
+        let holders: Vec<Arc<ChunkHolder>> = centers
             .iter()
             .map(|pos| cache.get(pos.0.x, pos.0.y).clone())
-            .collect())
+            .collect();
+
+        Ok(holders)
     }
 
     /// Drives `centers` to `target` and encodes them into a snapshot buffer.
     ///
-    /// Encoding happens here rather than in the caller so the chunk read guards
-    /// never escape this crate.
+    /// Only the chunks at least `keep_inset` in from the edge of the requested
+    /// rectangle are encoded. Callers request a margin because the `Features` step
+    /// writes into its immediate neighbours, so an edge chunk is not finished until
+    /// its neighbours have run features too — but that margin is then discarded, so
+    /// encoding, copying and decoding it is pure waste. At a 16-chunk batch with a
+    /// 1-chunk margin that is 21% of the payload; at 8 chunks it was 36%.
+    ///
+    /// Repeating a request returns the cached encoding rather than regenerating.
     ///
     /// # Errors
     /// Returns a message if generation fails, or if a chunk holds a block state
@@ -248,12 +291,26 @@ impl GenerationWorld {
         &self,
         centers: &[ChunkPos],
         target: ChunkStatus,
+        keep_inset: i32,
     ) -> Result<Vec<u8>, String> {
+        if let Some((cached_centers, cached_target, bytes)) = self.last_encoded.read().as_ref()
+            && cached_centers.as_slice() == centers
+            && *cached_target == target
+        {
+            return Ok(bytes.clone());
+        }
+
         let holders = self.generate(centers, target)?;
+
+        let keep = keep_region(centers, keep_inset);
+        let kept: Vec<&Arc<ChunkHolder>> = holders
+            .iter()
+            .filter(|holder| keep.contains(holder.get_pos()))
+            .collect();
 
         // Hold every read guard for the duration of the encode so a concurrent
         // call cannot advance a chunk mid-snapshot.
-        let guards = holders
+        let guards = kept
             .iter()
             .map(|holder| {
                 holder
@@ -263,11 +320,33 @@ impl GenerationWorld {
             .collect::<Result<Vec<_>, String>>()?;
 
         let chunks: Vec<_> = guards.iter().map(|guard| (&**guard, target)).collect();
-        snapshot::encode(&chunks, self.min_y).map_err(|err| err.to_string())
+        let bytes = snapshot::encode(&chunks, self.min_y).map_err(|err| err.to_string())?;
+
+        *self.last_encoded.write() = Some((centers.to_vec(), target, bytes.clone()));
+        Ok(bytes)
     }
 
     /// Builds the holder cache covering `centers` plus the dependency radius the
     /// target step needs.
+    ///
+    /// # Why these are fresh every call
+    ///
+    /// Reusing holders across calls looks like the obvious win — the dependency
+    /// halo is ~15x the requested chunks, and `claim_status_work` already skips a
+    /// status a holder has reached. It was tried and it broke terrain: parity with
+    /// vanilla fell from 95.2% to 79.1%, with ~100k blocks of excess stone and
+    /// deepslate.
+    ///
+    /// The reason is that `Features` writes into neighbouring chunks. Sharing
+    /// holders between concurrent batches means one batch can be encoding a chunk
+    /// while another batch's `Features` step is still writing into it. Holding the
+    /// chunk's read guard does not prevent that: the writes go through
+    /// `WorldGenRegion`, which takes per-section locks of its own.
+    ///
+    /// Steel avoids this with the ticket and level machinery in `ChunkMap`, which
+    /// orders writers and readers globally rather than per batch. Safe reuse means
+    /// going through that — see `steel-core/src/server/pregen.rs` — not keeping a
+    /// private map here.
     fn build_cache(
         &self,
         centers: &[ChunkPos],
@@ -320,6 +399,13 @@ impl GenerationWorld {
     /// Steps are dispatched onto the generation pool by `apply_step` itself, so
     /// the chunks in one step run concurrently; this only awaits them.
     ///
+    /// Chunks already at `status` are filtered out before dispatch. `apply_step`
+    /// would early-out on them anyway — `claim_status_work` fails its CAS and it
+    /// returns a future that resolves immediately — but it still allocates a boxed
+    /// future and a task per position first. With holder reuse most positions in a
+    /// sweep are already done, so skipping them here is the difference between
+    /// ~2,700 futures per call and a few hundred.
+    ///
     /// # Errors
     /// Returns the positions that did not complete.
     fn run_stage(
@@ -334,8 +420,13 @@ impl GenerationWorld {
             let pending = positions
                 .iter()
                 .filter_map(|pos| {
-                    let holder = cache.get(pos.0.x, pos.0.y).clone();
-                    holder.apply_step(step, &self.chunk_map, cache, self.pool.clone())
+                    let holder = cache.get(pos.0.x, pos.0.y);
+                    if holder.try_chunk(status).is_some() {
+                        return None;
+                    }
+                    holder
+                        .clone()
+                        .apply_step(step, &self.chunk_map, cache, self.pool.clone())
                 })
                 .collect::<Vec<_>>();
 
@@ -372,14 +463,45 @@ impl GenerationWorld {
 }
 
 /// Positions that must reach `status` for `target_step` to succeed at `centers`.
+///
+/// The union of per-centre radius-`r` squares. When `centers` is a filled
+/// rectangle — which is what a chunk-serving host asks for — that union is exactly
+/// the bounding rectangle grown by `r`, so it is emitted directly.
+///
+/// The general path is only for sparse requests. It matters because the naive
+/// version pushed one position per (centre, offset) pair and then sorted: for a
+/// 10x10 batch at radius 10 that was 44,100 pushes collapsing to 900 unique, and
+/// ~96,000 pushes plus a sort across all statuses of a single call.
 fn positions_for_status(
     centers: &[ChunkPos],
     target_step: &ChunkStep,
     status: ChunkStatus,
 ) -> Vec<ChunkPos> {
     let radius = i32::try_from(target_step.get_accumulated_radius_of(status)).unwrap_or(0);
-    let mut positions = Vec::new();
 
+    let (min_x, max_x) = min_max(centers.iter().map(|pos| pos.0.x));
+    let (min_z, max_z) = min_max(centers.iter().map(|pos| pos.0.y));
+
+    let width = i64::from(max_x - min_x) + 1;
+    let depth = i64::from(max_z - min_z) + 1;
+    let filled_rectangle = width * depth == centers.len() as i64;
+
+    if filled_rectangle {
+        let (from_x, to_x) = (min_x - radius, max_x + radius);
+        let (from_z, to_z) = (min_z - radius, max_z + radius);
+        let span_x = (to_x - from_x + 1) as usize;
+        let span_z = (to_z - from_z + 1) as usize;
+
+        let mut positions = Vec::with_capacity(span_x * span_z);
+        for z in from_z..=to_z {
+            for x in from_x..=to_x {
+                positions.push(ChunkPos::new(x, z));
+            }
+        }
+        return positions;
+    }
+
+    let mut positions = Vec::new();
     for center in centers {
         for z in (center.0.y - radius)..=(center.0.y + radius) {
             for x in (center.0.x - radius)..=(center.0.x + radius) {
@@ -389,7 +511,7 @@ fn positions_for_status(
     }
 
     // Overlapping centres produce duplicates; running a step twice on one chunk
-    // would double-apply it.
+    // would panic in `claim_status_work`.
     positions.sort_unstable_by_key(|pos| (pos.0.y, pos.0.x));
     positions.dedup();
     positions
@@ -400,4 +522,47 @@ fn min_max(values: impl Iterator<Item = i32>) -> (i32, i32) {
     values.fold((i32::MAX, i32::MIN), |(lo, hi), value| {
         (lo.min(value), hi.max(value))
     })
+}
+
+/// The rectangle of `centers` shrunk by `inset` on every side.
+///
+/// Returns everything when the inset would leave nothing, so a caller asking for
+/// a margin larger than the batch still gets its chunks rather than silence.
+fn keep_region(centers: &[ChunkPos], inset: i32) -> KeepRegion {
+    let (min_x, max_x) = min_max(centers.iter().map(|pos| pos.0.x));
+    let (min_z, max_z) = min_max(centers.iter().map(|pos| pos.0.y));
+
+    if inset <= 0 || min_x + inset > max_x - inset || min_z + inset > max_z - inset {
+        return KeepRegion {
+            min_x,
+            max_x,
+            min_z,
+            max_z,
+        };
+    }
+
+    KeepRegion {
+        min_x: min_x + inset,
+        max_x: max_x - inset,
+        min_z: min_z + inset,
+        max_z: max_z - inset,
+    }
+}
+
+/// An inclusive chunk rectangle.
+struct KeepRegion {
+    min_x: i32,
+    max_x: i32,
+    min_z: i32,
+    max_z: i32,
+}
+
+impl KeepRegion {
+    /// Whether `pos` falls inside the rectangle.
+    const fn contains(&self, pos: ChunkPos) -> bool {
+        pos.0.x >= self.min_x
+            && pos.0.x <= self.max_x
+            && pos.0.y >= self.min_z
+            && pos.0.y <= self.max_z
+    }
 }

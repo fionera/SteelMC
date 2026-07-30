@@ -92,7 +92,7 @@ fn snapshot_framing_round_trips() {
     let centers = [ChunkPos::new(0, 0), ChunkPos::new(1, 2)];
 
     let bytes = world
-        .generate_snapshot(&centers, ChunkStatus::Features)
+        .generate_snapshot(&centers, ChunkStatus::Features, 0)
         .expect("snapshot should encode");
 
     let mut reader = Reader::new(&bytes);
@@ -184,7 +184,7 @@ fn snapshot_framing_round_trips() {
 fn block_states_carry_their_properties() {
     let world = overworld(4242);
     let bytes = world
-        .generate_snapshot(&[ChunkPos::new(0, 0)], ChunkStatus::Features)
+        .generate_snapshot(&[ChunkPos::new(0, 0)], ChunkStatus::Features, 0)
         .expect("snapshot should encode");
 
     // Skip the header and the chunk preamble to reach the block palette.

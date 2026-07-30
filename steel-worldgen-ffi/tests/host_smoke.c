@@ -31,8 +31,8 @@ typedef struct {
 typedef uint32_t (*fn_abi_version)(void);
 typedef int32_t (*fn_runtime_init)(void);
 typedef int32_t (*fn_world_open)(const SwgWorldConfig *, uint64_t *);
-typedef int32_t (*fn_generate_batch)(uint64_t, const SwgChunkPos *, size_t, uint32_t, uint8_t *,
-                                     size_t, size_t *);
+typedef int32_t (*fn_generate_batch)(uint64_t, const SwgChunkPos *, size_t, uint32_t, uint32_t,
+                                     uint8_t *, size_t, size_t *);
 typedef int32_t (*fn_world_close)(uint64_t);
 typedef const char *(*fn_last_error)(void);
 
@@ -70,7 +70,7 @@ int main(int argc, char **argv) {
 
     uint32_t abi = abi_version();
     printf("abi_version = %u\n", abi);
-    if (abi != 1) {
+    if (abi != 2) {
         fprintf(stderr, "FAIL: unexpected ABI version %u\n", abi);
         return 1;
     }
@@ -121,13 +121,13 @@ int main(int argc, char **argv) {
                 }
             }
 
-            status = generate_batch(world, positions, count, STATUS_FULL, snapshot, capacity,
+            status = generate_batch(world, positions, count, STATUS_FULL, 0, snapshot, capacity,
                                     &needed);
             if (status == -7) { /* BufferTooSmall: grow and retry */
                 free(snapshot);
                 capacity = needed;
                 snapshot = malloc(capacity);
-                status = generate_batch(world, positions, count, STATUS_FULL, snapshot, capacity,
+                status = generate_batch(world, positions, count, STATUS_FULL, 0, snapshot, capacity,
                                         &needed);
             }
             if (status != 0) {
@@ -152,7 +152,7 @@ int main(int argc, char **argv) {
            (double)total_bytes / 1024.0 / (double)generated);
 
     /* An unknown handle must be reported, not crash. */
-    status = generate_batch(999999, positions, 1, STATUS_FEATURES, snapshot, capacity, &needed);
+    status = generate_batch(999999, positions, 1, STATUS_FEATURES, 0, snapshot, capacity, &needed);
     printf("generate_batch(bad handle) = %d (%s)\n", status, last_error());
     if (status != -5) {
         fprintf(stderr, "FAIL: expected InvalidHandle (-5), got %d\n", status);
