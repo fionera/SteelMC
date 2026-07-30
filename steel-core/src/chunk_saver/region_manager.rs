@@ -5,6 +5,7 @@
 //! format, avoiding memory duplication.
 
 use std::{
+    cell::RefCell,
     io::{self},
     path::PathBuf,
     sync::Weak,
@@ -17,9 +18,45 @@ use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     sync::oneshot,
 };
+use zstd::bulk::Compressor;
 
 use crate::chunk::chunk_access::ChunkStatus;
 use crate::world::World;
+
+/// Compression level for chunk payloads.
+const CHUNK_COMPRESSION_LEVEL: i32 = 3;
+
+thread_local! {
+    /// One zstd compression context per encoding thread.
+    ///
+    /// `zstd::encode_all` builds and tears down a `ZSTD_CCtx` on every call, and
+    /// that context's workspace is allocated through libc `malloc` rather than
+    /// the process's global Rust allocator. Saving one chunk per call across the
+    /// encoding pool therefore hammers glibc's arena lock: profiling a 90,601
+    /// chunk pregeneration put ~6% of the entire machine in
+    /// `__lll_lock_wait_private`, of which 99.4% was under `ZSTD_createCCtx`,
+    /// `ZSTD_freeCCtx` and `ZSTD_resetCCtx_internal` -- against 1.3% spent
+    /// actually compressing. Keeping one context per thread removes the churn.
+    ///
+    /// Frame bytes differ slightly from `encode_all` (the bulk API records the
+    /// content size in the header), which is fine: nothing depends on the exact
+    /// compressed bytes, and `zstd::decode_all` reads either form, so region
+    /// files written by older builds still load.
+    static CHUNK_COMPRESSOR: RefCell<Option<Compressor<'static>>> =
+        const { RefCell::new(None) };
+}
+
+/// Compresses a serialized chunk payload, reusing this thread's zstd context.
+fn compress_chunk(data: &[u8]) -> io::Result<Vec<u8>> {
+    CHUNK_COMPRESSOR.with_borrow_mut(|slot| {
+        if slot.is_none() {
+            *slot = Some(Compressor::new(CHUNK_COMPRESSION_LEVEL)?);
+        }
+        slot.as_mut()
+            .expect("compressor was just initialized")
+            .compress(data)
+    })
+}
 
 use super::{
     ChunkStorage, LoadedChunk, PersistentChunk,
@@ -312,7 +349,7 @@ impl RegionManager {
     fn encode_chunk(prepared: PreparedChunkSave) -> io::Result<Vec<u8>> {
         let data = wincode::serialize(&prepared.persistent)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-        let compressed = zstd::encode_all(&data[..], 3)?;
+        let compressed = compress_chunk(&data)?;
 
         if compressed.len() > MAX_CHUNK_SIZE {
             return Err(io::Error::new(

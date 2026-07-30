@@ -6,6 +6,7 @@
 
 use std::{
     cell::RefCell,
+    mem,
     sync::{
         Arc, Weak,
         atomic::{AtomicI64, Ordering},
@@ -55,8 +56,64 @@ pub struct WorldGenRegion<'a> {
     chunk_cache_radius: i32,
     chunks: RefCell<Box<[Option<CachedWorldGenChunk<'a>>]>>,
     worldgen_heightmaps: RefCell<Box<[CachedWorldgenHeightmaps]>>,
+    /// The world, upgraded once per step.
+    ///
+    /// `WorldGenContext::world()` is a `Weak::upgrade`, so calling it per access
+    /// costs a CAS on the world's `Arc` strong count plus a decrement when the
+    /// temporary drops. Feature code calls it thousands of times per chunk
+    /// (tick scheduling, sky-light checks, fluid tick delays), and every one of
+    /// those pairs of atomics lands on the same cache line for all generation
+    /// threads at once. Holding one strong reference for the step removes them.
+    world: Arc<World>,
+    /// Game time captured when the region was built.
+    ///
+    /// `World::game_time()` takes a read lock on the process-wide
+    /// `World::level_data`, and tick scheduling read it on every call. Proto
+    /// chunks discard the resulting trigger tick entirely (they store delay `0`,
+    /// see [`ProtoChunk::schedule_block_tick`]), so the value only reaches
+    /// already-full neighbour chunks; pinning it to the start of the step keeps
+    /// generation off that lock at the cost of at most one tick of skew there.
+    game_time: i64,
+    /// Ticks scheduled during this step, one bucket per cached chunk slot.
+    ///
+    /// See [`PendingTick`] for why these are buffered rather than written through.
+    pending_ticks: RefCell<Box<[Vec<PendingTick>]>>,
     random: RandomSource,
     sub_tick_count: AtomicI64,
+}
+
+/// A tick recorded during a generation step, applied when the region is dropped.
+///
+/// Vanilla writes these straight through. Steel buffers them because
+/// `schedule_block_tick` was the hottest contended cache line in the generator:
+/// tree leaf shape updates call it on the order of a thousand times per tree
+/// (`FeatureDecorationRunner::update_tree_shape_face` sweeps a tree's bounding box
+/// on all three axes and calls `update_shape` twice per shape boundary), and each
+/// call took a shared lock on the target chunk followed by that chunk's tick-list
+/// mutex and a hash insert. With Features writing at radius 1 and nothing
+/// serializing adjacent chunks, up to nine threads drove that against one chunk.
+///
+/// Deferring is sound because nothing in worldgen reads the tick list back: proto
+/// ticks are consumed only when the chunk becomes a `LevelChunk`, and the chunk
+/// cannot reach that status while a step still holds this region. Replaying in
+/// insertion order reproduces `schedule_pending`'s dedup and ordering exactly, and
+/// `trigger_tick`/`sub_tick_order` are recorded at call time so the full-chunk path
+/// is unchanged.
+enum PendingTick {
+    Block {
+        pos: BlockPos,
+        block: BlockRef,
+        trigger_tick: i64,
+        priority: TickPriority,
+        sub_tick_order: i64,
+    },
+    Fluid {
+        pos: BlockPos,
+        fluid: FluidRef,
+        trigger_tick: i64,
+        priority: TickPriority,
+        sub_tick_order: i64,
+    },
 }
 
 /// Cached section-level access for feature code that mirrors vanilla `BulkSectionAccess`.
@@ -136,6 +193,10 @@ impl<'a> WorldGenRegion<'a> {
         let worldgen_heightmaps = (0..chunk_cache_len)
             .map(|_| CachedWorldgenHeightmaps::default())
             .collect();
+        let pending_ticks = (0..chunk_cache_len).map(|_| Vec::new()).collect();
+
+        let world = context.world();
+        let game_time = world.game_time();
 
         Self {
             context,
@@ -145,9 +206,21 @@ impl<'a> WorldGenRegion<'a> {
             chunk_cache_radius,
             chunks: RefCell::new(chunks),
             worldgen_heightmaps: RefCell::new(worldgen_heightmaps),
+            world,
+            game_time,
+            pending_ticks: RefCell::new(pending_ticks),
             random,
             sub_tick_count: AtomicI64::new(0),
         }
+    }
+
+    /// Returns the world this region generates into.
+    ///
+    /// Prefer this over `self.context.world()`: it is a borrow of the strong
+    /// reference taken once in [`Self::new`], not a `Weak` upgrade.
+    #[must_use]
+    pub const fn world(&self) -> &Arc<World> {
+        &self.world
     }
 
     /// Returns the center chunk being generated.
@@ -194,7 +267,7 @@ impl<'a> WorldGenRegion<'a> {
     /// Returns the world seed.
     #[must_use]
     pub fn seed(&self) -> i64 {
-        self.context.world().seed()
+        self.world.seed()
     }
 
     /// Returns the weak world reference used by generated chunks and entities.
@@ -338,6 +411,96 @@ impl<'a> WorldGenRegion<'a> {
         }
 
         usize::try_from(rel_z.checked_mul(size)?.checked_add(rel_x)?).ok()
+    }
+
+    /// Inverse of [`Self::chunk_cache_index`].
+    fn chunk_pos_for_cache_index(&self, cache_index: usize) -> Option<(i32, i32)> {
+        let radius = self.chunk_cache_radius;
+        let size = radius.checked_mul(2)?.checked_add(1)?;
+        if size <= 0 {
+            return None;
+        }
+
+        let index = i32::try_from(cache_index).ok()?;
+        let chunk_x = self
+            .center
+            .0
+            .x
+            .checked_add(index.checked_rem(size)?)?
+            .checked_sub(radius)?;
+        let chunk_z = self
+            .center
+            .0
+            .y
+            .checked_add(index.checked_div(size)?)?
+            .checked_sub(radius)?;
+        Some((chunk_x, chunk_z))
+    }
+
+    /// Buffers a tick until the step ends. See [`PendingTick`].
+    ///
+    /// Chunks outside the slot cache write through instead. `dependency_chunk_for_pos`
+    /// has already established that the step declares the chunk, and the slot cache
+    /// spans the same radius, so that path is unreachable in practice -- it keeps the
+    /// buffer an optimization rather than something correctness depends on.
+    fn record_tick(&self, chunk_x: i32, chunk_z: i32, status: ChunkStatus, tick: PendingTick) {
+        let Some(cache_index) = self.chunk_cache_index(chunk_x, chunk_z) else {
+            self.with_cached_chunk(chunk_x, chunk_z, status, |chunk| {
+                Self::apply_tick(chunk, &tick);
+            });
+            return;
+        };
+
+        let mut pending = self.pending_ticks.borrow_mut();
+        let Some(slot) = pending.get_mut(cache_index) else {
+            panic!("Worldgen region tick cache index {cache_index} escaped its storage");
+        };
+        slot.push(tick);
+    }
+
+    fn apply_tick(chunk: &ChunkAccess, tick: &PendingTick) {
+        match *tick {
+            PendingTick::Block {
+                pos,
+                block,
+                trigger_tick,
+                priority,
+                sub_tick_order,
+            } => chunk.schedule_block_tick(pos, block, trigger_tick, priority, sub_tick_order),
+            PendingTick::Fluid {
+                pos,
+                fluid,
+                trigger_tick,
+                priority,
+                sub_tick_order,
+            } => chunk.schedule_fluid_tick(pos, fluid, trigger_tick, priority, sub_tick_order),
+        }
+    }
+
+    /// Applies every tick recorded during this step, one chunk at a time.
+    ///
+    /// Taking the whole buffer up front releases the `RefCell` borrow before any
+    /// chunk is touched, so nothing reached from a tick can observe it mid-flush.
+    fn flush_pending_ticks(&self) {
+        let pending = mem::take(&mut *self.pending_ticks.borrow_mut());
+        for (cache_index, ticks) in pending.iter().enumerate() {
+            if ticks.is_empty() {
+                continue;
+            }
+
+            let Some((chunk_x, chunk_z)) = self.chunk_pos_for_cache_index(cache_index) else {
+                continue;
+            };
+            let Some(status) = self.required_status_at(chunk_x, chunk_z) else {
+                continue;
+            };
+
+            self.with_cached_chunk(chunk_x, chunk_z, status, |chunk| {
+                for tick in ticks {
+                    Self::apply_tick(chunk, tick);
+                }
+            });
+        }
     }
 
     /// Gets a block state through the region dependency contract.
@@ -560,16 +723,21 @@ impl<'a> WorldGenRegion<'a> {
         delay: i32,
         priority: TickPriority,
     ) -> bool {
-        let trigger_tick = self
-            .context
-            .world()
-            .game_time()
-            .wrapping_add(i64::from(delay));
+        let trigger_tick = self.game_time.wrapping_add(i64::from(delay));
         let sub_tick_order = self.sub_tick_count.fetch_add(1, Ordering::Relaxed);
         let (chunk_x, chunk_z, status) = self.dependency_chunk_for_pos(pos, "schedule block tick");
-        self.with_cached_chunk(chunk_x, chunk_z, status, |chunk| {
-            chunk.schedule_block_tick(pos, block, trigger_tick, priority, sub_tick_order);
-        });
+        self.record_tick(
+            chunk_x,
+            chunk_z,
+            status,
+            PendingTick::Block {
+                pos,
+                block,
+                trigger_tick,
+                priority,
+                sub_tick_order,
+            },
+        );
         true
     }
 
@@ -590,16 +758,21 @@ impl<'a> WorldGenRegion<'a> {
         delay: i32,
         priority: TickPriority,
     ) -> bool {
-        let trigger_tick = self
-            .context
-            .world()
-            .game_time()
-            .wrapping_add(i64::from(delay));
+        let trigger_tick = self.game_time.wrapping_add(i64::from(delay));
         let sub_tick_order = self.sub_tick_count.fetch_add(1, Ordering::Relaxed);
         let (chunk_x, chunk_z, status) = self.dependency_chunk_for_pos(pos, "schedule fluid tick");
-        self.with_cached_chunk(chunk_x, chunk_z, status, |chunk| {
-            chunk.schedule_fluid_tick(pos, fluid, trigger_tick, priority, sub_tick_order);
-        });
+        self.record_tick(
+            chunk_x,
+            chunk_z,
+            status,
+            PendingTick::Fluid {
+                pos,
+                fluid,
+                trigger_tick,
+                priority,
+                sub_tick_order,
+            },
+        );
         true
     }
 
@@ -1326,7 +1499,7 @@ impl LevelReader for WorldGenRegion<'_> {
     }
 
     fn raw_brightness(&self, pos: BlockPos, sky_darkening: u8) -> u8 {
-        let sky_light = if self.context.world().dimension_type.has_skylight {
+        let sky_light = if self.world.dimension_type.has_skylight {
             15_u8.saturating_sub(sky_darkening)
         } else {
             0
@@ -1336,7 +1509,7 @@ impl LevelReader for WorldGenRegion<'_> {
     }
 
     fn can_see_sky(&self, pos: BlockPos) -> bool {
-        if !self.context.world().dimension_type.has_skylight {
+        if !self.world.dimension_type.has_skylight {
             return false;
         }
 
@@ -1344,7 +1517,7 @@ impl LevelReader for WorldGenRegion<'_> {
     }
 
     fn ambient_light(&self) -> f32 {
-        self.context.world().dimension_type.ambient_light
+        self.world.dimension_type.ambient_light
     }
 
     fn min_y(&self) -> i32 {
@@ -1356,11 +1529,15 @@ impl LevelReader for WorldGenRegion<'_> {
     }
 }
 
+impl Drop for WorldGenRegion<'_> {
+    fn drop(&mut self) {
+        self.flush_pending_ticks();
+    }
+}
+
 impl ScheduledTickAccess for WorldGenRegion<'_> {
     fn fluid_tick_delay(&self, fluid: FluidRef) -> i32 {
-        FLUID_BEHAVIORS
-            .get_behavior(fluid)
-            .tick_delay(&self.context.world())
+        FLUID_BEHAVIORS.get_behavior(fluid).tick_delay(&self.world)
     }
 
     fn schedule_block_tick_default(&self, pos: BlockPos, block: BlockRef, delay: i32) -> bool {

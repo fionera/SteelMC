@@ -1,4 +1,5 @@
 use arc_swap::ArcSwap;
+use crossbeam::utils::CachePadded;
 use rayon::ThreadPool;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use std::{
@@ -251,7 +252,11 @@ pub struct ChunkMap {
     /// Radius-2 work-window gate for light-engine worksets.
     light_work_window_gate: Arc<LightWorkWindowGate>,
     /// Number of top-level generation tasks currently running.
-    running_generation_tasks: AtomicUsize,
+    ///
+    /// Padded: every task increments this on admission and decrements it on
+    /// completion from whichever core ran it, so unpadded it drags whatever
+    /// `ChunkMap` field shares its line across every generation thread.
+    running_generation_tasks: CachePadded<AtomicUsize>,
     /// Wakes the generation refill loop when pending/running task state changes.
     generation_refill_notify: Notify,
     /// Cancels the generation refill loop without cancelling active generation tasks.
@@ -379,7 +384,7 @@ impl ChunkMap {
             light_updates: SyncMutex::new(LightUpdateState::default()),
             light_updates_progress_notify: Notify::new(),
             light_work_window_gate: Arc::new(LightWorkWindowGate::new()),
-            running_generation_tasks: AtomicUsize::new(0),
+            running_generation_tasks: CachePadded::new(AtomicUsize::new(0)),
             generation_refill_notify: Notify::new(),
             generation_refill_cancel_token: CancellationToken::new(),
             generation_refill_stopped: AtomicBool::new(false),

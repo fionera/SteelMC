@@ -1,4 +1,5 @@
 //! `ChunkHolder` manages chunk state and asynchronous generation tasks.
+use crossbeam::utils::CachePadded;
 use futures::Future;
 use parking_lot::RwLockReadGuard;
 use rustc_hash::FxHashSet;
@@ -168,8 +169,21 @@ impl ChangedLightSections {
 /// reading `data`; `status_changed` wakes async waiters so they can re-check
 /// the atomic state.
 pub struct ChunkHolder {
-    data: ChunkGuard,
-    published_status: AtomicU8,
+    /// Chunk data, on its own cache line.
+    ///
+    /// `ChunkHolder` lives inside an `Arc`, which puts the strong count 16 bytes
+    /// ahead of the first field -- so without padding, this lock word shares a
+    /// line with that refcount. Building one generation task clones 529
+    /// `Arc<ChunkHolder>` (one per chunk in the dependency neighbourhood), and
+    /// every one of those clones would invalidate the lock word that other
+    /// threads are reading through.
+    data: CachePadded<ChunkGuard>,
+    /// The highest status published for this chunk.
+    ///
+    /// Read-mostly and extremely hot: every `try_chunk`, `persisted_status`, and
+    /// `apply_step` loads it, from as many tasks as reference the chunk. Kept
+    /// away from `started_work`, whose CAS would otherwise invalidate it.
+    published_status: CachePadded<AtomicU8>,
     status_changed: Notify,
     generation_task: SyncMutex<Option<Arc<ChunkGenerationTask>>>,
     generation_task_target: AtomicU8,
@@ -179,7 +193,11 @@ pub struct ChunkHolder {
     /// The current simulation ticket level of the chunk.
     simulation_level: AtomicU8,
     /// The highest status that has started work.
-    started_work: AtomicUsize,
+    ///
+    /// Padded because this is the write-hot counterpart to `published_status`:
+    /// `claim_status_work` CASes it on every `apply_step` and loses the race on
+    /// nearly all of them, since a step is attempted once per referencing task.
+    started_work: CachePadded<AtomicUsize>,
     /// Number of save dependencies that have not completed yet.
     active_save_dependencies: AtomicUsize,
     /// The highest status that generation is allowed to reach.
@@ -288,15 +306,15 @@ impl ChunkHolder {
             .collect::<Box<[_]>>();
 
         Self {
-            data: ChunkGuard::new(ChunkAccess::Unloaded),
-            published_status: AtomicU8::new(UNPUBLISHED_STATUS),
+            data: CachePadded::new(ChunkGuard::new(ChunkAccess::Unloaded)),
+            published_status: CachePadded::new(AtomicU8::new(UNPUBLISHED_STATUS)),
             status_changed: Notify::new(),
             generation_task: SyncMutex::new(None),
             generation_task_target: AtomicU8::new(STATUS_NONE),
             pos,
             load_level: AtomicU8::new(load_level.raw()),
             simulation_level: AtomicU8::new(optional_ticket_level_raw(simulation_level)),
-            started_work: AtomicUsize::new(usize::MAX),
+            started_work: CachePadded::new(AtomicUsize::new(usize::MAX)),
             active_save_dependencies: AtomicUsize::new(0),
             highest_allowed_status: AtomicU8::new(highest_allowed_status),
             min_y,
@@ -1138,6 +1156,18 @@ impl ChunkHolder {
     /// Panics if the chunk is not at `ProtoChunk` stage or already full.
     pub fn upgrade_to_full(&self, level: Weak<World>) {
         let world = level.upgrade();
+
+        // Do the bulk of the promotion under a shared guard, so the exclusive
+        // section below is only the ownership swap. See
+        // `LevelChunk::prepare_proto_for_promotion` for why this is safe here
+        // and what it costs to leave it inside the write lock.
+        {
+            let chunk = self.data.read();
+            if let ChunkAccess::Proto(proto) = &*chunk {
+                LevelChunk::prepare_proto_for_promotion(proto, &level);
+            }
+        }
+
         let promoted_entities = self.data.with_write(|chunk| {
             use std::mem::replace;
             let owned = replace(chunk, ChunkAccess::Unloaded);

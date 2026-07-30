@@ -61,6 +61,12 @@ pub struct ProtoChunk {
     /// Whether the chunk has been modified since last save.
     /// Proto chunks start dirty since they're being generated.
     pub dirty: AtomicBool,
+    /// Whether the shared-access part of Full promotion has already run.
+    ///
+    /// See [`Self::prepare_for_promotion`]. Set once, under a shared guard, so
+    /// `LevelChunk::from_proto` can skip that work when it has been done and
+    /// still do it when the proto chunk is promoted directly.
+    pub(crate) promotion_prepared: AtomicBool,
     /// Current generation status of this chunk. Every time a chunk is loaded it goes thru all stages.
     /// If you want the real status use the chunkholder status
     status: AtomicCell<ChunkStatus>,
@@ -121,6 +127,7 @@ impl ProtoChunk {
             sections,
             pos,
             dirty: AtomicBool::new(true), // New chunks are always dirty
+            promotion_prepared: AtomicBool::new(false),
             status: AtomicCell::new(ChunkStatus::Empty),
             heightmaps: SyncRwLock::new(ProtoHeightmaps::new()),
             min_y,
@@ -174,6 +181,7 @@ impl ProtoChunk {
             sections,
             pos,
             dirty: AtomicBool::new(false),
+            promotion_prepared: AtomicBool::new(false),
             status: AtomicCell::new(status),
             // Proto heightmaps will be re-primed during generation on the first set_block_state call
             heightmaps: SyncRwLock::new(ProtoHeightmaps::new()),

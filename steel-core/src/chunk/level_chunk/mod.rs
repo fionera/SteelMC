@@ -223,10 +223,63 @@ impl LevelChunk {
         }
     }
 
+    /// Runs the parts of Full promotion that need only shared access.
+    ///
+    /// All of this used to happen inside `from_proto`, i.e. while the holder's
+    /// exclusive data lock was held: priming the final heightmaps over every
+    /// column, recounting all sections (a ~98k block scan per chunk), refreshing
+    /// the light emptiness maps, and scanning for points of interest. That made
+    /// the promotion's critical section long, and because `ChunkGuard::read`
+    /// uses `parking_lot`'s `read_recursive` -- which deliberately never yields to
+    /// a waiting writer -- the promotion had to spin to get in. A scheduler
+    /// trace of a pregeneration showed 600k `sched_yield` calls per second
+    /// across the generation pool, almost all of them from this acquisition.
+    ///
+    /// None of the work needs ownership, so it runs here under a shared guard
+    /// and `from_proto` skips it. Doing so is safe at this point in the pyramid:
+    /// reaching Full requires every radius-1 neighbour to have passed
+    /// `InitializeLight`, and Features -- the only step that writes outside its
+    /// own chunk, and only at radius 1 -- is earlier than that, so nothing else
+    /// can still be mutating these sections.
+    pub(crate) fn prepare_proto_for_promotion(proto_chunk: &ProtoChunk, level: &Weak<World>) {
+        if proto_chunk
+            .promotion_prepared
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        let min_y = proto_chunk.min_y();
+        let height = proto_chunk.height();
+
+        proto_chunk.heightmaps.write().prime_from_sections(
+            HeightmapType::final_types(),
+            min_y,
+            height,
+            &proto_chunk.sections.sections,
+        );
+
+        for section in &proto_chunk.sections.sections {
+            section.write().recalculate_counts();
+        }
+
+        if let Err(error) = proto_chunk
+            .light
+            .write()
+            .refresh_emptiness_maps_from_sections(&proto_chunk.sections)
+        {
+            panic!("invalid proto chunk light emptiness map length: {error:?}");
+        }
+
+        Self::populate_poi(level, &proto_chunk.sections, proto_chunk.pos, min_y);
+    }
+
     /// Creates a new `LevelChunk` from a `ProtoChunk`.
     ///
-    /// Transfers final heightmaps from the proto chunk if available.
-    /// Recalculates section block counts for random tick optimization.
+    /// Transfers final heightmaps from the proto chunk if available and
+    /// recalculates section block counts for random tick optimization, unless
+    /// [`Self::prepare_proto_for_promotion`] already did so.
     ///
     /// # Arguments
     /// * `proto_chunk` - The proto chunk to convert
@@ -236,7 +289,6 @@ impl LevelChunk {
     ///
     /// # Panics
     /// Panics if the proto chunk's light-section count does not match its world height.
-    ///
     #[must_use]
     pub fn from_proto(
         proto_chunk: ProtoChunk,
@@ -244,24 +296,31 @@ impl LevelChunk {
         height: i32,
         level: Weak<World>,
     ) -> LevelChunkPromotion {
+        // Everything gated on this flag is done by `prepare_proto_for_promotion`
+        // when promotion goes through `ChunkHolder::upgrade_to_full`. Callers
+        // that promote a proto chunk directly still get it here.
+        let already_prepared = proto_chunk.promotion_prepared.load(Ordering::Acquire);
+
         let (proto_block_entities, pending_block_entities) =
             proto_chunk.block_entities.into_transfer_snapshot();
         // Ensure full chunks always have populated final heightmaps. Some stages
         // may not touch blocks (carvers are currently empty), so lazy final
         // heightmaps are not guaranteed to exist before promotion.
         let mut proto_heightmaps = proto_chunk.heightmaps.into_inner();
-        proto_heightmaps.prime_from_sections(
-            HeightmapType::final_types(),
-            min_y,
-            height,
-            &proto_chunk.sections.sections,
-        );
-        let chunk_heightmaps = ChunkHeightmaps::from_proto(&mut proto_heightmaps, min_y, height);
+        if !already_prepared {
+            proto_heightmaps.prime_from_sections(
+                HeightmapType::final_types(),
+                min_y,
+                height,
+                &proto_chunk.sections.sections,
+            );
 
-        // Recalculate section counts for random tick optimization
-        for section in &proto_chunk.sections.sections {
-            section.write().recalculate_counts();
+            // Recalculate section counts for random tick optimization
+            for section in &proto_chunk.sections.sections {
+                section.write().recalculate_counts();
+            }
         }
+        let chunk_heightmaps = ChunkHeightmaps::from_proto(&mut proto_heightmaps, min_y, height);
 
         let structure_starts = proto_chunk.structure_starts.into_inner();
         let structure_references = proto_chunk.structure_references.into_inner();
@@ -273,11 +332,13 @@ impl LevelChunk {
         let pending_entities = proto_chunk.entities.get_all();
         let sky_light_sources = proto_chunk.sky_light_sources.into_inner();
         let mut light = proto_chunk.light.into_inner();
-        if let Err(error) = light.refresh_emptiness_maps_from_sections(&proto_chunk.sections) {
-            panic!("invalid proto chunk light emptiness map length: {error:?}");
-        }
+        if !already_prepared {
+            if let Err(error) = light.refresh_emptiness_maps_from_sections(&proto_chunk.sections) {
+                panic!("invalid proto chunk light emptiness map length: {error:?}");
+            }
 
-        Self::populate_poi(&level, &proto_chunk.sections, proto_chunk.pos, min_y);
+            Self::populate_poi(&level, &proto_chunk.sections, proto_chunk.pos, min_y);
+        }
         let game_event_listener_count = level
             .upgrade()
             .map_or_else(GameEventListenerCount::shared, |world| {

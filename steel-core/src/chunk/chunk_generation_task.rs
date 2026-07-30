@@ -210,11 +210,25 @@ impl ChunkGenerationTask {
             generate = true;
         }
 
-        let pyramid = if generate {
-            &GENERATION_PYRAMID
-        } else {
-            &LOADING_PYRAMID
-        };
+        if !generate {
+            // Already published at or past this status, so there is nothing to
+            // run and nothing to wait for: `apply_step` would lose the
+            // `claim_status_work` race and hand back a future that resolves on
+            // its first poll.
+            //
+            // Skipping matters because a task schedules its entire accumulated
+            // dependency neighbourhood at every layer -- 1,252 `apply_step`
+            // calls for a `Full` target, of which the two widest layers are 529
+            // chunks each -- while only the handful covering its own centre have
+            // work left. Every one of the rest was allocating a boxed future,
+            // cloning an `Arc<ChunkHolder>` and registering a `Notify` waiter to
+            // observe a status that was already published. At ~4,000 chunks/s
+            // that is over five million such calls per second, and it is why the
+            // chunk runtime was consuming ~12 cores of pure bookkeeping.
+            return true;
+        }
+
+        let pyramid = &GENERATION_PYRAMID;
 
         assert!(
             !generate || needs_generation,

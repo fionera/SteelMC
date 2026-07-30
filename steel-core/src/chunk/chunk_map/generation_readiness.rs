@@ -88,6 +88,18 @@ impl ChunkMap {
         }
     }
 
+    /// Generation tasks currently running, for diagnostics.
+    #[must_use]
+    pub fn running_generation_task_count(&self) -> usize {
+        self.running_generation_tasks.load(Ordering::Acquire)
+    }
+
+    /// The cap on concurrently running generation tasks.
+    #[must_use]
+    pub fn generation_task_capacity(&self) -> usize {
+        self.max_running_generation_tasks()
+    }
+
     pub(super) fn max_running_generation_tasks(&self) -> usize {
         self.generation_pool.current_num_threads().max(1) * GENERATION_THREAD_MULTIPLE
     }

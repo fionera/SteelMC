@@ -38,9 +38,9 @@ pub(crate) use lifecycle::ResetReason;
 pub use movement::PlayerInput;
 use movement::{MovementState, TeleportState};
 use permissions::PlayerPermissionState;
-pub(crate) use profile::{GAME_PROFILE_CACHE_LIMIT, KnownPlayerNameLookup};
 #[cfg(feature = "profile-lookup")]
 pub(crate) use profile::lookup_online_profile;
+pub(crate) use profile::{GAME_PROFILE_CACHE_LIMIT, KnownPlayerNameLookup};
 pub use profile::{
     GameProfile, GameProfileAction, KnownPlayer, KnownPlayers, ProfileLookupError,
     is_valid_player_name, offline_uuid,

@@ -1,9 +1,9 @@
+#[cfg(feature = "profile-lookup")]
+use super::lookup_online_profile;
 use super::{
     Arc, GameProfile, KnownPlayer, KnownPlayerNameLookup, KnownPlayers, ProfileLookupError, Server,
     Uuid, io, is_valid_player_name, offline_uuid,
 };
-#[cfg(feature = "profile-lookup")]
-use super::lookup_online_profile;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum UncachedPlayerTarget {
