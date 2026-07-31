@@ -786,6 +786,23 @@ impl<N: DimensionNoises> Aquifer<N> {
 
     /// Returns the quart-quantized preliminary surface level, reusing this aquifer's
     /// density-column and result caches.
+    /// Lowest y at which a non-positive density is guaranteed to produce `Air`
+    /// with no side effects.
+    ///
+    /// Above `skip_sampling_above_y` the aquifer short-circuits to the global
+    /// fluid, and at or above sea level the global fluid yields nothing, so such
+    /// a block is air and `place_block` is a no-op. `NoiseChunk::fill` uses this
+    /// to drop whole vertical runs without evaluating them.
+    #[must_use]
+    pub const fn air_only_above_y(&self) -> i32 {
+        let skip_above = self.skip_sampling_above_y + 1;
+        if skip_above > self.sea_level {
+            skip_above
+        } else {
+            self.sea_level
+        }
+    }
+
     pub fn preliminary_surface_level(&mut self, noises: &N, x: i32, z: i32) -> i32 {
         cached_preliminary_surface_level(noises, &mut self.cache, &mut self.prelim_cache, x, z)
     }

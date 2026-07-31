@@ -160,6 +160,15 @@ pub trait DimensionNoises: Sized + Send + Sync {
     /// Whether vein functions have interpolation channels.
     fn vein_interp_enabled() -> bool;
 
+    /// Whether `combine_interpolated <= 0` follows from interpolated channel 0
+    /// being `<= 0`.
+    ///
+    /// Lets `NoiseChunk::fill` prove a whole vertical run is air from one
+    /// channel's two cell corners, skipping the per-block combine, aquifer and
+    /// placement entirely. Generated per dimension by a conservative structural
+    /// check; `false` simply disables the optimization.
+    const DENSITY_NONPOSITIVE_FROM_CHANNEL0: bool = false;
+
     /// Compute blended noise for an entire column of Y values.
     ///
     /// Called by `NoiseChunk::fill_slice` before iterating over Y corners.

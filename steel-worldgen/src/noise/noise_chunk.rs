@@ -33,6 +33,15 @@ const MAX_INTERP: usize = 8;
 /// Overworld: (16/4+1) * (384/8+1) = 5 * 49 = 245. Rounded up for headroom.
 const MAX_SLICE_LEN: usize = 256;
 
+/// How far below zero channel 0 must be before a run is treated as air.
+///
+/// The trilerp evaluates `a + t*(b - a)` rather than the convex form, so with
+/// both endpoints at zero-ish magnitudes the rounded result can sit a few ulps
+/// above zero while the exact value is below it. Channel 0 has magnitude on the
+/// order of 0.05-0.64 here, so a margin this size costs no measurable hit rate
+/// while leaving many orders of magnitude of slack over the ~8 chained lerps.
+const AIR_SKIP_CHANNEL0_MARGIN: f64 = -1e-9;
+
 /// Cache-line aligned slice storage.
 ///
 /// With `MAX_INTERP` at 8 a corner's channels occupy exactly 64 bytes, so
@@ -280,11 +289,15 @@ impl<N: DimensionNoises> NoiseChunk<N> {
         clippy::similar_names,
         reason = "factor_{x,y,z}_v vector splats deliberately mirror their scalar factor_{x,y,z} sources"
     )]
+    /// `air_only_above_y`: lowest y at which a non-positive density is
+    /// guaranteed to place nothing (see `Aquifer::air_only_above_y`). `None`
+    /// disables whole-run air skipping.
     pub fn fill<F>(
         &mut self,
         noises: &N,
         cache: &mut N::ColumnCache,
         beardifier: Option<&Beardifier>,
+        air_only_above_y: Option<i32>,
         mut place_block: F,
     ) where
         F: FnMut(usize, i32, usize, f64, &[f64], &mut N::ColumnCache),
@@ -354,6 +367,68 @@ impl<N: DimensionNoises> NoiseChunk<N> {
 
                         // Process entire Y column at this (x, z)
                         for cell_y_idx in (0..cell_count_y).rev() {
+                            // Whole-run air skip.
+                            //
+                            // Every channel is affine in y between the cell's two
+                            // y-corners, so channel 0 over this run is bounded by
+                            // its two bilerped endpoints -- and for these
+                            // dimensions a non-positive channel 0 forces a
+                            // non-positive density (see
+                            // `DENSITY_NONPOSITIVE_FROM_CHANNEL0`). Above the
+                            // aquifer's air threshold such a block places nothing,
+                            // so the entire run can be dropped: no trilerp, no
+                            // combine, no aquifer, no placement. Sections start
+                            // out homogeneous air, so not writing is correct.
+                            //
+                            // The margin covers rounding: the trilerp uses
+                            // `a + t*(b-a)`, which can land a hair above zero when
+                            // both endpoints are zero-ish. Written so NaN falls
+                            // through to the slow path.
+                            if N::DENSITY_NONPOSITIVE_FROM_CHANNEL0
+                                && !beard_in_column
+                                && let Some(air_above) = air_only_above_y
+                                && (self.cell_min_y + cell_y_idx as i32) * cell_height >= air_above
+                            {
+                                let i0b = (z0_base + cell_y_idx) * MAX_INTERP;
+                                let i1b = (z1_base + cell_y_idx) * MAX_INTERP;
+                                let s0 = &*self.slices[cell_x_idx];
+                                let s1 = &*self.slices[cell_x_idx + 1];
+                                // SAFETY: same indices the trilerp below reads.
+                                let (bottom, top) = unsafe {
+                                    (
+                                        lerp(
+                                            factor_z,
+                                            lerp(
+                                                factor_x,
+                                                *s0.get_unchecked(i0b),
+                                                *s1.get_unchecked(i0b),
+                                            ),
+                                            lerp(
+                                                factor_x,
+                                                *s0.get_unchecked(i1b),
+                                                *s1.get_unchecked(i1b),
+                                            ),
+                                        ),
+                                        lerp(
+                                            factor_z,
+                                            lerp(
+                                                factor_x,
+                                                *s0.get_unchecked(i0b + MAX_INTERP),
+                                                *s1.get_unchecked(i0b + MAX_INTERP),
+                                            ),
+                                            lerp(
+                                                factor_x,
+                                                *s0.get_unchecked(i1b + MAX_INTERP),
+                                                *s1.get_unchecked(i1b + MAX_INTERP),
+                                            ),
+                                        ),
+                                    )
+                                };
+                                if bottom.max(top) <= AIR_SKIP_CHANNEL0_MARGIN {
+                                    continue;
+                                }
+                            }
+
                             for y_in_cell in (0..cell_height).rev() {
                                 let factor_y = f64::from(y_in_cell) / f64::from(cell_height);
 

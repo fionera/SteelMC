@@ -988,6 +988,9 @@ fn generate_noise_settings(dimension: &str, prefix: &str) -> TokenStream {
                 VEIN_INTERP_ENABLED
             }
 
+            const DENSITY_NONPOSITIVE_FROM_CHANNEL0: bool =
+                DENSITY_NONPOSITIVE_FROM_CHANNEL0;
+
             #[inline]
             fn compute_noise_column(&self, x: i32, block_ys: &[i32], z: i32, out: &mut [f64]) {
                 self.blended_noise.compute_column(x, block_ys, z, out);

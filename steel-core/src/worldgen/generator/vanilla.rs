@@ -440,10 +440,13 @@ impl<N: VanillaPostNoiseStateType> ChunkGenerator for VanillaGenerator<N> {
         let mut world_surface_wg =
             Heightmap::new(HeightmapType::WorldSurfaceWg, min_y, N::Settings::HEIGHT);
 
+        let air_only_above_y = aquifer.air_only_above_y();
+
         noise_chunk.fill(
             noises,
             &mut column_cache,
             beardifier,
+            Some(air_only_above_y),
             |local_x, world_y, local_z, density, interpolated, cache| {
                 // Flush when we move to a new column
                 if local_x != prev_x || local_z != prev_z {

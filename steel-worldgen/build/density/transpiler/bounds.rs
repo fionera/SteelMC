@@ -4,7 +4,7 @@
 //! unreachable branches (for example `min`/`max` when one operand is already
 //! bounded). Resolves `Reference` nodes through the build-time registry.
 
-use crate::density::{DensityFunction, MappedType, TwoArgType};
+use crate::density::{DensityFunction, MappedType, MarkerType, TwoArgType};
 
 use super::TranspilerInput;
 
@@ -196,5 +196,78 @@ pub(super) fn compute_bounds_inner(
             let (_, upper) = compute_bounds_inner(&fts.upper_bound, input, visiting);
             (f64::from(fts.lower_bound), upper)
         }
+    }
+}
+
+/// Whether `final_density <= 0` is implied by its first interpolated channel
+/// being `<= 0`.
+///
+/// This is what lets `NoiseChunk::fill` prove a whole vertical run is air from
+/// one channel, without evaluating the combine per block. Each channel is affine
+/// in y between its two cell corners, so the run's channel interval is exact;
+/// this function supplies the second half of the argument — that a non-positive
+/// channel 0 forces a non-positive density.
+///
+/// Deliberately structural and conservative: it recognizes only operations whose
+/// sign-at-zero behaviour is provable, and returns `false` for anything else, so
+/// an upstream JSON change degrades to "never skip" rather than to wrong terrain.
+///
+/// Sound because, for `x <= 0`:
+/// - `squeeze(x) = clamp(x,-1,1)/2 - clamp(x,-1,1)^3/24` is monotone increasing
+///   with `squeeze(0) = 0`, hence `<= 0`;
+/// - `min(a, b) <= a`, so one non-positive operand suffices;
+/// - the marker itself is the channel.
+pub(super) fn density_nonpositive_when_first_channel_nonpositive(
+    df: &DensityFunction,
+    input: &TranspilerInput,
+) -> bool {
+    nonpositive_inner(df, input, &mut Vec::new(), &mut true)
+}
+
+fn nonpositive_inner(
+    df: &DensityFunction,
+    input: &TranspilerInput,
+    visiting: &mut Vec<String>,
+    first_marker: &mut bool,
+) -> bool {
+    match df {
+        // The interpolated channel itself. Only the first one encountered is
+        // channel 0, which is the one the runtime test bounds.
+        DensityFunction::Marker(m) if m.kind == MarkerType::Interpolated => {
+            std::mem::take(first_marker)
+        }
+        // Other markers are transparent wrappers.
+        DensityFunction::Marker(m) => nonpositive_inner(&m.wrapped, input, visiting, first_marker),
+        DensityFunction::Mapped(m) if m.op == MappedType::Squeeze => {
+            nonpositive_inner(&m.input, input, visiting, first_marker)
+        }
+        DensityFunction::TwoArgumentSimple(t) if t.op == TwoArgType::Min => {
+            // `min` needs only one non-positive side, but the channel must be
+            // reachable through it, so try each in turn.
+            let mut first = *first_marker;
+            if nonpositive_inner(&t.argument1, input, visiting, &mut first) {
+                *first_marker = first;
+                return true;
+            }
+            let mut second = *first_marker;
+            if nonpositive_inner(&t.argument2, input, visiting, &mut second) {
+                *first_marker = second;
+                return true;
+            }
+            false
+        }
+        DensityFunction::Reference(r) => {
+            if visiting.iter().any(|name| name == &r.id) {
+                return false;
+            }
+            let Some(resolved) = input.registry.get(&r.id) else {
+                return false;
+            };
+            visiting.push(r.id.clone());
+            let result = nonpositive_inner(resolved, input, visiting, first_marker);
+            visiting.pop();
+            result
+        }
+        _ => false,
     }
 }

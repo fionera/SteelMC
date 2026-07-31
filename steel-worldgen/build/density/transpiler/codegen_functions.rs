@@ -278,6 +278,16 @@ impl TranspileContext {
         };
         let combine_vein_ridged_splines = mem::take(&mut self.spline_fns);
 
+        // Can a whole vertical run be proven air from channel 0 alone?
+        let density_nonpositive = entries.get("final_density").is_some_and(|info| {
+            super::bounds::density_nonpositive_when_first_channel_nonpositive(&info.df, input)
+        });
+        let density_nonpositive_tok: TokenStream = if density_nonpositive {
+            quote! { true }
+        } else {
+            quote! { false }
+        };
+
         // Determine whether vein interpolation is present
         let has_vein_interp =
             entries.contains_key("vein_toggle") || entries.contains_key("vein_ridged");
@@ -294,6 +304,11 @@ impl TranspileContext {
 
             /// Whether vein functions have interpolation channels.
             pub const VEIN_INTERP_ENABLED: bool = #has_vein_interp_tok;
+
+            /// Whether a non-positive interpolated channel 0 forces a
+            /// non-positive `final_density`. Enables whole-run air skipping in
+            /// `NoiseChunk::fill`; conservatively `false` when unprovable.
+            pub const DENSITY_NONPOSITIVE_FROM_CHANNEL0: bool = #density_nonpositive_tok;
 
             /// Evaluate the inner functions of all `Interpolated` markers at a cell corner.
             ///
