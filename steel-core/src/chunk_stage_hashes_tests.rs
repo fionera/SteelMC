@@ -1,5 +1,10 @@
 //! Chunk generation stage regression test.
 //!
+//! Lives inside the crate rather than in `tests/` because it drives individual
+//! generation stages directly, which needs `GenerationChunk`'s test constructor
+//! -- and that constructor stays `pub(crate)` so the typed-phase API is not
+//! widened for a test.
+//!
 //! Verifies that Steel's chunk generation matches vanilla Minecraft at each stage
 //! by comparing MD5 hashes of block and light data. When a mismatch is found and
 //! binary reference data is available, shows exact block/light diffs.
@@ -18,23 +23,23 @@ use flate2::read::GzDecoder;
 use glam::IVec3;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use serde::Deserialize;
-use steel_core::chunk::Chunk;
-use steel_core::worldgen::generator::GenerationChunk;
-use steel_core::chunk::status::ChunkStatus;
-use steel_core::chunk::chunk_generation_task::StaticCache2D;
-use steel_core::chunk::chunk_holder::ChunkHolder;
-use steel_core::chunk::chunk_pyramid::{ChunkStep, GENERATION_PYRAMID};
-use steel_core::chunk::chunk_ticket_manager::ChunkTicketLevel;
-use steel_core::chunk::light::{
+use crate::chunk::Chunk;
+use crate::worldgen::generator::GenerationChunk;
+use crate::chunk::status::ChunkStatus;
+use crate::chunk::chunk_generation_task::StaticCache2D;
+use crate::chunk::chunk_holder::ChunkHolder;
+use crate::chunk::chunk_pyramid::{ChunkStep, GENERATION_PYRAMID};
+use crate::chunk::chunk_ticket_manager::ChunkTicketLevel;
+use crate::chunk::light::{
     BlockLightChunkEdgeChecks, DATA_LAYER_SIZE, LightCacheLayout, LightCacheSetupRadius,
     LightLayer, LightSection, LightSectionRange, LightWorkset, SkyLightChunkEdgeChecks,
     propagate_block_light_chunk, propagate_sky_light_chunk,
 };
 
-use steel_core::chunk::section::{ChunkSection, Sections};
-use steel_core::level_data::WorldGenerationSettings;
-use steel_core::world::{World, WorldConfig, WorldStorageConfig};
-use steel_core::worldgen::{ChunkGenerator, ChunkGeneratorType, WorldGenContext};
+use crate::chunk::section::{ChunkSection, Sections};
+use crate::level_data::WorldGenerationSettings;
+use crate::world::{World, WorldConfig, WorldStorageConfig};
+use crate::worldgen::{ChunkGenerator, ChunkGeneratorType, WorldGenContext};
 use steel_registry::blocks::block_state_ext::BlockStateExt;
 use steel_registry::structure::TerrainAdjustment;
 use steel_registry::{dimension_type::DimensionTypeRef, vanilla_dimension_types};
@@ -1005,7 +1010,7 @@ fn generate_features_for_positions(
         let region_random = inputs
             .generator
             .create_worldgen_region_random(inputs.seed as i64, center);
-        let mut region = steel_core::worldgen::WorldGenRegion::new(
+        let mut region = crate::worldgen::WorldGenRegion::new(
             inputs.context,
             inputs.feature_step,
             &cache,
@@ -1082,10 +1087,10 @@ fn propagate_light_for_positions(
     reason = "large test with many hash assertions"
 )]
 fn chunk_stage_hashes_inner() {
-    use steel_core::behavior::init_behaviors;
-    use steel_core::block_entity::init_block_entities;
-    use steel_core::entity::init_entities;
-    use steel_core::worldgen::{EndGenerator, NetherGenerator, OverworldGenerator};
+    use crate::behavior::init_behaviors;
+    use crate::block_entity::init_block_entities;
+    use crate::entity::init_test_entities;
+    use crate::worldgen::{EndGenerator, NetherGenerator, OverworldGenerator};
     use steel_registry::{REGISTRY, Registry};
     use steel_worldgen::biomes::BiomeSourceKind;
 
@@ -1094,7 +1099,10 @@ fn chunk_stage_hashes_inner() {
     let _ = REGISTRY.init(registry);
     init_behaviors();
     init_block_entities();
-    init_entities();
+    // Not `init_entities`: this runs in the crate's shared test binary, where
+    // another test may already have initialized the entity registry, and that
+    // one asserts it is called exactly once.
+    init_test_entities();
 
     let expected = load_expected_hashes();
     let seed = expected.seed;

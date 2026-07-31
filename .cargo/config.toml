@@ -30,3 +30,38 @@ run-native = [
   "--config",
   "target.aarch64-unknown-linux-gnu.rustflags=[\"-Clink-arg=-fuse-ld=lld\",\"-Zthreads=0\",\"-C\",\"target-cpu=native\"]",
 ]
+
+# Microarchitecture levels, for shipping one artifact per tier instead of one
+# lowest-common-denominator binary.
+#
+# `cargo build --release` targets baseline x86-64, which is SSE2: worldgen is
+# built on `std::simd`, so on a default build every `f64x4` in the noise kernels
+# and the generated density functions lowers to a pair of 128-bit ops. The tiers
+# are cumulative -- v2 adds SSE4.2/POPCNT, v3 adds AVX2/FMA/BMI, v4 adds
+# AVX-512 -- so a `f64x4` becomes one 256-bit op at v3, and `f64x8` becomes one
+# 512-bit op at v4.
+#
+# v3 is the sensible default to publish (Haswell 2013 / Excavator 2015 and
+# later). Keep a baseline build for older hosts and use `build-native` when
+# building for the machine that will run it.
+build-v2 = [
+  "build",
+  "--config",
+  "build.rustflags=[\"-Zthreads=0\",\"-C\",\"target-cpu=x86-64-v2\"]",
+  "--config",
+  "target.x86_64-unknown-linux-gnu.rustflags=[\"-Clink-arg=-fuse-ld=lld\",\"-Zthreads=0\",\"-C\",\"target-cpu=x86-64-v2\"]",
+]
+build-v3 = [
+  "build",
+  "--config",
+  "build.rustflags=[\"-Zthreads=0\",\"-C\",\"target-cpu=x86-64-v3\"]",
+  "--config",
+  "target.x86_64-unknown-linux-gnu.rustflags=[\"-Clink-arg=-fuse-ld=lld\",\"-Zthreads=0\",\"-C\",\"target-cpu=x86-64-v3\"]",
+]
+build-v4 = [
+  "build",
+  "--config",
+  "build.rustflags=[\"-Zthreads=0\",\"-C\",\"target-cpu=x86-64-v4\"]",
+  "--config",
+  "target.x86_64-unknown-linux-gnu.rustflags=[\"-Clink-arg=-fuse-ld=lld\",\"-Zthreads=0\",\"-C\",\"target-cpu=x86-64-v4\"]",
+]

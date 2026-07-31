@@ -1,3 +1,6 @@
+use std::simd::Simd;
+use std::simd::cmp::SimdPartialEq as _;
+use std::simd::num::SimdFloat as _;
 use std::path::Path;
 use std::{cell::Cell, marker::PhantomData};
 
@@ -1057,8 +1060,10 @@ struct FuzzedBiomeColumn<'a> {
     chunk_quart_z: i32,
     neighbor_biomes: &'a dyn Fn(IVec3) -> u16,
     cached_parent_y: i32,
-    /// Per-candidate cached values: (`fy`, `xz_partial_distance`).
-    candidates: [(f64, f64); 8],
+    /// Per-candidate cached values, split into two lanes-worth of arrays so the
+    /// nearest-candidate search is a single eight-wide vector op.
+    candidate_fy: [f64; 8],
+    candidate_xz: [f64; 8],
     /// Precomputed `lcg_next(seed, parent_x)` and `lcg_next(seed, parent_x + 1)`.
     rval_after_cx: [i64; 2],
 }
@@ -1096,7 +1101,8 @@ impl<'a> FuzzedBiomeColumn<'a> {
             chunk_quart_z,
             neighbor_biomes,
             cached_parent_y: i32::MIN,
-            candidates: [(0.0, 0.0); 8],
+            candidate_fy: [0.0; 8],
+            candidate_xz: [0.0; 8],
             rval_after_cx: [
                 lcg_next(biome_zoom_seed, i64::from(parent_x)),
                 lcg_next(biome_zoom_seed, i64::from(parent_x + 1)),
@@ -1137,7 +1143,9 @@ impl<'a> FuzzedBiomeColumn<'a> {
                 let fz = get_fiddle(rval);
 
                 let xz_partial = (dx + fx) * (dx + fx) + (dz + fz) * (dz + fz);
-                self.candidates[cx_idx * 4 + base_idx + cz_off] = (fy, xz_partial);
+                let slot = cx_idx * 4 + base_idx + cz_off;
+                self.candidate_fy[slot] = fy;
+                self.candidate_xz[slot] = xz_partial;
             }
         }
     }
@@ -1150,10 +1158,10 @@ impl<'a> FuzzedBiomeColumn<'a> {
     fn recompute_candidates(&mut self, parent_y: i32) {
         if self.cached_parent_y != i32::MIN && parent_y == self.cached_parent_y - 1 {
             // Reuse: old low-cy group → new high-cy group
-            self.candidates[2] = self.candidates[0];
-            self.candidates[3] = self.candidates[1];
-            self.candidates[6] = self.candidates[4];
-            self.candidates[7] = self.candidates[5];
+            for (dst, src) in [(2usize, 0usize), (3, 1), (6, 4), (7, 5)] {
+                self.candidate_fy[dst] = self.candidate_fy[src];
+                self.candidate_xz[dst] = self.candidate_xz[src];
+            }
             self.compute_cy_group(parent_y, false);
         } else {
             self.compute_cy_group(parent_y, false);
@@ -1177,17 +1185,25 @@ impl<'a> FuzzedBiomeColumn<'a> {
             self.recompute_candidates(parent_y);
         }
 
-        let mut min_i = 0usize;
-        let mut min_dist = f64::INFINITY;
-        for i in 0..8usize {
-            let (fy, xz_partial) = self.candidates[i];
-            let dy = if (i & 2) == 0 { fract_y } else { fract_y - 1.0 };
-            let dist = xz_partial + (dy + fy) * (dy + fy);
-            if min_dist > dist {
-                min_i = i;
-                min_dist = dist;
-            }
-        }
+        // All eight candidates in one vector: exactly eight `f64` lanes, which
+        // is a single AVX-512 register. The per-lane expression is the scalar
+        // one unchanged, and `dy` depends only on bit 1 of the candidate index,
+        // so it is a fixed pattern. The scalar loop updated on a strict `>`,
+        // keeping the first candidate at the minimum -- taking the lowest set
+        // lane of the equality mask reproduces that exactly.
+        //
+        // `std::simd` lowers this on any target, so narrower machines still
+        // build and run; they just get two or four narrower ops instead of one.
+        let low = fract_y;
+        let high = fract_y - 1.0;
+        let dy = Simd::<f64, 8>::from_array([low, low, high, high, low, low, high, high]);
+        let offset = dy + Simd::from_array(self.candidate_fy);
+        let dist = Simd::from_array(self.candidate_xz) + offset * offset;
+        let min_dist = dist.reduce_min();
+        let min_i = dist
+            .simd_eq(Simd::splat(min_dist))
+            .to_bitmask()
+            .trailing_zeros() as usize;
 
         let biome_quart = IVec3::new(
             if (min_i & 4) == 0 {

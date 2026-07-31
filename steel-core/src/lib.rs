@@ -2,7 +2,11 @@
 //!
 //! The core library for the Steel Minecraft server. Handles everything related to the PLAY state.
 
+#![feature(portable_simd)]
 #![feature(try_as_dyn)]
+
+#[cfg(test)]
+mod chunk_stage_hashes_tests;
 
 use crate::chunk::chunk_map::ChunkMap;
 
