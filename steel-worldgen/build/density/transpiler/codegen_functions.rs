@@ -4,6 +4,7 @@
 //! entry points, and the interpolation fill/combine helpers for
 //! `final_density` / vein router channels.
 
+use super::DENSITY_LANES;
 use std::collections::BTreeMap;
 use std::mem;
 
@@ -73,7 +74,7 @@ impl TranspileContext {
                 #[doc = #doc]
                 #[allow(dead_code)]
                 #[inline]
-                fn #fn_name_4x(#params) -> f64x4 {
+                fn #fn_name_4x(#params) -> f64x8 {
                     #body
                 }
             });
@@ -204,6 +205,7 @@ impl TranspileContext {
             }
         }
 
+        let density_lanes_lit = Literal::usize_unsuffixed(DENSITY_LANES);
         let total_count = all_inners.len();
         let total_count_lit = Literal::usize_unsuffixed(total_count);
 
@@ -232,10 +234,9 @@ impl TranspileContext {
             inner_stmts_4x.push(quote! {
                 {
                     let __r = #expr_simd;
-                    out[#idx] = __r[0];
-                    out[#idx + INTERPOLATED_COUNT] = __r[1];
-                    out[#idx + 2 * INTERPOLATED_COUNT] = __r[2];
-                    out[#idx + 3 * INTERPOLATED_COUNT] = __r[3];
+                    for __lane in 0..DENSITY_LANES {
+                        out[#idx + __lane * INTERPOLATED_COUNT] = __r[__lane];
+                    }
                 }
             });
         }
@@ -302,6 +303,11 @@ impl TranspileContext {
             /// router entries (final_density + vein_toggle + vein_ridged).
             pub const INTERPOLATED_COUNT: usize = #total_count_lit;
 
+            /// SIMD lanes the wide corner-fill evaluates at once. Matches the
+            /// `f64x8` the generated expressions are emitted in, and is what
+            /// `NoiseChunk::fill_slice_into` batches its cell-corner Y values by.
+            pub const DENSITY_LANES: usize = #density_lanes_lit;
+
             /// Whether vein functions have interpolation channels.
             pub const VEIN_INTERP_ENABLED: bool = #has_vein_interp_tok;
 
@@ -334,7 +340,7 @@ impl TranspileContext {
             ///
             /// `out` layout: lane-major SoA. Lane `i`'s `INTERPOLATED_COUNT`
             /// channels live at `out[i * INTERPOLATED_COUNT..(i + 1) * INTERPOLATED_COUNT]`.
-            /// `out` must have length `4 * INTERPOLATED_COUNT`.
+            /// `out` must have length `DENSITY_LANES * INTERPOLATED_COUNT`.
             ///
             /// Per-lane semantics are bit-identical to four scalar
             /// [`fill_cell_corner_densities`] calls at the same Y values.
@@ -343,9 +349,9 @@ impl TranspileContext {
                 noises: &#noises,
                 cache: &#cache,
                 x: i32,
-                ys: f64x4,
+                ys: f64x8,
                 z: i32,
-                blended_noise_value_v: f64x4,
+                blended_noise_value_v: f64x8,
                 out: &mut [f64],
             ) {
                 let x = cache.x as f64;

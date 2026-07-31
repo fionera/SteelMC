@@ -74,6 +74,13 @@ pub struct TranspilerInput {
 /// - Private `compute_*` functions for each named density function
 /// - Public `router_*` functions for each noise router entry point
 #[must_use]
+/// SIMD lanes the generated density expressions are emitted in.
+///
+/// Eight `f64` lanes is one AVX-512 register on the target this is tuned for.
+/// `std::simd` splits it on narrower machines, so the generated code stays
+/// correct everywhere. Must match `NoiseChunk`'s `DENSITY_LANES`.
+pub(super) const DENSITY_LANES: usize = 8;
+
 pub fn transpile(input: &TranspilerInput) -> TokenStream {
     let mut ctx = context::TranspileContext::new(&input.prefix);
     ctx.legacy_random_source = input.legacy_random_source;
@@ -91,7 +98,7 @@ pub fn transpile(input: &TranspilerInput) -> TokenStream {
     // Imports are emitted here so each dimension's output is self-contained
     // when wrapped in a module by the caller.
     quote! {
-        use std::simd::f64x4;
+        use std::simd::f64x8;
         use std::simd::Select;
         use std::simd::cmp::SimdPartialOrd;
         use std::simd::num::SimdFloat;

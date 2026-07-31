@@ -10,7 +10,7 @@
 //! Cell dimensions depend on the dimension's noise settings.
 
 use std::marker::PhantomData;
-use std::simd::f64x4;
+use std::simd::{f64x4, f64x8};
 
 use steel_math::lerp;
 use steel_worldgen::density::{ColumnCache, DimensionNoises, NoiseSettings};
@@ -32,6 +32,14 @@ const MAX_INTERP: usize = 8;
 /// Maximum slice length (`z_corners` * `corners_y`) across all dimensions.
 /// Overworld: (16/4+1) * (384/8+1) = 5 * 49 = 245. Rounded up for headroom.
 const MAX_SLICE_LEN: usize = 256;
+
+/// SIMD lanes the wide cell-corner fill evaluates at once.
+///
+/// Matches the vector width the density transpiler emits, so this and the
+/// generated `DENSITY_LANES` must move together. Eight `f64` lanes is one
+/// AVX-512 register; on narrower targets `std::simd` splits it, which still
+/// works and is what non-AVX-512 hosts get.
+const DENSITY_LANES: usize = 8;
 
 /// How far below zero channel 0 must be before a run is treated as air.
 ///
@@ -204,8 +212,8 @@ impl<N: DimensionNoises> NoiseChunk<N> {
         let mut values = [0.0f64; MAX_INTERP];
 
         // Scratch buffer for the 4-Y SIMD batch. Lane-major SoA: lane `i`'s
-        // `interp_count` channels live at `values_4x[i * interp_count..]`.
-        let mut values_4x = [0.0f64; 4 * MAX_INTERP];
+        // `interp_count` channels live at `values_wide[i * interp_count..]`.
+        let mut values_wide = [0.0f64; DENSITY_LANES * MAX_INTERP];
 
         for cz in 0..=cell_count_xz {
             let cell_z = first_cell_z + cz as i32;
@@ -217,41 +225,36 @@ impl<N: DimensionNoises> NoiseChunk<N> {
             // SIMD-batch blended noise for the entire Y column.
             noises.compute_noise_column(block_x, block_ys, block_z, blended_column);
 
-            // 4-Y SIMD-batched corner fill. Tail is handled by the scalar
-            // loop below for any remaining `corners_y % 4` corners.
+            // Wide SIMD-batched corner fill, `DENSITY_LANES` Y values at a
+            // time. Tail is handled by the scalar loop below for any remaining
+            // `corners_y % DENSITY_LANES` corners.
             let mut cy = 0;
-            while cy + 4 <= corners_y {
-                let ys_v = f64x4::from_array([
-                    f64::from(block_ys[cy]),
-                    f64::from(block_ys[cy + 1]),
-                    f64::from(block_ys[cy + 2]),
-                    f64::from(block_ys[cy + 3]),
-                ]);
-                let blended_v = f64x4::from_array([
-                    blended_column[cy],
-                    blended_column[cy + 1],
-                    blended_column[cy + 2],
-                    blended_column[cy + 3],
-                ]);
+            while cy + DENSITY_LANES <= corners_y {
+                let mut ys = [0.0f64; DENSITY_LANES];
+                let mut blended = [0.0f64; DENSITY_LANES];
+                for lane in 0..DENSITY_LANES {
+                    ys[lane] = f64::from(block_ys[cy + lane]);
+                    blended[lane] = blended_column[cy + lane];
+                }
 
                 noises.fill_cell_corner_densities_4x(
                     cache,
                     block_x,
-                    ys_v,
+                    f64x8::from_array(ys),
                     block_z,
-                    blended_v,
-                    &mut values_4x[..4 * interp_count],
+                    f64x8::from_array(blended),
+                    &mut values_wide[..DENSITY_LANES * interp_count],
                 );
 
-                for lane in 0..4 {
+                for lane in 0..DENSITY_LANES {
                     let lane_cy = cy + lane;
-                    let src = &values_4x[lane * interp_count..(lane + 1) * interp_count];
+                    let src = &values_wide[lane * interp_count..(lane + 1) * interp_count];
                     let corner_idx = cz * corners_y + lane_cy;
                     let base = corner_idx * MAX_INTERP;
                     slice[base..base + interp_count].copy_from_slice(src);
                 }
 
-                cy += 4;
+                cy += DENSITY_LANES;
             }
 
             while cy < corners_y {

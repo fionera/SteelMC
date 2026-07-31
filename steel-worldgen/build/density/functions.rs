@@ -1006,9 +1006,9 @@ fn generate_noise_settings(dimension: &str, prefix: &str) -> TokenStream {
                 &self,
                 cache: &mut Self::ColumnCache,
                 x: i32,
-                ys: std::simd::f64x4,
+                ys: std::simd::f64x8,
                 z: i32,
-                blended_noise_values: std::simd::f64x4,
+                blended_noise_values: std::simd::f64x8,
                 out: &mut [f64],
             ) {
                 fill_cell_corner_densities_4x(self, cache, x, ys, z, blended_noise_values, out)

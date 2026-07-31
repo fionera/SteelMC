@@ -4,7 +4,7 @@
 //! allowing generic chunk generation code to work with any dimension's transpiled
 //! density functions.
 
-use std::simd::f64x4;
+use std::simd::f64x8;
 
 use crate::BlockStateId;
 use crate::random::RandomSplitter;
@@ -211,9 +211,9 @@ pub trait DimensionNoises: Sized + Send + Sync {
         &self,
         cache: &mut Self::ColumnCache,
         x: i32,
-        ys: f64x4,
+        ys: f64x8,
         z: i32,
-        blended_noise_values: f64x4,
+        blended_noise_values: f64x8,
         out: &mut [f64],
     ) {
         let interp_count = Self::interpolated_count();
