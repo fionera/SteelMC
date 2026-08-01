@@ -175,24 +175,33 @@ fn configured_chunk_generation_threads(configured_threads: Option<usize>) -> usi
 /// want cores as well -- and past a point extra generation threads buy nothing
 /// but scheduling and cache pressure.
 ///
-/// Thirteen sixteenths is where the measurement puts the peak, and the peak is
-/// sharp on the high side. Swept on a 128-thread machine over a 201x201
-/// pregeneration with the chunk runtime already trimmed, chunks/s ran 96: 8,044
-/// | 100: 8,083 | **104: 8,243** | 108: 7,909 | 112: 7,137 | 120: 7,257. The
-/// 100-104 plateau holds at 301x301 and 601x601; above it the pool starts
-/// losing to the rest of the machine faster than the extra workers earn.
+/// Fifteen sixteenths. Swept on a 128-thread machine over a 301x301
+/// pregeneration, chunks/s ran 96: 8,704 | 104: 9,005 | 112: 9,225 | **120:
+/// 9,484** | 124: 9,337 | 127: 9,429, and 601x601 agrees (104: 8,935, 120:
+/// 9,189, 127: 9,190).
 ///
-/// This was once briefly raised to all-but-one on a measurement that turned out
-/// to be invalid -- taken on a 301x301 pregeneration with a pipeline deep enough
-/// to hold the whole area, so nothing ever unloaded and the run was missing all
-/// of its unload and save work. Anything set here has to be measured on an area
-/// large enough to force unloading.
+/// This was thirteen sixteenths until the region-file lock was split per region.
+/// While every chunk's storage handshake went through one lock, extra generation
+/// threads had nothing to do but queue on it and the same sweep peaked at 104
+/// and fell off a cliff above 108. That is worth remembering before trusting any
+/// number here: this knob mostly measures whatever the pipeline's current
+/// serialization point is, so re-sweep it after removing one.
+///
+/// It was also once briefly raised to all-but-one on a measurement that turned
+/// out to be invalid -- taken on a 301x301 pregeneration with a pipeline deep
+/// enough to hold the whole area, so nothing ever unloaded and the run was
+/// missing all of its unload and save work. Anything set here has to be measured
+/// on an area large enough to force unloading.
+///
+/// Only the large end is measured. A small machine's other pools have fixed
+/// floors rather than fractions, so it ends up more oversubscribed than this
+/// ratio suggests; the cutoff below keeps the very small cases out of it.
 pub(crate) fn default_chunk_generation_threads(available_threads: usize) -> usize {
     let available = available_threads.max(1);
     if available <= 4 {
         available
     } else {
-        (available * 13 / 16).max(4)
+        (available * 15 / 16).max(4)
     }
 }
 

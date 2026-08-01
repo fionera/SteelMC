@@ -946,16 +946,19 @@ mod tests {
         // Small machines keep every thread; there is nothing to spare.
         assert_eq!(default_chunk_generation_threads(1), 1);
         assert_eq!(default_chunk_generation_threads(4), 4);
-        assert_eq!(default_chunk_generation_threads(8), 6);
-        // Thirteen sixteenths of a large machine: the measured peak, with a
-        // sharp falloff above it (104 threads 8,243 chunks/s, 112 only 7,137).
-        assert_eq!(default_chunk_generation_threads(128), 104);
+        assert_eq!(default_chunk_generation_threads(8), 7);
+        // Fifteen sixteenths of a large machine: the measured peak, and a broad
+        // one (120 threads 9,484 chunks/s against 112 at 9,225 and 127 at 9,429).
+        assert_eq!(default_chunk_generation_threads(128), 120);
 
-        // Whatever is left has to cover the encoding pool and the chunk runtime
-        // without pushing the machine further into oversubscription than the
-        // sweep that produced these numbers.
         assert_eq!(default_chunk_encoding_threads(128), 12);
-        assert!(default_chunk_generation_threads(128) + default_chunk_encoding_threads(128) <= 128);
+        // The pools deliberately overcommit: 120 generation, 12 encoding and 16
+        // chunk-runtime workers is 148 threads on a 128-thread machine, and that
+        // measured faster than any configuration that fits, because generation
+        // threads spend real time blocked on storage and step handoffs rather
+        // than running. What has to hold is only that generation leaves the
+        // other pools something to run on.
+        assert!(default_chunk_generation_threads(128) < 128);
     }
 
     #[test]
