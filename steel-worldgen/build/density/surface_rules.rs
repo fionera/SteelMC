@@ -145,14 +145,41 @@ pub struct SurfaceRuleTranspiler {
     pub uses_surface_secondary: bool,
     /// Whether generated conditions use `ctx.steep`.
     pub uses_steep: bool,
+    /// Facts held true for the copy currently being emitted.
+    facts: SurfaceRuleFacts,
+    /// Biomes named by `BiomeIs` conditions that survived the current pass.
+    referenced_biomes: Vec<String>,
+    /// Whether the current pass emitted a condition reading the downward scan's
+    /// running state -- stone depth or water height -- rather than position and
+    /// per-column values alone.
+    reads_scan_state: bool,
     /// Min Y for this dimension.
     min_y: i32,
     /// Height for this dimension.
     height: i32,
 }
 
+/// What a specialized copy of a surface rule is allowed to assume.
+///
+/// Every fact here has to be established by the caller before it uses the copy;
+/// the transpiler folds the matching conditions away and emits neither the test
+/// nor the branch behind it.
+#[derive(Debug, Default, Clone)]
+pub struct SurfaceRuleFacts {
+    /// Known value of `above_preliminary_surface`, if the caller knows it.
+    above_preliminary_surface: Option<bool>,
+    /// Biomes known not to occur anywhere the copy will be applied.
+    absent_biomes: Vec<String>,
+}
+
+/// A transpiled condition, folded to a constant where the facts decide it.
+enum Cond {
+    Known(bool),
+    Expr(TokenStream),
+}
+
 impl SurfaceRuleTranspiler {
-    pub const fn new(min_y: i32, height: i32, uses_preliminary_surface: bool) -> Self {
+    pub fn new(min_y: i32, height: i32, uses_preliminary_surface: bool) -> Self {
         Self {
             noise_ids: Vec::new(),
             gradient_ids: Vec::new(),
@@ -161,6 +188,9 @@ impl SurfaceRuleTranspiler {
             uses_preliminary_surface,
             uses_surface_secondary: false,
             uses_steep: false,
+            facts: SurfaceRuleFacts::default(),
+            referenced_biomes: Vec::new(),
+            reads_scan_state: false,
             min_y,
             height,
         }
@@ -193,11 +223,27 @@ impl SurfaceRuleTranspiler {
                 quote! { #(#stmts)* }
             }
             SurfaceRuleJson::Condition { if_true, then_run } => {
-                let cond = self.transpile_condition(if_true);
-                let body = self.transpile_rule(then_run);
-                quote! {
-                    if #cond {
-                        #body
+                // The condition is evaluated first even when it folds, so that a
+                // pass still registers the noise, gradient and block-state ids
+                // its live siblings share. Every surface condition is a pure
+                // function of position and per-column values -- the vertical
+                // gradients take a positional random, the noises are positional
+                // and memoized per block -- so dropping one changes nothing but
+                // the work done.
+                match self.transpile_condition(if_true) {
+                    Cond::Known(false) => TokenStream::new(),
+                    Cond::Known(true) => self.transpile_rule(then_run),
+                    Cond::Expr(cond) => {
+                        let body = self.transpile_rule(then_run);
+                        if body.is_empty() {
+                            TokenStream::new()
+                        } else {
+                            quote! {
+                                if #cond {
+                                    #body
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -214,14 +260,15 @@ impl SurfaceRuleTranspiler {
         clippy::too_many_lines,
         reason = "surface condition variants are best kept in one dispatch function"
     )]
-    fn transpile_condition(&mut self, cond: &SurfaceConditionJson) -> TokenStream {
-        match cond {
+    fn transpile_condition(&mut self, cond: &SurfaceConditionJson) -> Cond {
+        Cond::Expr(match cond {
             SurfaceConditionJson::StoneDepth {
                 offset,
                 add_surface_depth,
                 secondary_depth_range,
                 surface_type,
             } => {
+                self.reads_scan_state = true;
                 let is_floor = surface_type == "floor";
                 let depth_field = if is_floor {
                     quote! { ctx.stone_depth_above }
@@ -255,10 +302,26 @@ impl SurfaceRuleTranspiler {
             }
             SurfaceConditionJson::AbovePreliminarySurface {} => {
                 self.uses_preliminary_surface = true;
+                if let Some(known) = self.facts.above_preliminary_surface {
+                    return Cond::Known(known);
+                }
                 quote! { ctx.block_y >= ctx.min_surface_level }
             }
             SurfaceConditionJson::BiomeIs { biome_is } => {
                 self.uses_biome = true;
+                let named: Vec<&str> = biome_is.as_slice().iter().map(BiomeIdJson::as_str).collect();
+                if !named.is_empty()
+                    && named
+                        .iter()
+                        .all(|name| self.facts.absent_biomes.iter().any(|absent| absent == name))
+                {
+                    return Cond::Known(false);
+                }
+                for name in named {
+                    if !self.referenced_biomes.iter().any(|seen| seen == name) {
+                        self.referenced_biomes.push(name.to_owned());
+                    }
+                }
                 let checks: Vec<_> = biome_is
                     .as_slice()
                     .iter()
@@ -343,6 +406,7 @@ impl SurfaceRuleTranspiler {
                 let anchor_y = self.resolve_anchor(anchor);
                 let mul = *surface_depth_multiplier;
                 if *add_stone_depth {
+                    self.reads_scan_state = true;
                     quote! {
                         ctx.block_y + ctx.stone_depth_above >= #anchor_y + ctx.surface_depth * #mul
                     }
@@ -360,6 +424,7 @@ impl SurfaceRuleTranspiler {
                 // Vanilla: waterHeight == MIN_VALUE
                 //   || blockY + (addStoneDepth ? stoneDepthAbove : 0)
                 //        >= waterHeight + offset + surfaceDepth * multiplier
+                self.reads_scan_state = true;
                 let mul = *surface_depth_multiplier;
                 if *add_stone_depth {
                     quote! {
@@ -384,9 +449,74 @@ impl SurfaceRuleTranspiler {
             SurfaceConditionJson::Hole {} => {
                 quote! { ctx.surface_depth <= 0 }
             }
-            SurfaceConditionJson::Not { invert } => {
-                let inner = self.transpile_condition(invert);
-                quote! { !(#inner) }
+            SurfaceConditionJson::Not { invert } => match self.transpile_condition(invert) {
+                Cond::Known(known) => return Cond::Known(!known),
+                Cond::Expr(inner) => quote! { !(#inner) },
+            },
+        })
+    }
+
+    /// Evaluates a condition against the current facts without emitting code.
+    ///
+    /// Mirrors the folding `transpile_condition` does, so the two agree on which
+    /// branches are dead.
+    fn const_condition(&self, cond: &SurfaceConditionJson) -> Option<bool> {
+        match cond {
+            SurfaceConditionJson::AbovePreliminarySurface {} => {
+                self.facts.above_preliminary_surface
+            }
+            SurfaceConditionJson::BiomeIs { biome_is } => {
+                let named = biome_is.as_slice();
+                (!named.is_empty()
+                    && named.iter().all(|b| {
+                        self.facts
+                            .absent_biomes
+                            .iter()
+                            .any(|absent| absent == b.as_str())
+                    }))
+                .then_some(false)
+            }
+            SurfaceConditionJson::Not { invert } => self.const_condition(invert).map(|known| !known),
+            _ => None,
+        }
+    }
+
+    /// The `block_y` at and above which `cond` is always false, if it has one.
+    fn condition_false_at_and_above(&self, cond: &SurfaceConditionJson) -> Option<i32> {
+        match cond {
+            SurfaceConditionJson::VerticalGradient {
+                false_at_and_above, ..
+            } => Some(self.resolve_anchor(false_at_and_above)),
+            _ => None,
+        }
+    }
+
+    /// The `block_y` at and above which `rule` never returns a block.
+    ///
+    /// `None` when no such bound can be proven, which is the answer for any rule
+    /// that can write at an unbounded height. The bound lets the caller skip the
+    /// rule outright over a whole span of a column rather than calling it once
+    /// per block to be told `None`.
+    fn write_ceiling(&self, rule: &SurfaceRuleJson) -> Option<i32> {
+        match rule {
+            SurfaceRuleJson::Block { .. } | SurfaceRuleJson::Bandlands {} => None,
+            SurfaceRuleJson::Sequence { sequence } => {
+                let mut highest = i32::MIN;
+                for inner in sequence {
+                    highest = highest.max(self.write_ceiling(inner)?);
+                }
+                Some(highest)
+            }
+            SurfaceRuleJson::Condition { if_true, then_run } => {
+                if self.const_condition(if_true) == Some(false) {
+                    // Dead branch: it writes nowhere, so it bounds nothing.
+                    return Some(i32::MIN);
+                }
+                let body = self.write_ceiling(then_run);
+                match self.condition_false_at_and_above(if_true) {
+                    Some(bound) => Some(body.map_or(bound, |body| body.min(bound))),
+                    None => body,
+                }
             }
         }
     }
@@ -429,19 +559,35 @@ fn condition_uses_preliminary_surface(condition: &SurfaceConditionJson) -> bool 
     }
 }
 
-/// Generate the complete `try_apply_surface_rule` function for a dimension.
+/// Everything the density-function generator needs from one dimension's surface rule.
+pub struct SurfaceRuleFunctionArtifacts {
+    /// The generated `apply_surface_rule_impl`, plus the deep-band copy if there is one.
+    pub functions: TokenStream,
+    pub noise_ids: Vec<String>,
+    pub gradient_ids: Vec<String>,
+    pub block_state_names: Vec<String>,
+    pub uses_biome: bool,
+    pub uses_preliminary_surface: bool,
+    pub uses_surface_secondary: bool,
+    pub uses_steep: bool,
+    /// The deep-band specialization, absent when the rule does not admit one.
+    pub deep_band: Option<DeepBandArtifacts>,
+}
+
+/// A copy of the surface rule specialized to below the preliminary surface.
 ///
-/// Returns the function token stream, condition noise IDs, and returned block states.
-type SurfaceRuleFunctionArtifacts = (
-    TokenStream,
-    Vec<String>,
-    Vec<String>,
-    Vec<String>,
-    bool,
-    bool,
-    bool,
-    bool,
-);
+/// Below that level the rule is a much smaller function: everything guarded by
+/// `above_preliminary_surface` is gone, and so is everything that only fires in
+/// a biome the caller has proven cannot occur nearby. What survives in vanilla's
+/// overworld is two vertical gradients, which read nothing but position -- no
+/// biome lookup, no scan state, no preliminary surface.
+pub struct DeepBandArtifacts {
+    /// Biomes the caller must prove absent before using the specialization.
+    pub required_absent_biomes: Vec<String>,
+    /// `block_y` at and above which the specialization never writes, so the
+    /// caller can skip it over that whole span instead of calling it per block.
+    pub write_ceiling: i32,
+}
 
 pub fn generate_surface_rule_function(
     rule: &SurfaceRuleJson,
@@ -451,6 +597,14 @@ pub fn generate_surface_rule_function(
     let uses_preliminary_surface = rule_uses_preliminary_surface(rule);
     let mut transpiler = SurfaceRuleTranspiler::new(min_y, height, uses_preliminary_surface);
     let body = transpiler.transpile_rule(rule);
+
+    // The deep-band copy is emitted second so that it can only reuse ids the
+    // full rule already registered; folding conditions away never introduces a
+    // new noise, gradient or block state.
+    let deep = uses_preliminary_surface
+        .then(|| generate_deep_band(&mut transpiler, rule))
+        .flatten();
+
     let noise_ids = mem::take(&mut transpiler.noise_ids);
     let gradient_ids = mem::take(&mut transpiler.gradient_ids);
     let block_state_names = mem::take(&mut transpiler.block_state_names);
@@ -459,7 +613,23 @@ pub fn generate_surface_rule_function(
     let uses_surface_secondary = transpiler.uses_surface_secondary;
     let uses_steep = transpiler.uses_steep;
 
-    let func = quote! {
+    let deep_function = deep.as_ref().map(|(_, body)| {
+        quote! {
+            /// Apply this dimension's surface rule below the preliminary surface.
+            ///
+            /// Only valid where `ctx.block_y < ctx.min_surface_level` and none of
+            /// `surface_deep_band_absent_biomes()` occur near the position.
+            #[allow(clippy::collapsible_if, clippy::needless_return, clippy::erasing_op, unused_comparisons)]
+            fn apply_surface_rule_deep_impl(
+                ctx: &mut steel_worldgen::surface::SurfaceRuleContext<'_>,
+            ) -> Option<steel_utils::BlockStateId> {
+                #body
+                None
+            }
+        }
+    });
+
+    let functions = quote! {
         /// Apply this dimension's surface rule at the current context position.
         #[allow(clippy::collapsible_if, clippy::needless_return, clippy::erasing_op, unused_comparisons)]
         fn apply_surface_rule_impl(
@@ -468,10 +638,12 @@ pub fn generate_surface_rule_function(
             #body
             None
         }
+
+        #deep_function
     };
 
-    (
-        func,
+    SurfaceRuleFunctionArtifacts {
+        functions,
         noise_ids,
         gradient_ids,
         block_state_names,
@@ -479,5 +651,53 @@ pub fn generate_surface_rule_function(
         uses_preliminary_surface,
         uses_surface_secondary,
         uses_steep,
-    )
+        deep_band: deep.map(|(artifacts, _)| artifacts),
+    }
+}
+
+/// Emits the below-preliminary-surface copy of `rule`, if one is worth having.
+///
+/// Two passes. The first establishes only that `above_preliminary_surface` is
+/// false and records which biomes the surviving conditions still test; the
+/// second additionally assumes those biomes absent, which is what collapses the
+/// rule. Returns `None` when the result would still read the downward scan's
+/// running state, or when no height bound can be proven -- in both cases the
+/// caller is better off with the full rule.
+fn generate_deep_band(
+    transpiler: &mut SurfaceRuleTranspiler,
+    rule: &SurfaceRuleJson,
+) -> Option<(DeepBandArtifacts, TokenStream)> {
+    transpiler.facts = SurfaceRuleFacts {
+        above_preliminary_surface: Some(false),
+        absent_biomes: Vec::new(),
+    };
+    transpiler.referenced_biomes.clear();
+    let _ = transpiler.transpile_rule(rule);
+    let required_absent_biomes = mem::take(&mut transpiler.referenced_biomes);
+
+    transpiler.facts = SurfaceRuleFacts {
+        above_preliminary_surface: Some(false),
+        absent_biomes: required_absent_biomes.clone(),
+    };
+    transpiler.referenced_biomes.clear();
+    transpiler.reads_scan_state = false;
+    let body = transpiler.transpile_rule(rule);
+    let reads_scan_state = transpiler.reads_scan_state;
+    let write_ceiling = transpiler.write_ceiling(rule);
+    transpiler.facts = SurfaceRuleFacts::default();
+    transpiler.reads_scan_state = false;
+    transpiler.referenced_biomes.clear();
+
+    if reads_scan_state {
+        return None;
+    }
+    let write_ceiling = write_ceiling?;
+
+    Some((
+        DeepBandArtifacts {
+            required_absent_biomes,
+            write_ceiling,
+        },
+        body,
+    ))
 }

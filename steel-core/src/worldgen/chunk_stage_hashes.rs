@@ -28,7 +28,9 @@ use crate::chunk::section::{ChunkSection, Sections};
 use crate::chunk::status::ChunkStatus;
 use crate::level_data::WorldGenerationSettings;
 use crate::world::{World, WorldConfig, WorldStorageConfig};
-use crate::worldgen::generator::{CarversPhase, GenerationChunk, NoisePhase, SurfacePhase};
+use crate::worldgen::generator::{
+    CarversPhase, GenerationChunk, NoisePhase, SurfacePhase, ring_contains_any_via,
+};
 use crate::worldgen::{ChunkGenerator, ChunkGeneratorType, WorldGenContext};
 use flate2::read::GzDecoder;
 use glam::IVec3;
@@ -1454,9 +1456,20 @@ fn chunk_stage_hashes_inner() {
                                 .biomes
                                 .get(local_qx, local_qy, local_qz)
                         };
+                        let ring_contains_any = |biomes: &[u16]| {
+                            ring_contains_any_via(
+                                &neighbor_biomes,
+                                pos.0 * 4,
+                                pos.1 * 4,
+                                min_qy,
+                                total_quarts_y,
+                                biomes,
+                            )
+                        };
                         generator.build_surface(
                             GenerationChunk::<SurfacePhase>::for_test(chunk),
                             &neighbor_biomes,
+                            &ring_contains_any,
                         );
                     }
                     for &pos in &dependency_positions {
@@ -1602,10 +1615,23 @@ fn chunk_stage_hashes_inner() {
                         };
 
                         match stage {
-                            "minecraft:surface" => generator.build_surface(
-                                GenerationChunk::<SurfacePhase>::for_test(chunk),
-                                &neighbor_biomes,
-                            ),
+                            "minecraft:surface" => {
+                                let ring_contains_any = |biomes: &[u16]| {
+                                    ring_contains_any_via(
+                                        &neighbor_biomes,
+                                        chunk_x * 4,
+                                        chunk_z * 4,
+                                        min_qy,
+                                        total_quarts_y,
+                                        biomes,
+                                    )
+                                };
+                                generator.build_surface(
+                                    GenerationChunk::<SurfacePhase>::for_test(chunk),
+                                    &neighbor_biomes,
+                                    &ring_contains_any,
+                                )
+                            }
                             "minecraft:carvers" => {
                                 recalculate_section_counts(chunk);
                                 generator.apply_carvers(GenerationChunk::<CarversPhase>::for_test(

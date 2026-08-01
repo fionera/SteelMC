@@ -287,4 +287,33 @@ pub trait DimensionNoises: Sized + Send + Sync {
 
     /// Apply the transpiled surface rule at the given context position.
     fn try_apply_surface_rule(ctx: &mut SurfaceRuleContext<'_>) -> Option<BlockStateId>;
+
+    // ── Deep-band specialization ────────────────────────────────────────────
+    //
+    // Below the preliminary surface most of a surface rule is unreachable, and
+    // what remains often needs neither the biome nor the downward scan's running
+    // state. Where that is so the transpiler emits a second, much smaller copy
+    // of the rule, and these describe when it may be used.
+
+    /// Whether a deep-band copy of the surface rule was emitted.
+    ///
+    /// When false the other three still answer safely -- the entry point
+    /// forwards to the full rule -- but there is nothing to gain by using them.
+    fn surface_deep_band_supported() -> bool;
+
+    /// Biomes that must not occur near a position for the deep-band copy to
+    /// apply there. The copy assumes the branches testing for them are dead.
+    fn surface_deep_band_absent_biomes() -> &'static [u16];
+
+    /// `block_y` at and above which the deep-band copy never returns a block.
+    ///
+    /// Lets a caller skip the span between this and the preliminary surface
+    /// without calling the rule at all.
+    fn surface_deep_band_write_ceiling() -> i32;
+
+    /// Apply the deep-band copy of the surface rule.
+    ///
+    /// Only valid where `ctx.block_y < ctx.min_surface_level` and none of
+    /// [`Self::surface_deep_band_absent_biomes`] occur near the position.
+    fn try_apply_surface_rule_deep(ctx: &mut SurfaceRuleContext<'_>) -> Option<BlockStateId>;
 }

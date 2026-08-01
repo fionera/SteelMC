@@ -387,13 +387,18 @@ pub mod benchmark_support {
     }
 
     /// Calls Surface directly for a Criterion benchmark.
-    pub fn build_surface<G>(generator: &G, chunk: &Chunk, neighbor_biomes: &dyn Fn(IVec3) -> u16)
-    where
+    pub fn build_surface<G>(
+        generator: &G,
+        chunk: &Chunk,
+        neighbor_biomes: &dyn Fn(IVec3) -> u16,
+        ring_contains_any: &dyn Fn(&[u16]) -> bool,
+    ) where
         G: ChunkGenerator + ?Sized,
     {
         generator.build_surface(
             GenerationChunk::<SurfacePhase>::from_chunk(chunk),
             neighbor_biomes,
+            ring_contains_any,
         );
     }
 

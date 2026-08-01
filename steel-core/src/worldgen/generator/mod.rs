@@ -81,10 +81,17 @@ pub trait ChunkGenerator: Send + Sync {
     /// `neighbor_biomes` maps `(quart_x, quart_y, quart_z)` to a biome palette ID,
     /// reading from neighbor chunk palettes for out-of-chunk biome lookups (matching
     /// vanilla's `WorldGenRegion.getNoiseBiome`).
+    ///
+    /// `ring_contains_any` reports whether any of the given biome IDs occurs in
+    /// the one-quart ring around the chunk. It backs the deep-band surface rule
+    /// specialization, which is only valid where the biomes it assumes away
+    /// cannot be returned by a fuzzed lookup. An implementation that cannot
+    /// answer must report `true`, which keeps the caller on the full rule.
     fn build_surface(
         &self,
         chunk: GenerationChunk<'_, SurfacePhase>,
         neighbor_biomes: &dyn Fn(IVec3) -> u16,
+        ring_contains_any: &dyn Fn(&[u16]) -> bool,
     );
 
     /// Applies carvers to the chunk.
@@ -96,6 +103,42 @@ pub trait ChunkGenerator: Send + Sync {
     /// Applies structure piece placement and biome feature decorations.
     fn apply_biome_decorations(&self, region: &mut WorldGenRegion<'_>);
 }
+
+/// Tests the one-quart biome ring around a chunk through a per-quart accessor.
+///
+/// Correct but deliberately unhurried: one accessor call per quart, where the
+/// generation stage's own version hoists a section lock over sixteen of them.
+/// This exists for callers that already hold an accessor and are not on the hot
+/// path -- the parity harness and the generator tests -- so that they exercise
+/// the same deep-band specialization the server does rather than silently
+/// falling back to the full rule.
+pub fn ring_contains_any_via(
+    quart_biome: &dyn Fn(IVec3) -> u16,
+    chunk_quart_x: i32,
+    chunk_quart_z: i32,
+    min_quart_y: i32,
+    total_quarts_y: i32,
+    biomes: &[u16],
+) -> bool {
+    if biomes.is_empty() {
+        return false;
+    }
+    (-1i32..=4).any(|quart_x| {
+        (-1i32..=4).any(|quart_z| {
+            if (0..4).contains(&quart_x) && (0..4).contains(&quart_z) {
+                return false;
+            }
+            (0..total_quarts_y).any(|quart_y| {
+                biomes.contains(&quart_biome(IVec3::new(
+                    chunk_quart_x + quart_x,
+                    min_quart_y + quart_y,
+                    chunk_quart_z + quart_z,
+                )))
+            })
+        })
+    })
+}
+
 
 pub(crate) fn worldgen_region_random_from_splitter(
     splitter: &RandomSplitter,

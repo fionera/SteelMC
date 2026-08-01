@@ -50,6 +50,7 @@ impl ChunkGenerator for EmptyChunkGenerator {
         &self,
         _chunk: GenerationChunk<'_, SurfacePhase>,
         _neighbor_biomes: &dyn Fn(IVec3) -> u16,
+        _ring_contains_any: &dyn Fn(&[u16]) -> bool,
     ) {
     }
 

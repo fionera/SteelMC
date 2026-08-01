@@ -7,7 +7,7 @@ use std::string::String;
 use std::sync::Arc;
 use std::{fs, path::PathBuf};
 
-use super::surface_rules::{SurfaceRuleJson, generate_surface_rule_function};
+use super::surface_rules::{DeepBandArtifacts, SurfaceRuleJson, generate_surface_rule_function};
 
 /// Parsed density function from datapack JSON.
 ///
@@ -701,6 +701,72 @@ fn transpile_dimension(
     transpile(&input)
 }
 
+/// Generate the trait methods describing a dimension's deep-band specialization.
+///
+/// When there is none, every method reports that fact and the deep entry point
+/// forwards to the full rule, so a caller that ignores `supported` still gets
+/// correct results.
+fn generate_deep_band_glue(deep_band: Option<&DeepBandArtifacts>) -> TokenStream {
+    let Some(deep_band) = deep_band else {
+        return quote! {
+            fn surface_deep_band_supported() -> bool {
+                false
+            }
+
+            fn surface_deep_band_absent_biomes() -> &'static [u16] {
+                &[]
+            }
+
+            fn surface_deep_band_write_ceiling() -> i32 {
+                i32::MIN
+            }
+
+            fn try_apply_surface_rule_deep(
+                ctx: &mut steel_worldgen::surface::SurfaceRuleContext<'_>,
+            ) -> Option<steel_utils::BlockStateId> {
+                Self::apply_surface_rule_impl(ctx)
+            }
+        };
+    };
+
+    let biome_idents: Vec<_> = deep_band
+        .required_absent_biomes
+        .iter()
+        .map(|name| {
+            let biome_name = name.strip_prefix("minecraft:").unwrap_or(name);
+            Ident::new(&biome_name.to_uppercase(), Span::call_site())
+        })
+        .collect();
+    let write_ceiling = deep_band.write_ceiling;
+
+    quote! {
+        fn surface_deep_band_supported() -> bool {
+            true
+        }
+
+        fn surface_deep_band_absent_biomes() -> &'static [u16] {
+            static BIOMES: std::sync::OnceLock<Box<[u16]>> = std::sync::OnceLock::new();
+            BIOMES.get_or_init(|| {
+                Box::from([
+                    #(steel_registry::RegistryEntry::id(
+                        &*steel_registry::vanilla_biomes::#biome_idents
+                    ) as u16),*
+                ])
+            })
+        }
+
+        fn surface_deep_band_write_ceiling() -> i32 {
+            #write_ceiling
+        }
+
+        fn try_apply_surface_rule_deep(
+            ctx: &mut steel_worldgen::surface::SurfaceRuleContext<'_>,
+        ) -> Option<steel_utils::BlockStateId> {
+            Self::apply_surface_rule_deep_impl(ctx)
+        }
+    }
+}
+
 /// Generate noise settings constants and trait impls for a dimension.
 #[expect(
     clippy::too_many_lines,
@@ -723,28 +789,24 @@ fn generate_noise_settings(dimension: &str, prefix: &str) -> TokenStream {
         surface_rule_uses_preliminary_surface,
         surface_rule_uses_surface_secondary,
         surface_rule_uses_steep,
+        surface_deep_band_tokens,
     ) = if let Some(rule) = settings.surface_rule.take() {
-        let (
-            func,
-            noise_ids,
-            gradient_ids,
-            block_state_names,
-            uses_biome,
-            uses_preliminary_surface,
-            uses_surface_secondary,
-            uses_steep,
-        ) = generate_surface_rule_function(&rule, settings.noise.min_y, settings.noise.height);
-        let noise_id_literals: Vec<_> = noise_ids.iter().map(String::as_str).collect();
-        let gradient_id_literals: Vec<_> = gradient_ids.iter().map(String::as_str).collect();
-        let block_state_idents: Vec<_> = block_state_names
+        let artifacts =
+            generate_surface_rule_function(&rule, settings.noise.min_y, settings.noise.height);
+        let noise_id_literals: Vec<_> = artifacts.noise_ids.iter().map(String::as_str).collect();
+        let gradient_id_literals: Vec<_> =
+            artifacts.gradient_ids.iter().map(String::as_str).collect();
+        let block_state_idents: Vec<_> = artifacts
+            .block_state_names
             .iter()
             .map(|name| {
                 let block_name = name.strip_prefix("minecraft:").unwrap_or(name);
                 Ident::new(&block_name.to_uppercase(), Span::call_site())
             })
             .collect();
+        let deep_band_tokens = generate_deep_band_glue(artifacts.deep_band.as_ref());
         (
-            func,
+            artifacts.functions,
             quote! { &[#(#noise_id_literals),*] },
             quote! { &[#(#gradient_id_literals),*] },
             quote! {
@@ -758,10 +820,11 @@ fn generate_noise_settings(dimension: &str, prefix: &str) -> TokenStream {
                     })
                 }
             },
-            uses_biome,
-            uses_preliminary_surface,
-            uses_surface_secondary,
-            uses_steep,
+            artifacts.uses_biome,
+            artifacts.uses_preliminary_surface,
+            artifacts.uses_surface_secondary,
+            artifacts.uses_steep,
+            deep_band_tokens,
         )
     } else {
         let empty_func = quote! {
@@ -782,6 +845,7 @@ fn generate_noise_settings(dimension: &str, prefix: &str) -> TokenStream {
             false,
             false,
             false,
+            generate_deep_band_glue(None),
         )
     };
 
@@ -1062,6 +1126,8 @@ fn generate_noise_settings(dimension: &str, prefix: &str) -> TokenStream {
             ) -> Option<steel_utils::BlockStateId> {
                 Self::apply_surface_rule_impl(ctx)
             }
+
+            #surface_deep_band_tokens
         }
 
         impl #noises_struct {

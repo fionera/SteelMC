@@ -513,6 +513,7 @@ impl<N: VanillaPostNoiseStateType> ChunkGenerator for VanillaGenerator<N> {
         &self,
         chunk: GenerationChunk<'_, SurfacePhase>,
         neighbor_biomes: &dyn Fn(IVec3) -> u16,
+        ring_contains_any: &dyn Fn(&[u16]) -> bool,
     ) {
         let min_y = N::Settings::MIN_Y;
         let pos = chunk.pos();
@@ -546,6 +547,23 @@ impl<N: VanillaPostNoiseStateType> ChunkGenerator for VanillaGenerator<N> {
         // Pre-extract biome palette values only if surface rules/extensions need them.
         let biome_data = surface_needs_biomes.then(|| chunk.read_all_biomes());
         let section_count = chunk.section_count();
+
+        // Below the preliminary surface the rule collapses to a handful of
+        // vertical gradients -- no biome, no scan state -- provided the biomes
+        // whose branches the specialization drops cannot occur here. Establish
+        // that once for the whole chunk: check the biomes already in hand, then
+        // the one-quart ring a fuzzed lookup can reach into.
+        let deep_band_absent_biomes = N::surface_deep_band_absent_biomes();
+        let deep_band_write_ceiling = N::surface_deep_band_write_ceiling();
+        let use_deep_band = N::surface_deep_band_supported()
+            && surface_rule_uses_preliminary_surface
+            && preliminary_surface_corners.is_some()
+            && (deep_band_absent_biomes.is_empty()
+                || (biome_data.as_ref().is_some_and(|biomes| {
+                    !biomes
+                        .iter()
+                        .any(|biome| deep_band_absent_biomes.contains(biome))
+                }) && !ring_contains_any(deep_band_absent_biomes)));
 
         let mut pending_writes: Vec<(usize, BlockStateId)> = Vec::new();
         let mut column_buf: Vec<BlockStateId> = Vec::new();
@@ -659,7 +677,27 @@ impl<N: VanillaPostNoiseStateType> ChunkGenerator for VanillaGenerator<N> {
                 let mut next_ceiling_stone_y: i32 = i32::MAX;
                 pending_writes.clear();
 
-                for y in (min_y..=start_height).rev() {
+                // The downward scan runs the full rule from the top of the
+                // column down to the preliminary surface. Below that the
+                // specialization takes over and none of the scan's running state
+                // is read any more, so the scan stops there rather than carrying
+                // stone depths and water heights nothing will ask for.
+                let deep_band_top = if use_deep_band {
+                    min_surface_level - 1
+                } else {
+                    min_y - 1
+                };
+                // Debug builds scan the whole column regardless, so the
+                // specialization can be checked against the full rule at every
+                // position it claims to cover. The deep pass below is skipped
+                // there; this loop has already done its work.
+                let scan_floor = if cfg!(debug_assertions) {
+                    min_y
+                } else {
+                    deep_band_top.saturating_add(1).max(min_y)
+                };
+
+                for y in (scan_floor..=start_height).rev() {
                     let relative_y = (y - min_y) as usize;
                     let state = column_buf[relative_y];
 
@@ -733,7 +771,78 @@ impl<N: VanillaPostNoiseStateType> ChunkGenerator for VanillaGenerator<N> {
 
                         let rule_result = N::try_apply_surface_rule(&mut ctx);
 
+                        #[cfg(debug_assertions)]
+                        if use_deep_band && y <= deep_band_top {
+                            let specialized = if y >= deep_band_write_ceiling {
+                                None
+                            } else {
+                                let mut deep_ctx = SurfaceRuleContext::new(
+                                    block_x,
+                                    block_z,
+                                    surface_depth,
+                                    surface_secondary,
+                                    min_surface_level,
+                                    steep,
+                                    y,
+                                    0,
+                                    0,
+                                    i32::MIN,
+                                    None,
+                                    None,
+                                    &self.surface_system,
+                                    &condition_noise_cache,
+                                    surface_rule_block_states,
+                                );
+                                N::try_apply_surface_rule_deep(&mut deep_ctx)
+                            };
+                            assert_eq!(
+                                specialized, rule_result,
+                                "deep-band surface rule disagrees with the full rule at \
+                                 ({block_x}, {y}, {block_z})"
+                            );
+                        }
+
                         if let Some(new_block) = rule_result {
+                            pending_writes.push((relative_y, new_block));
+                        }
+                    }
+                }
+
+                if use_deep_band && !cfg!(debug_assertions) {
+                    // At and above the write ceiling the specialization returns
+                    // nothing, so that span is skipped entirely instead of being
+                    // walked to be told so once per block.
+                    let deep_band_ceiling = deep_band_top
+                        .min(start_height)
+                        .min(deep_band_write_ceiling.saturating_sub(1));
+                    for y in (min_y..=deep_band_ceiling).rev() {
+                        let relative_y = (y - min_y) as usize;
+                        if column_buf[relative_y] != default_block_id {
+                            continue;
+                        }
+
+                        let mut ctx = SurfaceRuleContext::new(
+                            block_x,
+                            block_z,
+                            surface_depth,
+                            surface_secondary,
+                            min_surface_level,
+                            steep,
+                            y,
+                            // The specialization reads neither stone depth nor
+                            // water height; the transpiler refuses to emit one
+                            // that does.
+                            0,
+                            0,
+                            i32::MIN,
+                            None,
+                            None,
+                            &self.surface_system,
+                            &condition_noise_cache,
+                            surface_rule_block_states,
+                        );
+
+                        if let Some(new_block) = N::try_apply_surface_rule_deep(&mut ctx) {
                             pending_writes.push((relative_y, new_block));
                         }
                     }
@@ -1345,9 +1454,21 @@ mod tests {
 
         cold.clear_transient_generation_state();
         for chunk in [&warm, &cold] {
-            generator.build_surface(GenerationChunk::<SurfacePhase>::for_test(chunk), &|quart| {
-                self_neighbor_biome(chunk, quart)
-            });
+            let neighbor_biomes = |quart| self_neighbor_biome(chunk, quart);
+            generator.build_surface(
+                GenerationChunk::<SurfacePhase>::for_test(chunk),
+                &neighbor_biomes,
+                &|biomes: &[u16]| {
+                    crate::worldgen::generator::ring_contains_any_via(
+                        &neighbor_biomes,
+                        0,
+                        0,
+                        chunk.min_y() >> 2,
+                        (chunk.sections().sections.len() * 4) as i32,
+                        biomes,
+                    )
+                },
+            );
         }
         assert!(has_overworld_post_noise_state(&warm));
         assert!(!has_overworld_post_noise_state(&cold));

@@ -24,7 +24,7 @@ use glam::IVec3;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use serde::Deserialize;
 use crate::chunk::Chunk;
-use crate::worldgen::generator::GenerationChunk;
+use crate::worldgen::generator::{GenerationChunk, ring_contains_any_via};
 use crate::chunk::status::ChunkStatus;
 use crate::chunk::chunk_generation_task::StaticCache2D;
 use crate::chunk::chunk_holder::ChunkHolder;
@@ -1474,7 +1474,21 @@ fn chunk_stage_hashes_inner() {
                                 .biomes
                                 .get(local_qx, local_qy, local_qz)
                         };
-                        generator.build_surface(GenerationChunk::for_test(chunk), &neighbor_biomes);
+                        let ring_contains_any = |biomes: &[u16]| {
+                            ring_contains_any_via(
+                                &neighbor_biomes,
+                                pos.0 * 4,
+                                pos.1 * 4,
+                                min_qy,
+                                total_quarts_y,
+                                biomes,
+                            )
+                        };
+                        generator.build_surface(
+                            GenerationChunk::for_test(chunk),
+                            &neighbor_biomes,
+                            &ring_contains_any,
+                        );
                     }
                     for &pos in &dependency_positions {
                         if tracked_block_stages_already_ran && tracked_positions.contains(&pos) {
@@ -1619,7 +1633,23 @@ fn chunk_stage_hashes_inner() {
                         };
 
                         match stage {
-                            "minecraft:surface" => generator.build_surface(GenerationChunk::for_test(chunk), &neighbor_biomes),
+                            "minecraft:surface" => {
+                                let ring_contains_any = |biomes: &[u16]| {
+                                    ring_contains_any_via(
+                                        &neighbor_biomes,
+                                        chunk_x * 4,
+                                        chunk_z * 4,
+                                        min_qy,
+                                        total_quarts_y,
+                                        biomes,
+                                    )
+                                };
+                                generator.build_surface(
+                                    GenerationChunk::for_test(chunk),
+                                    &neighbor_biomes,
+                                    &ring_contains_any,
+                                )
+                            }
                             "minecraft:carvers" => {
                                 recalculate_section_counts(chunk);
                                 generator.apply_carvers(GenerationChunk::for_test(chunk));
