@@ -9,11 +9,17 @@ use std::{
     fmt,
     io::{self},
     path::PathBuf,
-    sync::Weak,
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use rustc_hash::FxHashMap;
-use steel_utils::{ChunkPos, locks::AsyncRwLock};
+use steel_utils::{
+    ChunkPos,
+    locks::{AsyncMutex, AsyncRwLock},
+};
 use tokio::{
     fs::{self, File, OpenOptions},
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
@@ -83,8 +89,35 @@ impl fmt::Display for CorruptChunkData {
 pub struct RegionManager {
     /// Base directory for region files (e.g., "world/region").
     base_path: PathBuf,
-    /// Open region file handles with their headers.
-    regions: AsyncRwLock<FxHashMap<RegionPos, RegionHandle>>,
+    /// Open regions, each behind its own lock.
+    ///
+    /// The map itself is read-mostly: it is written only when a region is first
+    /// opened or finally closed, which is once per 1,024 chunks rather than once
+    /// per chunk. That distinction is the whole point of the indirection. When
+    /// this was a single `RwLock<HashMap<_, RegionHandle>>` every chunk took its
+    /// write lock twice -- once to acquire, once to release -- and held it across
+    /// file opens and header writes, which serialized chunk generation on one
+    /// lock: instrumenting a 601x601 pregeneration found 11,784 chunks queued
+    /// there at one sample while the 104-thread generation pool had 36 jobs to
+    /// run.
+    regions: AsyncRwLock<FxHashMap<RegionPos, Arc<RegionEntry>>>,
+}
+
+/// One open region file.
+struct RegionEntry {
+    /// The file and its header. Operations on a region serialize here, as they
+    /// must: they share one file cursor.
+    handle: AsyncMutex<RegionHandle>,
+    /// Chunks currently counted against this region.
+    ///
+    /// Outside the handle lock so that dropping a reference does not have to
+    /// take it, and so the map's write lock is only needed when the count
+    /// actually reaches zero. It is incremented under the map's read lock and
+    /// only ever removed under its write lock, which is what stops a reference
+    /// taken concurrently with the last release from reviving an entry that has
+    /// already been dropped from the map -- two live handles on one region file
+    /// would let their headers diverge.
+    references: AtomicUsize,
 }
 
 /// Prepared chunk data ready to be saved asynchronously.
@@ -106,8 +139,6 @@ struct RegionHandle {
     file: File,
     /// Chunk location header (8KB).
     header: RegionHeader,
-    /// Number of chunks currently loaded from this region.
-    loaded_chunk_count: usize,
     /// Whether the header has been modified since last save.
     header_dirty: bool,
     /// Current file size in sectors.
@@ -130,6 +161,78 @@ impl RegionManager {
     /// Gets the file path for a region.
     fn region_path(&self, pos: RegionPos) -> PathBuf {
         self.base_path.join(pos.filename())
+    }
+
+    /// Returns the region's entry with one reference counted against it.
+    ///
+    /// Every caller must pair this with [`Self::drop_region_reference`]; the
+    /// region file stays open, and its header unflushed, until the last
+    /// reference goes.
+    async fn acquire_region(&self, pos: RegionPos) -> io::Result<Arc<RegionEntry>> {
+        if let Some(entry) = self.regions.read().await.get(&pos) {
+            entry.references.fetch_add(1, Ordering::AcqRel);
+            return Ok(Arc::clone(entry));
+        }
+
+        // Opening has to be serialized -- two creators would truncate each
+        // other's file -- so it happens under the map's write lock, with a
+        // re-check to settle the race. This is the rare path: once per region
+        // file, against the 1,024 chunks that live in it.
+        let mut regions = self.regions.write().await;
+        if let Some(entry) = regions.get(&pos) {
+            entry.references.fetch_add(1, Ordering::AcqRel);
+            return Ok(Arc::clone(entry));
+        }
+
+        let entry = Arc::new(RegionEntry {
+            handle: AsyncMutex::new(self.open_region(pos).await?),
+            references: AtomicUsize::new(1),
+        });
+        regions.insert(pos, Arc::clone(&entry));
+        Ok(entry)
+    }
+
+    /// Returns the region's entry if it is open, without counting a reference.
+    async fn open_region_entry(&self, pos: RegionPos) -> Option<Arc<RegionEntry>> {
+        self.regions.read().await.get(&pos).map(Arc::clone)
+    }
+
+    /// Drops one reference, closing the region once none are left.
+    async fn drop_region_reference(
+        &self,
+        pos: RegionPos,
+        entry: &Arc<RegionEntry>,
+    ) -> io::Result<()> {
+        {
+            let _regions = self.regions.read().await;
+            if entry.references.fetch_sub(1, Ordering::AcqRel) != 1 {
+                return Ok(());
+            }
+        }
+
+        // Last reference. Removal needs the write lock, and an acquire may have
+        // taken a fresh reference in the meantime, so re-check under it.
+        {
+            let mut regions = self.regions.write().await;
+            if entry.references.load(Ordering::Acquire) != 0 {
+                return Ok(());
+            }
+            match regions.get(&pos) {
+                Some(current) if Arc::ptr_eq(current, entry) => regions.remove(&pos),
+                // Already replaced by a newer open; that entry owns the file now.
+                _ => return Ok(()),
+            };
+        }
+
+        // Out of the map and unreferenced, so nothing else can reach this
+        // handle: flush its header outside both locks.
+        let mut handle = entry.handle.lock().await;
+        let handle = &mut *handle;
+        if handle.header_dirty {
+            Self::write_header(&mut handle.file, &handle.header).await?;
+            handle.header_dirty = false;
+        }
+        Ok(())
     }
 
     /// Opens or creates a region file, loading only the header.
@@ -191,7 +294,6 @@ impl RegionManager {
         Ok(RegionHandle {
             file,
             header,
-            loaded_chunk_count: 0,
             header_dirty: false,
             file_sectors,
         })
@@ -224,7 +326,6 @@ impl RegionManager {
         Ok(RegionHandle {
             file,
             header,
-            loaded_chunk_count: 0,
             header_dirty: false,
             file_sectors: FIRST_DATA_SECTOR,
         })
@@ -315,12 +416,13 @@ impl RegionManager {
         index: usize,
         expected_entry: ChunkEntry,
     ) -> io::Result<bool> {
-        let mut regions = self.regions.write().await;
-        let Some(handle) = regions.get_mut(&region_pos) else {
+        let Some(entry) = self.open_region_entry(region_pos).await else {
             return Err(io::Error::other(
                 "region was released while clearing corrupt chunk data",
             ));
         };
+        let mut handle = entry.handle.lock().await;
+        let handle = &mut *handle;
         if handle.header.entries[index] != expected_entry {
             return Ok(false);
         }
@@ -363,10 +465,6 @@ impl RegionManager {
     }
 
     /// Saves prepared chunk data to disk after the snapshot-preparation phase has ended.
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "panic on `just inserted` is unreachable"
-    )]
     pub async fn save_chunk_data(
         &self,
         prepared: PreparedChunkSave,
@@ -392,19 +490,29 @@ impl RegionManager {
             io::Error::other("chunk encode task ended without returning a result")
         })??;
 
-        let mut regions = self.regions.write().await;
+        // Counted for the duration of the write, so a concurrent release cannot
+        // close the region out from under it and leave a second handle to open
+        // the same file.
+        let entry = self.acquire_region(region_pos).await?;
+        let result = self
+            .write_chunk_into_region(&entry, index, status, &compressed)
+            .await;
+        let released = self.drop_region_reference(region_pos, &entry).await;
+        result?;
+        released?;
+        Ok(true)
+    }
 
-        // Track if we opened the region (so we can close it after)
-        let we_opened_region = !regions.contains_key(&region_pos);
-
-        // Get or open the region
-        let handle = if let Some(handle) = regions.get_mut(&region_pos) {
-            handle
-        } else {
-            let handle = self.open_region(region_pos).await?;
-            regions.insert(region_pos, handle);
-            regions.get_mut(&region_pos).expect("just inserted")
-        };
+    /// Writes one encoded chunk into an already-referenced region.
+    async fn write_chunk_into_region(
+        &self,
+        entry: &Arc<RegionEntry>,
+        index: usize,
+        status: ChunkStatus,
+        compressed: &[u8],
+    ) -> io::Result<()> {
+        let mut handle = entry.handle.lock().await;
+        let handle = &mut *handle;
 
         // Find space for the chunk
         let sectors_needed = compressed.len().div_ceil(SECTOR_SIZE) as u32;
@@ -423,7 +531,7 @@ impl RegionManager {
         Self::write_chunk_data(
             &mut handle.file,
             sector_offset,
-            &compressed,
+            compressed,
             &mut handle.file_sectors,
         )
         .await?;
@@ -431,17 +539,9 @@ impl RegionManager {
         // Update header entry
         handle.header.entries[index] =
             super::format::ChunkEntry::new(sector_offset, compressed.len() as u32, status);
+        handle.header_dirty = true;
 
-        // If we opened this region and no chunks are loaded from it,
-        // write the header and close it immediately
-        if we_opened_region && handle.loaded_chunk_count == 0 {
-            Self::write_header(&mut handle.file, &handle.header).await?;
-            regions.remove(&region_pos);
-        } else {
-            handle.header_dirty = true;
-        }
-
-        Ok(true)
+        Ok(())
     }
 
     fn encode_chunk(prepared: PreparedChunkSave) -> io::Result<Vec<u8>> {
@@ -498,13 +598,13 @@ impl RegionManager {
         let index = RegionHeader::chunk_index(local_x, local_z);
 
         let (compressed, entry) = {
-            let mut regions = self.regions.write().await;
-
-            // Get the region (should already be open via acquire_chunk)
-            let Some(handle) = regions.get_mut(&region_pos) else {
+            // Should already be open, via acquire_chunk.
+            let Some(region) = self.open_region_entry(region_pos).await else {
                 log::warn!("load_chunk called without acquire_chunk for region {region_pos:?}");
                 return Ok(None);
             };
+            let mut handle = region.handle.lock().await;
+            let handle = &mut *handle;
 
             // Check if chunk exists
             let entry = handle.header.entries[index];
@@ -585,33 +685,13 @@ impl RegionManager {
     /// generating a chunk, and call `release_chunk` when done with the chunk.
     ///
     /// Returns `Ok(true)` if the chunk exists on disk, `Ok(false)` if it doesn't.
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "panic on `just inserted` is unreachable"
-    )]
     pub async fn acquire_chunk(&self, pos: ChunkPos) -> io::Result<bool> {
         let region_pos = RegionPos::from_chunk(pos.0.x, pos.0.y);
         let (local_x, local_z) = RegionPos::local_chunk_pos(pos.0.x, pos.0.y);
         let index = RegionHeader::chunk_index(local_x, local_z);
 
-        let mut regions = self.regions.write().await;
-
-        // Get or open/create the region
-        let handle = if let Some(handle) = regions.get_mut(&region_pos) {
-            handle
-        } else {
-            // open_region creates the file if it doesn't exist
-            let handle = self.open_region(region_pos).await?;
-            regions.insert(region_pos, handle);
-            regions.get_mut(&region_pos).expect("just inserted")
-        };
-
-        // Check if chunk exists
-        let exists = handle.header.entries[index].exists();
-
-        // Increment ref count
-        handle.loaded_chunk_count += 1;
-
+        let entry = self.acquire_region(region_pos).await?;
+        let exists = entry.handle.lock().await.header.entries[index].exists();
         Ok(exists)
     }
 
@@ -623,24 +703,10 @@ impl RegionManager {
     /// This must be called for each chunk returned by `load_chunk`.
     pub async fn release_chunk(&self, pos: ChunkPos) -> io::Result<()> {
         let region_pos = RegionPos::from_chunk(pos.0.x, pos.0.y);
-
-        let mut regions = self.regions.write().await;
-
-        let should_close = if let Some(handle) = regions.get_mut(&region_pos) {
-            handle.loaded_chunk_count = handle.loaded_chunk_count.saturating_sub(1);
-            handle.loaded_chunk_count == 0
-        } else {
+        let Some(entry) = self.open_region_entry(region_pos).await else {
             return Ok(());
         };
-
-        if should_close
-            && let Some(mut handle) = regions.remove(&region_pos)
-            && handle.header_dirty
-        {
-            Self::write_header(&mut handle.file, &handle.header).await?;
-        }
-
-        Ok(())
+        self.drop_region_reference(region_pos, &entry).await
     }
 
     /// Checks if a chunk exists on disk without loading it.
@@ -649,14 +715,10 @@ impl RegionManager {
         let (local_x, local_z) = RegionPos::local_chunk_pos(pos.0.x, pos.0.y);
         let index = RegionHeader::chunk_index(local_x, local_z);
 
-        let regions = self.regions.write().await;
-
-        // Check cached header first
-        if let Some(handle) = regions.get(&region_pos) {
-            return Ok(handle.header.entries[index].exists());
+        // Check the cached header first.
+        if let Some(region) = self.open_region_entry(region_pos).await {
+            return Ok(region.handle.lock().await.header.entries[index].exists());
         }
-
-        drop(regions);
 
         // Need to read header from disk
         let path = self.region_path(region_pos);
@@ -686,9 +748,12 @@ impl RegionManager {
 
     /// Flushes all dirty headers to disk.
     pub async fn flush_all(&self) -> io::Result<()> {
-        let mut regions = self.regions.write().await;
+        let entries: Vec<Arc<RegionEntry>> =
+            self.regions.read().await.values().map(Arc::clone).collect();
 
-        for handle in regions.values_mut() {
+        for entry in entries {
+            let mut handle = entry.handle.lock().await;
+            let handle = &mut *handle;
             if handle.header_dirty {
                 Self::write_header(&mut handle.file, &handle.header).await?;
                 handle.header_dirty = false;
@@ -703,13 +768,17 @@ impl RegionManager {
     /// This should be called during graceful shutdown after all chunks have been saved.
     /// It ensures all data is persisted and file handles are properly closed.
     pub async fn close_all(&self) -> io::Result<()> {
-        let mut regions = self.regions.write().await;
+        let entries: Vec<Arc<RegionEntry>> =
+            self.regions.write().await.drain().map(|(_, entry)| entry).collect();
 
-        for (_, mut handle) in regions.drain() {
+        for entry in entries {
+            let mut handle = entry.handle.lock().await;
+            let handle = &mut *handle;
             if handle.header_dirty {
                 Self::write_header(&mut handle.file, &handle.header).await?;
+                handle.header_dirty = false;
             }
-            // File handle is dropped here, closing the file
+            // The file is closed when the last reference to the entry goes.
         }
 
         Ok(())
@@ -795,6 +864,177 @@ mod tests {
             .await
             .expect("chunk table entry should be readable");
         assert!(ChunkEntry::from_bytes(bytes).is_some_and(|entry| entry.exists()));
+    }
+
+    fn empty_persistent_chunk() -> PersistentChunk<'static> {
+        PersistentChunk {
+            last_modified: 0,
+            block_states: Vec::new(),
+            biomes: Vec::new(),
+            sections: Vec::new(),
+            block_entities: Vec::new(),
+            entities: Vec::new(),
+            block_ticks: Vec::new(),
+            fluid_ticks: Vec::new(),
+            heightmaps: Vec::new(),
+            light: PersistentLightData::default(),
+            carving_mask: None,
+            postprocessing: Vec::new(),
+            structure_starts: Vec::new(),
+            structure_references: Vec::new(),
+            pois: Vec::new(),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_acquire_and_release_leave_no_open_regions() {
+        // The reference count lives outside the region's own lock so that
+        // acquiring and releasing a chunk -- which every chunk does -- need not
+        // take it. That only works if a reference taken concurrently with the
+        // last release cannot revive an entry already dropped from the map: two
+        // live handles on one region file would let their headers diverge.
+        let directory = test_directory("concurrent-acquire");
+        let pos = ChunkPos::new(0, 0);
+        let payload = b"payload";
+        write_test_region(&directory, pos, payload, payload.len() as u32)
+            .await
+            .expect("test region should be written");
+
+        let manager = Arc::new(RegionManager::new(&directory));
+        let mut tasks = Vec::new();
+        for chunk in 0..32 {
+            let manager = Arc::clone(&manager);
+            // All 32 chunks are inside the same 32x32 region, so every task
+            // contends for the same entry.
+            let chunk_pos = ChunkPos::new(chunk % 8, chunk / 8);
+            tasks.push(tokio::spawn(async move {
+                for _ in 0..64 {
+                    manager
+                        .acquire_chunk(chunk_pos)
+                        .await
+                        .expect("region should open");
+                    manager
+                        .release_chunk(chunk_pos)
+                        .await
+                        .expect("region should release");
+                }
+            }));
+        }
+        for task in tasks {
+            task.await.expect("acquire/release task should not panic");
+        }
+
+        assert!(
+            manager.regions.read().await.is_empty(),
+            "every acquire was released, so no region should still be open"
+        );
+        assert!(
+            manager
+                .chunk_exists(pos)
+                .await
+                .expect("header should still be readable"),
+            "the chunk table survived the churn"
+        );
+
+        fs::remove_dir_all(directory)
+            .await
+            .expect("test directory should be removable");
+    }
+
+    #[tokio::test]
+    async fn saving_a_chunk_flushes_its_header_once_released() {
+        // save_chunk counts itself against the region for the duration of the
+        // write. Releasing that reference is what closes the file and writes the
+        // header, so a save into a region nobody else holds must still land.
+        let directory = test_directory("save-flush");
+        fs::create_dir_all(&directory)
+            .await
+            .expect("test directory should be creatable");
+        let pos = ChunkPos::new(3, 5);
+        let manager = RegionManager::new(&directory);
+
+        assert!(
+            manager
+                .save_chunk_data(
+                    PreparedChunkSave {
+                        pos,
+                        status: ChunkStatus::Full,
+                        persistent: empty_persistent_chunk(),
+                        handled_runtime_entity_ids: Vec::new(),
+                    },
+                    &test_thread_pool(),
+                )
+                .await
+                .expect("chunk should save")
+        );
+        assert!(
+            manager.regions.read().await.is_empty(),
+            "a save into an otherwise unheld region should close it again"
+        );
+
+        let reopened = RegionManager::new(&directory);
+        assert!(
+            reopened
+                .chunk_exists(pos)
+                .await
+                .expect("header should be readable"),
+            "the saved chunk's table entry was flushed to disk"
+        );
+
+        fs::remove_dir_all(directory)
+            .await
+            .expect("test directory should be removable");
+    }
+
+    #[tokio::test]
+    async fn a_region_held_by_another_chunk_stays_open_across_a_save() {
+        let directory = test_directory("save-held");
+        fs::create_dir_all(&directory)
+            .await
+            .expect("test directory should be creatable");
+        let held = ChunkPos::new(0, 0);
+        let saved = ChunkPos::new(1, 0);
+        let manager = RegionManager::new(&directory);
+
+        manager
+            .acquire_chunk(held)
+            .await
+            .expect("region should open");
+        manager
+            .save_chunk_data(
+                PreparedChunkSave {
+                    pos: saved,
+                    status: ChunkStatus::Full,
+                    persistent: empty_persistent_chunk(),
+                    handled_runtime_entity_ids: Vec::new(),
+                },
+                &test_thread_pool(),
+            )
+            .await
+            .expect("chunk should save");
+
+        assert_eq!(
+            manager.regions.read().await.len(),
+            1,
+            "the save must not close a region another chunk is holding"
+        );
+        manager
+            .release_chunk(held)
+            .await
+            .expect("region should release");
+        assert!(manager.regions.read().await.is_empty());
+
+        let reopened = RegionManager::new(&directory);
+        assert!(
+            reopened
+                .chunk_exists(saved)
+                .await
+                .expect("header should be readable")
+        );
+
+        fs::remove_dir_all(directory)
+            .await
+            .expect("test directory should be removable");
     }
 
     #[tokio::test]
