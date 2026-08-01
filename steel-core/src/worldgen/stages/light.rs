@@ -45,21 +45,6 @@ pub(crate) fn generate(
     publish_light_updates(&context, LightLayer::Block, block_updates);
 }
 
-pub(crate) fn load(
-    context: Arc<WorldGenContext>,
-    _step: &ChunkStep,
-    cache: &Arc<StaticCache2D<Arc<ChunkHolder>>>,
-    holder: Arc<ChunkHolder>,
-) {
-    let (sky_updates, block_updates) = run_loaded_light_stage(
-        cache,
-        holder.as_ref(),
-        context.world().dimension_type.has_skylight,
-    );
-    publish_light_updates(&context, LightLayer::Sky, sky_updates);
-    publish_light_updates(&context, LightLayer::Block, block_updates);
-}
-
 fn run_light_stage(
     cache: &StaticCache2D<Arc<ChunkHolder>>,
     holder: &ChunkHolder,
@@ -117,6 +102,14 @@ fn run_light_stage(
     (sky_updates, block_result.updated_sections)
 }
 
+/// Force-loads and validates the light of a chunk whose light data came from disk.
+///
+/// Nothing calls this today. Chunks read from storage publish their saved status
+/// directly (`ChunkHolder::apply_existing_empty_step`) and their light is trusted
+/// as written, so the validation pass never runs. Kept, with its tests, as the
+/// implementation to wire back in if saved light stops being trusted. The
+/// `cfg(test)` says exactly that: today the tests are its only callers.
+#[cfg(test)]
 fn run_loaded_light_stage(
     cache: &StaticCache2D<Arc<ChunkHolder>>,
     holder: &ChunkHolder,

@@ -88,11 +88,3 @@ pub(crate) fn generate_references(
         target_chunk.mark_dirty();
     }
 }
-
-pub(crate) fn load_starts(
-    _context: Arc<WorldGenContext>,
-    _step: &ChunkStep,
-    _cache: &Arc<StaticCache2D<Arc<ChunkHolder>>>,
-    _holder: Arc<ChunkHolder>,
-) {
-}

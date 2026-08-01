@@ -46,11 +46,34 @@ struct GateState {
     waiters: FxHashMap<(i32, i32), Vec<Waiter>>,
 }
 
-#[derive(Debug)]
+/// What a blocked reserver left behind to be run once its window is free.
+///
+/// It is handed the reservation directly, so a caller does not have to be a
+/// future parked on a channel. That matters under pregeneration: with a worker
+/// per core and an exclusion radius of `LIGHT_WORK_CENTER_EXCLUSION_RADIUS`, a
+/// dense generation front can have every worker wanting an overlapping window at
+/// once, and blocking a pool thread there stalls the very tasks that would
+/// release it.
+///
+/// Continuations run without the gate lock held, but they do run on the releaser's
+/// thread. Hand the work off rather than doing it inline: a continuation that runs
+/// a whole workset and then drops its reservation grants the next waiter from
+/// inside its own drop, so a chain of them recurses on the releasing thread's
+/// stack.
+type GrantContinuation = Box<dyn FnOnce(LightWorkWindowReservation) + Send>;
+
 struct Waiter {
     center: ChunkPos,
-    /// Signalled once the window has been reserved on this waiter's behalf.
-    grant: oneshot::Sender<()>,
+    /// Run once the window has been reserved on this waiter's behalf.
+    grant: GrantContinuation,
+}
+
+impl std::fmt::Debug for Waiter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Waiter")
+            .field("center", &self.center)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Reservation for one light-engine cache window.
@@ -69,43 +92,62 @@ impl LightWorkWindowGate {
         }
     }
 
+    /// Runs `grant` with the radius-2 light cache window centered on `center`,
+    /// either immediately or once whoever holds a conflicting window releases it.
+    ///
+    /// Never blocks the calling thread. See [`GrantContinuation`] for what a
+    /// continuation may do.
+    pub(crate) fn reserve_centered_with<F>(self: &Arc<Self>, center: ChunkPos, grant: F)
+    where
+        F: FnOnce(LightWorkWindowReservation) + Send + 'static,
+    {
+        {
+            let mut state = self.state.lock();
+            if !state.try_insert_active(center) {
+                // Registering has to happen under the same lock hold as the
+                // failed attempt. A release landing between the two would find
+                // no waiter to hand the window to, and this continuation would
+                // never run.
+                state
+                    .waiters
+                    .entry(Self::grid_cell(center))
+                    .or_default()
+                    .push(Waiter {
+                        center,
+                        grant: Box::new(grant),
+                    });
+                return;
+            }
+        }
+
+        grant(LightWorkWindowReservation {
+            gate: Arc::clone(self),
+            center,
+        });
+    }
+
     /// Reserves the radius-2 light cache window centered on `center`.
     ///
+    /// Parks a future on the reservation. Prefer [`Self::reserve_centered_with`]
+    /// anywhere the caller occupies a pool thread while it waits.
+    ///
     /// # Panics
-    /// Panics if the granting sender is dropped without granting, which cannot
-    /// happen while this future holds an `Arc` to the gate.
+    /// Panics if the granting continuation is dropped without being run, which
+    /// cannot happen while this future holds an `Arc` to the gate.
     pub(crate) async fn reserve_centered(
         self: &Arc<Self>,
         center: ChunkPos,
     ) -> LightWorkWindowReservation {
-        let granted = {
-            let mut state = self.state.lock();
-            if state.try_insert_active(center) {
-                return LightWorkWindowReservation {
-                    gate: Arc::clone(self),
-                    center,
-                };
-            }
+        let (grant, granted) = oneshot::channel();
+        self.reserve_centered_with(center, move |reservation| {
+            // A send failure means this future was dropped before the window
+            // came free; the reservation then drops here and is handed on.
+            let _ = grant.send(reservation);
+        });
 
-            let (grant, granted) = oneshot::channel();
-            state
-                .waiters
-                .entry(Self::grid_cell(center))
-                .or_default()
-                .push(Waiter { center, grant });
-            granted
-        };
-
-        // The releaser inserts this center into `active` before signalling, so
-        // the window is already held by the time this resolves.
         granted
             .await
-            .expect("light work window grant sender dropped without granting");
-
-        LightWorkWindowReservation {
-            gate: Arc::clone(self),
-            center,
-        }
+            .expect("light work window grant continuation dropped without running")
     }
 
     /// Attempts to reserve the radius-2 light cache window centered on `center`.
@@ -183,12 +225,21 @@ impl GateState {
         true
     }
 
-    /// Hands the freed window to every waiter that `released` was blocking.
+    /// Claims the freed window for every waiter that `released` was blocking,
+    /// and returns their continuations for the caller to run.
+    ///
+    /// The windows are already reserved on the waiters' behalf when this
+    /// returns, so a racing reserver cannot take one out from under them. The
+    /// continuations are handed back rather than run here because running one
+    /// under the gate lock would deadlock the moment it touched the gate again —
+    /// which it does as soon as it drops its reservation.
     ///
     /// Only waiters within the exclusion radius of the released center can have
     /// been unblocked by it, and those all live in the nine cells around it, so
     /// this never walks the whole waiter set.
-    fn grant_unblocked(&mut self, released: ChunkPos) {
+    #[must_use]
+    fn grant_unblocked(&mut self, released: ChunkPos) -> Vec<(ChunkPos, GrantContinuation)> {
+        let mut granted = Vec::new();
         let (cx, cz) = LightWorkWindowGate::grid_cell(released);
         for dx in -1..=1 {
             for dz in -1..=1 {
@@ -215,14 +266,8 @@ impl GateState {
                         .get_mut(&cell)
                         .expect("waiter bucket vanished while granting")
                         .swap_remove(index);
-                    // Reserve on the waiter's behalf before waking it, so it
-                    // cannot lose the window to a racing reserver.
                     self.insert_active(center);
-                    if waiter.grant.send(()).is_err() {
-                        // The waiting future was dropped before it was granted;
-                        // hand the window back rather than leaking it.
-                        self.remove_active(center);
-                    }
+                    granted.push((center, waiter.grant));
                 }
 
                 if self.waiters.get(&cell).is_some_and(Vec::is_empty) {
@@ -230,6 +275,7 @@ impl GateState {
                 }
             }
         }
+        granted
     }
 }
 
@@ -241,11 +287,22 @@ impl Default for LightWorkWindowGate {
 
 impl Drop for LightWorkWindowReservation {
     fn drop(&mut self) {
-        let mut state = self.gate.state.lock();
-        let removed = state.remove_active(self.center);
-        debug_assert!(removed, "light work reservation missing active center");
-        if removed {
-            state.grant_unblocked(self.center);
+        let granted = {
+            let mut state = self.gate.state.lock();
+            let removed = state.remove_active(self.center);
+            debug_assert!(removed, "light work reservation missing active center");
+            if removed {
+                state.grant_unblocked(self.center)
+            } else {
+                Vec::new()
+            }
+        };
+
+        for (center, grant) in granted {
+            grant(LightWorkWindowReservation {
+                gate: Arc::clone(&self.gate),
+                center,
+            });
         }
     }
 }
@@ -289,6 +346,76 @@ mod tests {
 
         drop(first);
         assert!(gate.try_reserve_centered(ChunkPos::new(1, 0)).is_some());
+    }
+
+    #[test]
+    fn continuation_runs_holding_the_window_once_it_frees() {
+        let gate = Arc::new(LightWorkWindowGate::new());
+        let held = gate
+            .try_reserve_centered(ChunkPos::new(0, 0))
+            .expect("first light window should reserve");
+
+        let granted = Arc::new(SyncMutex::new(None));
+        gate.reserve_centered_with(ChunkPos::new(1, 0), {
+            let granted = Arc::clone(&granted);
+            move |reservation| *granted.lock() = Some(reservation)
+        });
+        assert!(
+            granted.lock().is_none(),
+            "continuation ran while a conflicting window was held"
+        );
+
+        drop(held);
+        assert!(
+            granted.lock().is_some(),
+            "continuation did not run once its window came free"
+        );
+        // It was handed the window, not just told to go take it.
+        assert!(gate.try_reserve_centered(ChunkPos::new(0, 0)).is_none());
+
+        let reservation = granted.lock().take();
+        drop(reservation);
+        assert!(gate.try_reserve_centered(ChunkPos::new(0, 0)).is_some());
+    }
+
+    #[test]
+    fn continuation_dropping_its_reservation_frees_the_window() {
+        let gate = Arc::new(LightWorkWindowGate::new());
+        let held = gate
+            .try_reserve_centered(ChunkPos::new(0, 0))
+            .expect("first light window should reserve");
+
+        // Stands in for a waiter that has gone away by the time it is granted:
+        // the reservation is handed over and immediately dropped.
+        gate.reserve_centered_with(ChunkPos::new(1, 0), drop);
+
+        drop(held);
+        assert!(gate.try_reserve_centered(ChunkPos::new(1, 0)).is_some());
+    }
+
+    #[test]
+    fn a_chain_of_continuations_all_run() {
+        let gate = Arc::new(LightWorkWindowGate::new());
+        let held = gate
+            .try_reserve_centered(ChunkPos::new(0, 0))
+            .expect("first light window should reserve");
+
+        // Each waiter releases the window from inside its own grant, so only the
+        // first is unblocked by `held`; the rest come off that cascade.
+        let ran = Arc::new(SyncMutex::new(Vec::new()));
+        for x in 1..=4 {
+            let ran = Arc::clone(&ran);
+            gate.reserve_centered_with(ChunkPos::new(x, 0), move |reservation| {
+                ran.lock().push(x);
+                drop(reservation);
+            });
+        }
+        assert!(ran.lock().is_empty());
+
+        drop(held);
+        let mut ran = ran.lock().clone();
+        ran.sort_unstable();
+        assert_eq!(ran, vec![1, 2, 3, 4]);
     }
 
     #[tokio::test]
