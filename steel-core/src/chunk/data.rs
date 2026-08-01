@@ -1108,12 +1108,17 @@ impl Chunk {
         let mut heightmaps = self.heightmaps.write();
         heightmaps.prime_from_sections(heightmap_types, min_y, height, &sections.sections);
 
-        for &(relative_y, state) in relative_writes {
-            let y = min_y + relative_y as i32;
-            for &hm_type in heightmap_types {
-                let Some(heightmap) = heightmaps.get_mut(hm_type) else {
-                    panic!("heightmap {hm_type:?} missing after priming");
-                };
+        // Types outer, writes inner: each heightmap is resolved once per column
+        // instead of once per write per type, which for a surface column is a
+        // couple of lookups instead of a couple of hundred. Safe to reorder
+        // because the maps are independent -- within one type the writes still
+        // arrive in their original order, which is what `update` depends on.
+        for &hm_type in heightmap_types {
+            let Some(heightmap) = heightmaps.get_mut(hm_type) else {
+                panic!("heightmap {hm_type:?} missing after priming");
+            };
+            for &(relative_y, state) in relative_writes {
+                let y = min_y + relative_y as i32;
                 heightmap.update(local_x, y, local_z, state, get_block);
             }
         }
