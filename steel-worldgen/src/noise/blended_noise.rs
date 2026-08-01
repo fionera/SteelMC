@@ -199,17 +199,32 @@ impl BlendedNoise {
 
     /// Compute blended noise for a column of Y values, returning the results.
     ///
-    /// Uses SIMD to process 4 Y values at a time.
+    /// Batches eight Y values at a time, matching the width the density kernel
+    /// is emitted in -- this was still splitting the column four at a time
+    /// after that widened, so it issued twice the vector operations it needed.
+    /// Narrower batches follow for the remainder.
     pub fn compute_column(&self, block_x: i32, block_ys: &[i32], block_z: i32, out: &mut [f64]) {
         let count = block_ys.len().min(out.len());
         let block_x = f64::from(block_x);
         let block_z = f64::from(block_z);
         let mut processed = 0;
 
+        // SIMD batches of 8 -- one AVX-512 register.
+        let chunks_8 = count / 8;
+        for chunk in 0..chunks_8 {
+            let base = chunk * 8;
+            let mut batch_ys = [0.0f64; 8];
+            for (lane, y) in batch_ys.iter_mut().enumerate() {
+                *y = f64::from(block_ys[base + lane]);
+            }
+            out[base..base + 8].copy_from_slice(&self.compute_simd(block_x, batch_ys, block_z));
+        }
+        processed += chunks_8 * 8;
+
         // SIMD batches of 4
-        let chunks_4 = count / 4;
+        let chunks_4 = (count - processed) / 4;
         for chunk in 0..chunks_4 {
-            let base = chunk * 4;
+            let base = processed + chunk * 4;
             let batch_ys = [
                 f64::from(block_ys[base]),
                 f64::from(block_ys[base + 1]),

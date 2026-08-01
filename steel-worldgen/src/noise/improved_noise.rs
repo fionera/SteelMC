@@ -561,33 +561,41 @@ impl ImprovedNoise {
         let x0 = self.p[xf as usize];
         let x1 = self.p[xf.wrapping_add(1) as usize];
 
-        let yf = ys_floor.cast();
+        let yf: Simd<u8, N> = ys_floor.cast();
 
-        // Per-lane y-dependent permutation lookups
-        let mut h000 = [0usize; N];
-        let mut h100 = [0usize; N];
-        let mut h010 = [0usize; N];
-        let mut h110 = [0usize; N];
-        let mut h001 = [0usize; N];
-        let mut h101 = [0usize; N];
-        let mut h011 = [0usize; N];
-        let mut h111 = [0usize; N];
+        // Y-dependent permutation lookups, vectorised across lanes. The final
+        // round is eight index vectors, which at eight lanes is exactly one
+        // AVX-512 register, so it goes through the batched table lookup
+        // instead of 64 scalar loads. Index arithmetic is `u8`, so the vector
+        // adds wrap exactly as `wrapping_add` did.
+        let x0_v = Simd::splat(x0);
+        let x1_v = Simd::splat(x1);
+        let one_v = Simd::splat(1u8);
+        let xy00 = self.p_simd(x0_v + yf);
+        let xy01 = self.p_simd(x0_v + yf + one_v);
+        let xy10 = self.p_simd(x1_v + yf);
+        let xy11 = self.p_simd(x1_v + yf + one_v);
 
-        for i in 0..N {
-            let y = yf[i];
-            let xy00 = self.p[x0.wrapping_add(y) as usize];
-            let xy01 = self.p[x0.wrapping_add(y).wrapping_add(1) as usize];
-            let xy10 = self.p[x1.wrapping_add(y) as usize];
-            let xy11 = self.p[x1.wrapping_add(y).wrapping_add(1) as usize];
-            h000[i] = self.p[xy00.wrapping_add(zf) as usize] as usize;
-            h100[i] = self.p[xy10.wrapping_add(zf) as usize] as usize;
-            h010[i] = self.p[xy01.wrapping_add(zf) as usize] as usize;
-            h110[i] = self.p[xy11.wrapping_add(zf) as usize] as usize;
-            h001[i] = self.p[xy00.wrapping_add(zf).wrapping_add(1) as usize] as usize;
-            h101[i] = self.p[xy10.wrapping_add(zf).wrapping_add(1) as usize] as usize;
-            h011[i] = self.p[xy01.wrapping_add(zf).wrapping_add(1) as usize] as usize;
-            h111[i] = self.p[xy11.wrapping_add(zf).wrapping_add(1) as usize] as usize;
-        }
+        let zf_v = Simd::splat(zf);
+        let zf1_v = Simd::splat(zf.wrapping_add(1));
+        let corners = self.p_simd_batch8([
+            xy00 + zf_v,
+            xy10 + zf_v,
+            xy01 + zf_v,
+            xy11 + zf_v,
+            xy00 + zf1_v,
+            xy10 + zf1_v,
+            xy01 + zf1_v,
+            xy11 + zf1_v,
+        ]);
+        let h000 = corners[0].cast::<usize>().to_array();
+        let h100 = corners[1].cast::<usize>().to_array();
+        let h010 = corners[2].cast::<usize>().to_array();
+        let h110 = corners[3].cast::<usize>().to_array();
+        let h001 = corners[4].cast::<usize>().to_array();
+        let h101 = corners[5].cast::<usize>().to_array();
+        let h011 = corners[6].cast::<usize>().to_array();
+        let h111 = corners[7].cast::<usize>().to_array();
 
         // Vectorized gradient dot products
         let xr_v: Simd<f64, N> = Simd::splat(xr);
