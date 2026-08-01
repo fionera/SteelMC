@@ -19,7 +19,6 @@ use steel_core::player::player_data_storage::GlobalPlayerData;
 use steel_core::player::player_inventory::MenuRemovalStatus;
 use steel_core::server::Server;
 use steel_utils::text::DisplayResolutor;
-use steel_utils::threading::worker_threads_for_available;
 use text_components::fmt::set_display_resolutor;
 use tokio::runtime::{Builder, Runtime};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
@@ -159,7 +158,8 @@ fn steel_main() {
     };
 
     let main_worker_threads = configured_worker_threads(steel_config.server.threads.main_runtime);
-    let chunk_worker_threads = configured_worker_threads(steel_config.server.threads.chunk_runtime);
+    let chunk_worker_threads =
+        configured_chunk_worker_threads(steel_config.server.threads.chunk_runtime);
 
     let chunk_runtime = Arc::new(
         Builder::new_multi_thread()
@@ -187,8 +187,54 @@ fn configured_worker_threads(configured_threads: Option<usize>) -> usize {
     worker_threads_for_available(configured_threads, available_worker_threads())
 }
 
+fn configured_chunk_worker_threads(configured_threads: Option<usize>) -> usize {
+    chunk_worker_threads_for_available(configured_threads, available_worker_threads())
+}
+
 fn available_worker_threads() -> usize {
     thread::available_parallelism().map_or(4, NonZero::get)
+}
+
+fn worker_threads_for_available(
+    configured_threads: Option<usize>,
+    available_threads: usize,
+) -> usize {
+    let available_threads = available_threads.max(1);
+    if let Some(configured_threads) = configured_threads.filter(|&threads| threads > 0) {
+        return configured_threads.min(available_threads);
+    }
+
+    ((available_threads / 2).max(2)).min(available_threads)
+}
+
+/// Worker threads for the chunk runtime.
+///
+/// Much smaller than the main runtime's half-the-machine, because the two do
+/// different work. The chunk runtime does not generate chunks; it orchestrates.
+/// Its tasks claim a status, hand the actual work to the generation pool, and
+/// await a result, so it needs enough workers to keep that pipeline fed and no
+/// more. Measured over a 201x201 pregeneration on 128 threads it used 29.6 CPU
+/// seconds against the generation pool's 407 -- about 5% occupancy across the 64
+/// workers half-the-machine gave it.
+///
+/// Those idle workers were expensive. They are 64 more runnable threads for the
+/// kernel to place against a generation pool that wants every core it can get,
+/// and cutting them to 16 was the single largest configuration win measured:
+/// 6,114 -> 8,086 chunks/s at 301x301 (+32%) and 6,388 -> 7,124 at 601x601
+/// (+11.5%). Below the plateau it does start to bind -- 8 workers gave 7,905 at
+/// 201x201 against 8,124 at 12 and 8,130 at 16 -- and 24 is slightly worse
+/// again, so an eighth of the machine with a floor of 4 sits in the middle of
+/// what was measured.
+fn chunk_worker_threads_for_available(
+    configured_threads: Option<usize>,
+    available_threads: usize,
+) -> usize {
+    let available_threads = available_threads.max(1);
+    if let Some(configured_threads) = configured_threads.filter(|&threads| threads > 0) {
+        return configured_threads.min(available_threads);
+    }
+
+    (available_threads / 8).clamp(4, 16).min(available_threads)
 }
 
 async fn main_async(chunk_runtime: Arc<Runtime>, steel_config: config::SteelConfig) {
@@ -457,4 +503,40 @@ async fn shutdown_worlds(server: &Arc<Server>) {
         }
     }
     log::info!("Saved {saved} players");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{chunk_worker_threads_for_available, worker_threads_for_available};
+
+    #[test]
+    fn configured_worker_threads_are_capped_to_available_threads() {
+        assert_eq!(worker_threads_for_available(Some(16), 8), 8);
+        assert_eq!(worker_threads_for_available(Some(4), 8), 4);
+        assert_eq!(chunk_worker_threads_for_available(Some(16), 8), 8);
+        assert_eq!(chunk_worker_threads_for_available(Some(4), 8), 4);
+    }
+
+    #[test]
+    fn zero_worker_threads_uses_auto_default() {
+        assert_eq!(worker_threads_for_available(Some(0), 8), 4);
+        assert_eq!(worker_threads_for_available(None, 8), 4);
+        assert_eq!(worker_threads_for_available(None, 1), 1);
+    }
+
+    #[test]
+    fn chunk_runtime_stays_small_on_large_machines() {
+        // The chunk runtime orchestrates generation rather than performing it,
+        // so it must not scale with the machine the way the main runtime does.
+        // Half of a 128-thread box measured 32% slower at 301x301 than an
+        // eighth, purely from the idle workers competing for placement.
+        assert_eq!(chunk_worker_threads_for_available(None, 128), 16);
+        assert_eq!(chunk_worker_threads_for_available(None, 256), 16);
+        assert!(chunk_worker_threads_for_available(None, 128) < worker_threads_for_available(None, 128));
+        // Small machines still get a workable floor, never more than they have.
+        assert_eq!(chunk_worker_threads_for_available(None, 16), 4);
+        assert_eq!(chunk_worker_threads_for_available(None, 8), 4);
+        assert_eq!(chunk_worker_threads_for_available(None, 2), 2);
+        assert_eq!(chunk_worker_threads_for_available(None, 1), 1);
+    }
 }

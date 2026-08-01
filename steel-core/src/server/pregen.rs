@@ -942,16 +942,20 @@ mod tests {
 
     #[test]
     fn default_generation_threads_leave_headroom_for_the_other_pools() {
-        use crate::server::default_chunk_generation_threads;
+        use crate::server::{default_chunk_encoding_threads, default_chunk_generation_threads};
         // Small machines keep every thread; there is nothing to spare.
         assert_eq!(default_chunk_generation_threads(1), 1);
         assert_eq!(default_chunk_generation_threads(4), 4);
-        // Larger ones give back a single thread. Holding back a quarter measured
-        // faster only while task creation was serialized on the scheduling
-        // thread; once that was fixed, generation kept scaling to the top of the
-        // machine.
         assert_eq!(default_chunk_generation_threads(8), 6);
-        assert_eq!(default_chunk_generation_threads(128), 96);
+        // Thirteen sixteenths of a large machine: the measured peak, with a
+        // sharp falloff above it (104 threads 8,243 chunks/s, 112 only 7,137).
+        assert_eq!(default_chunk_generation_threads(128), 104);
+
+        // Whatever is left has to cover the encoding pool and the chunk runtime
+        // without pushing the machine further into oversubscription than the
+        // sweep that produced these numbers.
+        assert_eq!(default_chunk_encoding_threads(128), 12);
+        assert!(default_chunk_generation_threads(128) + default_chunk_encoding_threads(128) <= 128);
     }
 
     #[test]

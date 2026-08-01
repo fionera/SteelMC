@@ -175,19 +175,24 @@ fn configured_chunk_generation_threads(configured_threads: Option<usize>) -> usi
 /// want cores as well -- and past a point extra generation threads buy nothing
 /// but scheduling and cache pressure.
 ///
-/// This was briefly raised to all-but-one on a measurement that turned out to
-/// be invalid: it was taken on a 301x301 pregeneration with a pipeline deep
-/// enough to hold the whole area, so nothing ever unloaded and the run was
-/// missing all of its unload and save work. Re-measured on a 601x601 area,
-/// where unloading is forced, three quarters beats all-but-one by 20%: 96
-/// threads 6,690 chunks/s against 127 at 5,576. That matches the original
-/// finding this briefly overrode.
+/// Thirteen sixteenths is where the measurement puts the peak, and the peak is
+/// sharp on the high side. Swept on a 128-thread machine over a 201x201
+/// pregeneration with the chunk runtime already trimmed, chunks/s ran 96: 8,044
+/// | 100: 8,083 | **104: 8,243** | 108: 7,909 | 112: 7,137 | 120: 7,257. The
+/// 100-104 plateau holds at 301x301 and 601x601; above it the pool starts
+/// losing to the rest of the machine faster than the extra workers earn.
+///
+/// This was once briefly raised to all-but-one on a measurement that turned out
+/// to be invalid -- taken on a 301x301 pregeneration with a pipeline deep enough
+/// to hold the whole area, so nothing ever unloaded and the run was missing all
+/// of its unload and save work. Anything set here has to be measured on an area
+/// large enough to force unloading.
 pub(crate) fn default_chunk_generation_threads(available_threads: usize) -> usize {
     let available = available_threads.max(1);
     if available <= 4 {
         available
     } else {
-        (available * 3 / 4).max(4)
+        (available * 13 / 16).max(4)
     }
 }
 
@@ -210,8 +215,14 @@ fn configured_chunk_encoding_threads(configured_threads: Option<usize>) -> usize
 /// An eighth of the machine leaves 3-7x headroom over the measured pregeneration
 /// demand, which also covers the burstier gameplay path where this pool encodes
 /// chunk packets for joining players.
+///
+/// The ceiling is 12 rather than 16 because the contention above is worse than
+/// the headroom below is worth. On a 128-thread machine at 301x301, 16 encoding
+/// threads measured 7,066 chunks/s against 8,072 at 12 -- a 12% loss, and an
+/// unstable one (6,801 and 7,330 on two runs of the same build). Eight is also
+/// worse, at 7,828: the pool does need real workers, just not idle ones.
 pub(crate) fn default_chunk_encoding_threads(available_threads: usize) -> usize {
-    (available_threads.max(1) / 8).clamp(2, 16)
+    (available_threads.max(1) / 8).clamp(2, 12)
 }
 
 fn configured_packet_workers(configured_workers: Option<usize>) -> usize {
