@@ -549,6 +549,7 @@ impl<N: DimensionNoises> Aquifer<N> {
         clippy::too_many_lines,
         reason = "splitting would hurt readability of the aquifer sampling logic"
     )]
+    #[inline(always)]
     pub fn compute_substance(
         &mut self,
         noises: &N,
@@ -557,15 +558,19 @@ impl<N: DimensionNoises> Aquifer<N> {
         world_z: i32,
         density: f64,
     ) -> AquiferResult {
-        // Solid block — let the caller decide (stone or ore)
+        // Solid block -- let the caller decide (stone or ore). This is the
+        // common answer for a chunk's blocks and needs none of the aquifer
+        // state, so it is answered here rather than behind the call.
         if density > 0.0 {
             self.should_schedule_fluid_update = false;
             return AquiferResult::Solid;
         }
 
-        // Disabled aquifers (nether/end): use global fluid picker directly,
-        // matching vanilla's `Aquifer.createDisabled`.
-        if !N::Settings::AQUIFERS_ENABLED {
+        // Disabled aquifers (nether/end), or above the sampling threshold:
+        // the global fluid decides, again without touching aquifer state.
+        // Tested before `global_fluid` is computed so the solid path above
+        // loads nothing extra.
+        if !N::Settings::AQUIFERS_ENABLED || world_y > self.skip_sampling_above_y {
             self.should_schedule_fluid_update = false;
             let gf = global_fluid(
                 world_y,
@@ -580,6 +585,23 @@ impl<N: DimensionNoises> Aquifer<N> {
             };
         }
 
+        self.compute_substance_sampled(noises, world_x, world_y, world_z, density)
+    }
+
+    /// The sampling half of [`Self::compute_substance`].
+    ///
+    /// Split out and kept out of line so the early-outs above can be inlined
+    /// into the caller without dragging this function's seven callee-saved
+    /// pushes and 216-byte frame onto the paths that never sample.
+    #[inline(never)]
+    fn compute_substance_sampled(
+        &mut self,
+        noises: &N,
+        world_x: i32,
+        world_y: i32,
+        world_z: i32,
+        density: f64,
+    ) -> AquiferResult {
         let gf = global_fluid(
             world_y,
             self.lava_floor,
@@ -587,15 +609,6 @@ impl<N: DimensionNoises> Aquifer<N> {
             self.lava_id,
             self.default_fluid_id,
         );
-
-        // Above the skip threshold: use global fluid directly
-        if world_y > self.skip_sampling_above_y {
-            self.should_schedule_fluid_update = false;
-            return match gf.at(world_y) {
-                Some(id) => AquiferResult::Fluid(id),
-                None => AquiferResult::Air,
-            };
-        }
 
         // If global fluid is lava here, return lava
         if gf.fluid_type == self.lava_id && world_y < gf.fluid_level {
