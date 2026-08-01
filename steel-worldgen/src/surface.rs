@@ -42,6 +42,13 @@ pub struct SurfaceRuleContext<'a> {
     block_states: &'a [BlockStateId],
     /// Lazily computed temperature condition value.
     cold_enough_to_snow: Option<bool>,
+    /// Last `condition_noise_3d` sample, keyed by noise index.
+    ///
+    /// The generated rules test one 3D noise against several disjoint ranges in
+    /// sequence, re-sampling the same noise at the same block for each test. A
+    /// context lives for exactly one block position, so one slot is enough and
+    /// cannot go stale.
+    noise_3d_memo: Cell<Option<(usize, f64)>>,
 }
 
 impl<'a> SurfaceRuleContext<'a> {
@@ -79,6 +86,7 @@ impl<'a> SurfaceRuleContext<'a> {
             stone_depth_below,
             water_height,
             biome_id,
+            noise_3d_memo: Cell::new(None),
             biome_provider,
             system,
             condition_noises,
@@ -94,11 +102,19 @@ impl<'a> SurfaceRuleContext<'a> {
             .get(noise_index, self.system, self.block_x, self.block_z)
     }
 
-    /// Returns an uncached surface condition noise value sampled at this block.
+    /// Returns a surface condition noise value sampled at this block.
     #[must_use]
     pub fn condition_noise_3d(&self, noise_index: usize) -> f64 {
-        self.system
-            .condition_noise_3d(noise_index, self.block_x, self.block_y, self.block_z)
+        if let Some((index, value)) = self.noise_3d_memo.get()
+            && index == noise_index
+        {
+            return value;
+        }
+        let value =
+            self.system
+                .condition_noise_3d(noise_index, self.block_x, self.block_y, self.block_z);
+        self.noise_3d_memo.set(Some((noise_index, value)));
+        value
     }
 
     /// Returns a pre-resolved block state emitted by the generated surface rule.
