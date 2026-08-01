@@ -1,6 +1,5 @@
 //! `ChunkGenerationTask` handles the generation process for chunks.
 use std::{
-    cmp::max,
     future::Future,
     mem,
     pin::Pin,
@@ -18,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 use crate::chunk::{
     chunk_holder::ChunkHolder,
     chunk_map::ChunkMap,
-    chunk_pyramid::{GENERATION_PYRAMID, LOADING_PYRAMID},
+    chunk_pyramid::GENERATION_PYRAMID,
     status::ChunkStatus,
 };
 
@@ -151,8 +150,6 @@ pub struct ChunkGenerationTask {
     worst_case_radius: i32,
     /// Holder for the chunk this task is targeting.
     pub center_holder: Arc<ChunkHolder>,
-    /// Whether generation is required for this task.
-    pub needs_generation: AtomicBool,
     /// The thread pool to use for generation.
     pub thread_pool: Arc<ThreadPool>,
 }
@@ -192,7 +189,6 @@ impl ChunkGenerationTask {
             neighbor_ready: SyncMutex::new(Vec::new()),
             worst_case_radius,
             center_holder,
-            needs_generation: AtomicBool::new(true),
             thread_pool,
         }
     }
@@ -252,7 +248,6 @@ impl ChunkGenerationTask {
         &self,
         halo: &Arc<StaticCache2D<Arc<ChunkHolder>>>,
         status: ChunkStatus,
-        needs_generation: bool,
         chunk_holder: &Arc<ChunkHolder>,
     ) -> bool {
         let published_status = chunk_holder.published_status();
@@ -284,11 +279,6 @@ impl ChunkGenerationTask {
 
         let pyramid = &GENERATION_PYRAMID;
 
-        assert!(
-            !generate || needs_generation,
-            "Generation required but not expected for chunk load"
-        );
-
         if let Some(future) = chunk_holder.apply_step(
             pyramid.get_step_to(status),
             &self.chunk_map,
@@ -308,15 +298,14 @@ impl ChunkGenerationTask {
         &self,
         halo: &Arc<StaticCache2D<Arc<ChunkHolder>>>,
         status: ChunkStatus,
-        needs_generation: bool,
     ) {
-        let radius = self.get_radius_for_layer(status, needs_generation);
+        let radius = self.get_radius_for_layer(status);
         // This for loop is inclusive, so if the radius is 0, we will only schedule the center chunk.
         for x in (self.pos.0.x - radius)..=(self.pos.0.x + radius) {
             for y in (self.pos.0.y - radius)..=(self.pos.0.y + radius) {
                 let chunk_holder = halo.get(x, y);
                 if self.is_cancelled()
-                    || !self.schedule_chunk_in_layer(halo, status, needs_generation, chunk_holder)
+                    || !self.schedule_chunk_in_layer(halo, status, chunk_holder)
                 {
                     return;
                 }
@@ -324,14 +313,8 @@ impl ChunkGenerationTask {
         }
     }
 
-    const fn get_radius_for_layer(&self, status: ChunkStatus, needs_generation: bool) -> i32 {
-        let pyramid = if needs_generation {
-            &GENERATION_PYRAMID
-        } else {
-            &LOADING_PYRAMID
-        };
-
-        pyramid
+    const fn get_radius_for_layer(&self, status: ChunkStatus) -> i32 {
+        GENERATION_PYRAMID
             .get_step_to(self.target_status)
             .get_accumulated_radius_of(status) as i32
     }
@@ -343,12 +326,6 @@ impl ChunkGenerationTask {
     pub fn schedule_next_layer(&self, halo: &Arc<StaticCache2D<Arc<ChunkHolder>>>) {
         let status_to_schedule = if self.scheduled_status.lock().is_none() {
             ChunkStatus::Empty
-        } else if !self.needs_generation.load(Ordering::Relaxed)
-            && *self.scheduled_status.lock() == Some(ChunkStatus::Empty)
-            && !self.can_load_without_generation(halo)
-        {
-            self.needs_generation.store(true, Ordering::Relaxed);
-            ChunkStatus::Empty
         } else {
             self.scheduled_status
                 .lock()
@@ -357,46 +334,8 @@ impl ChunkGenerationTask {
                 .expect("Next status missing")
         };
 
-        self.schedule_layer(
-            halo,
-            status_to_schedule,
-            self.needs_generation.load(Ordering::Relaxed),
-        );
+        self.schedule_layer(halo, status_to_schedule);
         self.scheduled_status.lock().replace(status_to_schedule);
-    }
-
-    fn can_load_without_generation(&self, halo: &StaticCache2D<Arc<ChunkHolder>>) -> bool {
-        if self.target_status == ChunkStatus::Empty {
-            return true;
-        }
-        let highest_generated_status = self.center_holder.published_status();
-
-        if let Some(highest_status) = highest_generated_status {
-            if highest_status < self.target_status {
-                return false;
-            }
-
-            let dependencies = &LOADING_PYRAMID
-                .get_step_to(self.target_status)
-                .accumulated_dependencies;
-            let range = dependencies.get_radius() as i32;
-
-            for x in (self.pos.0.x - range)..=(self.pos.0.x + range) {
-                for z in (self.pos.0.y - range)..=(self.pos.0.y + range) {
-                    let distance = max((self.pos.0.x - x).abs(), (self.pos.0.y - z).abs()) as usize;
-                    if let Some(required_status) = dependencies.get(distance) {
-                        let neighbor = halo.get(x, z);
-                        let published = neighbor.published_status();
-                        if published < Some(required_status) {
-                            return false;
-                        }
-                    }
-                }
-            }
-            true
-        } else {
-            false
-        }
     }
 
     /// Runs the generation task loop.

@@ -613,26 +613,13 @@ impl ChunkHolder {
             .map(FullChunkRef::from_full_context)
     }
 
-    /// Waits until the chunk has reached the given status.
-    pub async fn await_chunk(&self, status: ChunkStatus) -> Option<&Chunk> {
-        loop {
-            // Register before checking the state so a concurrent publication
-            // cannot land between the check and the wait.
-            let notified = self.status_changed.notified();
-
-            if self.published_status.load(Ordering::Acquire) >= encoded_published_status(status) {
-                return self.data.get();
-            }
-
-            if self.is_status_disallowed(status) {
-                return None;
-            }
-
-            notified.await;
-        }
-    }
 
     /// Waits until the chunk has reached the given status without reading chunk data.
+    /// Retained with no production caller on purpose: its two tests
+    /// (`status_waiter_observes_publication_after_subscribing`,
+    /// `pending_status_waiters_wake_after_publication`) are the only coverage of
+    /// the publish/wake protocol that the `AtomicWaitQueue` migration replaces,
+    /// so they are the regression net for that change.
     pub async fn await_chunk_status(&self, status: ChunkStatus) -> Option<ChunkStatus> {
         loop {
             let notified = self.status_changed.notified();
