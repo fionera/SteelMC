@@ -43,6 +43,9 @@ impl TranspileContext {
                 #(#fields,)*
                 #blended_field
                 #end_islands_field
+                /// Memo for preliminary surface levels, shared by every chunk of
+                /// this world. See `PrelimSurfaceCache` for why it is worth having.
+                pub prelim_surface_cache: steel_worldgen::noise::PrelimSurfaceCache,
             }
         }
     }
@@ -147,6 +150,7 @@ impl TranspileContext {
                         #(#field_inits,)*
                         #blended_init
                         #end_islands_init
+                        prelim_surface_cache: steel_worldgen::noise::PrelimSurfaceCache::new(),
                     }
                 }
             }

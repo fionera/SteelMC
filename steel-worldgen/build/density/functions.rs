@@ -1093,6 +1093,10 @@ fn generate_noise_settings(dimension: &str, prefix: &str) -> TokenStream {
                 combine_vein_ridged(self, cache, interpolated, x, y, z)
             }
 
+            fn prelim_surface_cache(&self) -> &steel_worldgen::noise::PrelimSurfaceCache {
+                &self.prelim_surface_cache
+            }
+
             fn surface_noise_ids() -> &'static [&'static str] {
                 #surface_noise_ids_tokens
             }

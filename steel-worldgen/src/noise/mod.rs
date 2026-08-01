@@ -7,6 +7,8 @@
 //! - [`NormalNoise`] - Double Perlin noise (used for biome climate parameters)
 //! - [`SimplexNoise`] - Simplex noise (used for End island generation)
 
+pub mod prelim_surface_cache;
+pub use prelim_surface_cache::PrelimSurfaceCache;
 mod aquifer;
 mod beardifier;
 mod blended_noise;

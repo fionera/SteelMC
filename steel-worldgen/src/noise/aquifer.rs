@@ -1105,10 +1105,19 @@ fn cached_preliminary_surface_level<N: DimensionNoises>(
     z: i32,
 ) -> i32 {
     let key = ((x >> 2) << 2, (z >> 2) << 2);
+    // Two levels, because they answer different questions. The per-aquifer map
+    // is unsynchronized and catches the repeats within one chunk; the world-wide
+    // memo catches the far larger overlap between neighbouring chunks, whose
+    // aquifers each scan a 42-block span to find their sampling threshold.
     if let Some(&level) = prelim_cache.get(&key) {
+        return level;
+    }
+    if let Some(level) = noises.prelim_surface_cache().get(key.0, key.1) {
+        prelim_cache.insert(key, level);
         return level;
     }
     let level = preliminary_surface_level(noises, cache, x, z);
     prelim_cache.insert(key, level);
+    noises.prelim_surface_cache().insert(key.0, key.1, level);
     level
 }

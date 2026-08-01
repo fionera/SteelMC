@@ -51,6 +51,7 @@ impl NetherClimateSampler {
             n_nether__temperature: n_temperature,
             n_nether__vegetation: n_vegetation,
             blended_noise,
+            prelim_surface_cache: crate::noise::PrelimSurfaceCache::new(),
         };
 
         Self {

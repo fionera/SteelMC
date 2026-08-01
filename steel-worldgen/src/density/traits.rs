@@ -73,6 +73,14 @@ pub trait DimensionNoises: Sized + Send + Sync {
     /// The noise settings type for this dimension.
     type Settings: NoiseSettings;
 
+    /// The world's shared memo for preliminary surface levels.
+    ///
+    /// Lives on the noises because that is what is already threaded through
+    /// every density-function call and is created once per world, which is
+    /// exactly the memo's scope: the level is a pure function of the quart
+    /// column and the seed.
+    fn prelim_surface_cache(&self) -> &crate::noise::PrelimSurfaceCache;
+
     /// Create all noise generators from a world seed and its positional splitter.
     fn create(
         seed: u64,
