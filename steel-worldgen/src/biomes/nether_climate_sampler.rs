@@ -14,7 +14,7 @@ use steel_utils::climate::{TargetPoint, quantize_coord};
 use steel_utils::random::RandomSource;
 use steel_utils::random::legacy_random::LegacyRandom;
 use steel_worldgen::density_functions::nether::{self, NetherColumnCache, NetherNoises};
-use steel_worldgen::noise::{BlendedNoise, NormalNoise};
+use steel_worldgen::noise::{BlendedNoise, NormalNoise, PrelimSurfaceCache};
 
 /// Climate sampler for the nether using compiled density functions.
 ///
@@ -51,7 +51,7 @@ impl NetherClimateSampler {
             n_nether__temperature: n_temperature,
             n_nether__vegetation: n_vegetation,
             blended_noise,
-            prelim_surface_cache: crate::noise::PrelimSurfaceCache::new(),
+            prelim_surface_cache: PrelimSurfaceCache::new(),
         };
 
         Self {

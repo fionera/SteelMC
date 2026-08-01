@@ -17,6 +17,9 @@ const SHARDS: usize = 256;
 /// chunks. `SHARDS * SHARD_CAPACITY` entries is roughly 50 MB at worst.
 const SHARD_CAPACITY: usize = 4096;
 
+/// One shard's table of quart columns to surface levels.
+type Shard = SyncRwLock<FxHashMap<(i32, i32), i32>>;
+
 /// Memoizes `preliminary_surface_level` across the chunks of one world.
 ///
 /// The level is a pure function of the quart column and the world seed, so a
@@ -30,7 +33,7 @@ const SHARD_CAPACITY: usize = 4096;
 /// that took one lock became the throughput ceiling for the entire server.
 #[derive(Debug, Default)]
 pub struct PrelimSurfaceCache {
-    shards: Box<[SyncRwLock<FxHashMap<(i32, i32), i32>>]>,
+    shards: Box<[Shard]>,
 }
 
 impl PrelimSurfaceCache {
@@ -49,7 +52,7 @@ impl PrelimSurfaceCache {
     /// Mixes both axes so that a row of columns spreads across shards instead of
     /// queueing on one.
     #[inline]
-    fn shard_of(quart_x: i32, quart_z: i32) -> usize {
+    const fn shard_of(quart_x: i32, quart_z: i32) -> usize {
         let key = (quart_x as u32 as u64) | ((quart_z as u32 as u64) << 32);
         // splitmix64 finalizer
         let mut hash = key.wrapping_mul(0x9E37_79B9_7F4A_7C15);
@@ -82,6 +85,8 @@ impl PrelimSurfaceCache {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
 
     #[test]
@@ -97,7 +102,7 @@ mod tests {
 
     #[test]
     fn shards_spread_a_row_of_columns() {
-        let used: std::collections::BTreeSet<usize> = (0..64)
+        let used: BTreeSet<usize> = (0..64)
             .map(|x| PrelimSurfaceCache::shard_of(x * 4, 0))
             .collect();
         assert!(

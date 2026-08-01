@@ -5,6 +5,7 @@
 //! density functions.
 
 use std::simd::f64x8;
+use crate::noise::PrelimSurfaceCache;
 
 use crate::BlockStateId;
 use crate::random::RandomSplitter;
@@ -79,7 +80,8 @@ pub trait DimensionNoises: Sized + Send + Sync {
     /// every density-function call and is created once per world, which is
     /// exactly the memo's scope: the level is a pure function of the quart
     /// column and the seed.
-    fn prelim_surface_cache(&self) -> &crate::noise::PrelimSurfaceCache;
+    #[must_use]
+    fn prelim_surface_cache(&self) -> &PrelimSurfaceCache;
 
     /// Create all noise generators from a world seed and its positional splitter.
     fn create(
