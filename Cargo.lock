@@ -2839,6 +2839,7 @@ dependencies = [
  "bitflags",
  "crc32c",
  "criterion",
+ "crossbeam",
  "enum_dispatch",
  "glam",
  "heck",

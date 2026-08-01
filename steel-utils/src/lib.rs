@@ -5,6 +5,8 @@
 #![feature(const_trait_impl, const_cmp, derive_const, array_try_from_fn)]
 
 /// axis
+/// A monotonic status cell with a queue of waiters for later statuses.
+pub mod atomic_wait_queue;
 pub mod axis;
 /// Vanilla `BlockUtil` helpers.
 pub mod block_util;
