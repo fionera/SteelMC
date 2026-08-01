@@ -5,6 +5,7 @@ use std::fmt::Debug;
 use std::mem;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
+use steel_utils::atomic_wait_queue::{AtomicWaitQueue, WaitOutcome};
 use steel_utils::{BlockPos, ChunkPos, PackedSectionBlockPos, SectionPos, locks::SyncMutex};
 use tokio::sync::{Notify, oneshot};
 #[cfg(feature = "slow_chunk_gen")]
@@ -144,13 +145,22 @@ impl ChangedLightSections {
 
 /// Holds chunk data and coordinates asynchronous generation work.
 ///
-/// `published_status` is released only after the corresponding data and Full
-/// tick containers are installed. Synchronous readers acquire it before
-/// reading `data`; `status_changed` wakes async waiters so they can re-check
-/// the atomic state.
+/// The published status is released only after the corresponding data and Full
+/// tick containers are installed. Synchronous readers acquire it before reading
+/// `data`.
+///
+/// It lives in `status` as the wait queue's status word, so publishing a status
+/// and releasing the waiters for it are one atomic step: a waiter cannot be
+/// registered for a status that has already been published, and a publish
+/// cannot miss a waiter registered concurrently with it.
+///
+/// `status_changed` remains for the events that are *not* status raises --
+/// generation becoming disallowed during unload, and an abandoned work claim
+/// being rolled back. Those must wake waiters without moving the status, which
+/// the queue deliberately cannot express.
 pub struct ChunkHolder {
     data: OnceLock<Chunk>,
-    published_status: AtomicU8,
+    status: AtomicWaitQueue<oneshot::Sender<()>>,
     status_changed: Notify,
     generation_task: SyncMutex<Option<Arc<ChunkGenerationTask>>>,
     generation_task_target: AtomicU8,
@@ -291,7 +301,7 @@ impl ChunkHolder {
 
         Self {
             data: OnceLock::new(),
-            published_status: AtomicU8::new(UNPUBLISHED_STATUS),
+            status: AtomicWaitQueue::new(u16::from(UNPUBLISHED_STATUS)),
             status_changed: Notify::new(),
             generation_task: SyncMutex::new(None),
             generation_task_target: AtomicU8::new(STATUS_NONE),
@@ -600,7 +610,7 @@ impl ChunkHolder {
     /// Gets access to the chunk if it has reached the given status.
     #[inline]
     pub fn try_chunk(&self, status: ChunkStatus) -> Option<&Chunk> {
-        let published = self.published_status.load(Ordering::Acquire);
+        let published = self.encoded_status();
         (published >= encoded_published_status(status))
             .then(|| self.data.get())
             .flatten()
@@ -621,40 +631,66 @@ impl ChunkHolder {
     /// the publish/wake protocol that the `AtomicWaitQueue` migration replaces,
     /// so they are the regression net for that change.
     pub async fn await_chunk_status(&self, status: ChunkStatus) -> Option<ChunkStatus> {
-        loop {
-            let notified = self.status_changed.notified();
-            let published = self.published_status();
-            if published.is_some_and(|current| status <= current) {
-                return published;
-            }
-
-            if self.is_status_disallowed(status) {
-                return None;
-            }
-
-            notified.await;
-        }
+        self.await_status_with(status, |_| false).await
     }
 
     async fn await_claimed_chunk_status(&self, status: ChunkStatus) -> Option<ChunkStatus> {
+        self.await_status_with(status, |holder| !holder.status_work_covers(status))
+            .await
+    }
+
+    /// Waits for `status` to be published, or for `bail` to become true.
+    ///
+    /// Two different events are in play and only one of them is a status raise.
+    /// The queue delivers the raise exactly once, to exactly the waiters it
+    /// satisfies. The bail conditions -- generation becoming disallowed, or a
+    /// work claim being rolled back -- do not move the status, so they arrive on
+    /// `status_changed` and are re-checked on each wake.
+    ///
+    /// Ordering matters: the waiter is registered *before* the bail conditions
+    /// are tested, so a bail that lands between the test and the registration
+    /// still wakes it.
+    async fn await_status_with<F>(&self, status: ChunkStatus, bail: F) -> Option<ChunkStatus>
+    where
+        F: Fn(&Self) -> bool,
+    {
         loop {
-            let notified = self.status_changed.notified();
-            let published = self.published_status();
-            if published.is_some_and(|current| status <= current) {
-                return published;
+            let bailed = self.status_changed.notified();
+            let (sender, receiver) = oneshot::channel();
+
+            // The queue releases a waiter once its status is *exceeded*, so a
+            // waiter for encoded status `e` registers at `e - 1`.
+            let wait_for = u16::from(encoded_published_status(status)) - 1;
+            match self.status.wait(wait_for, sender) {
+                WaitOutcome::AlreadySatisfied(_) => return self.published_status(),
+                WaitOutcome::Cancelled(_) => return None,
+                WaitOutcome::Registered => {}
             }
 
-            if self.is_status_disallowed(status) || !self.status_work_covers(status) {
+            if self.is_status_disallowed(status) || bail(self) {
                 return None;
             }
 
-            notified.await;
+            tokio::select! {
+                _ = receiver => return self.published_status(),
+                () = bailed => {}
+            }
         }
     }
 
     /// Gets the published status of the chunk.
     pub fn published_status(&self) -> Option<ChunkStatus> {
-        decoded_published_status(self.published_status.load(Ordering::Acquire))
+        decoded_published_status(self.encoded_status())
+    }
+
+    /// The raw encoded status, as stored in the wait queue's status word.
+    #[inline]
+    fn encoded_status(&self) -> u8 {
+        // The queue is never cancelled today (see `wake_all_watchers`), so
+        // `None` cannot occur; treat it as unpublished rather than panicking.
+        self.status.status().map_or(UNPUBLISHED_STATUS, |encoded| {
+            u8::try_from(encoded).unwrap_or(UNPUBLISHED_STATUS)
+        })
     }
 
     /// Returns whether vanilla timed tickets may age for this chunk.
@@ -1270,7 +1306,7 @@ impl ChunkHolder {
 
     fn store_and_publish_chunk_status(&self, chunk: Chunk, status: ChunkStatus) {
         assert_eq!(
-            self.published_status.load(Ordering::Acquire),
+            self.encoded_status(),
             UNPUBLISHED_STATUS,
             "initial chunk installation cannot replace published data"
         );
@@ -1287,17 +1323,29 @@ impl ChunkHolder {
             self.register_full_chunk_ticks();
         }
         self.mark_status_work_published(status);
-        self.published_status
-            .store(encoded_published_status(status), Ordering::Release);
-        self.status_changed.notify_waiters();
+        // A disk load jumps straight from unpublished to the loaded status, so
+        // this raise can skip several statuses at once. The queue releases every
+        // waiter it passes, not just the next one.
+        self.raise_published_status(encoded_published_status(status));
     }
 
     fn publish_generated_status(&self, status: ChunkStatus) {
-        let encoded = encoded_published_status(status);
-        let previous = self.published_status.fetch_max(encoded, Ordering::Release);
-        if previous < encoded {
-            self.status_changed.notify_waiters();
+        self.raise_published_status(encoded_published_status(status));
+    }
+
+    /// Publishes an encoded status and releases the waiters it satisfies.
+    ///
+    /// Idempotent: a raise to a status already reached is dropped, matching the
+    /// `fetch_max` this replaced. The queue asserts monotonicity in debug.
+    fn raise_published_status(&self, encoded: u8) {
+        if encoded <= self.encoded_status() {
+            return;
         }
+        self.status
+            .advance_and_notify(u16::from(encoded), |waiter| {
+                // A dropped receiver just means the waiter went away.
+                let _ = waiter.send(());
+            });
     }
 
     /// Registers tick queues before Full status becomes observable to watchers.
