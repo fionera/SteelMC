@@ -45,28 +45,25 @@ const DEFAULT_PREGEN_WINDOW_SIZE: i32 = 32;
 /// collapsed the run-to-run spread: median absolute deviation fell from 2.77s
 /// to 0.26s, because the tail stalls a shallow pipeline suffers simply stop
 /// happening.
-/// Active windows per generation thread when the depth is left unset.
+/// How many windows may be generating at once.
 ///
-/// Pipeline depth exists to keep the generation pool supplied, so it belongs in
-/// units of generation threads rather than as a flat count: a 128-thread host
-/// needs far more chunks in flight than an 8-thread one to reach the same
-/// occupancy, and a flat default either starves the big host or makes the small
-/// one hold a pointless amount of world in memory.
+/// This is the pregeneration pipeline's depth. Each window is
+/// `window_size * window_size` target chunks, and a new one is admitted only as
+/// an active one finishes, so this bounds how much world is resident at once.
 ///
-/// Depth 16 was tuned when task creation was serialized on the scheduling
-/// thread, where deeper pipelines made things worse -- 32 windows measured 13%
-/// slower than 16. With that bottleneck removed the relationship inverted.
-/// Measured on a 128-thread EPYC 9555P over a 90,601-chunk pregeneration at 96
-/// generation threads: 16 windows 6,130 chunks/s, 32 -> 6,190, 64 -> 6,574,
-/// 128 -> 6,861, with generation-pool occupancy rising from 0.73 to 0.83.
+/// It was briefly scaled to one window per generation thread, on a measurement
+/// that turned out to be invalid: the benchmark generated a 301x301 area, and
+/// 127 windows of 32x32 is 130,048 target chunks, so the entire area fit inside
+/// the pipeline and *nothing ever unloaded*. That removed all unload and save
+/// work from the measurement rather than making it faster. Re-measured on a
+/// 601x601 area, where unloading is forced, depth makes no throughput
+/// difference worth having -- 16 windows 5,572 chunks/s, 32 -> 5,372, 127 ->
+/// 5,698, inside run-to-run spread -- while the peak unload backlog scales with
+/// it (30k, 47k, 133k chunks) and with it the worst scheduling epoch (121ms,
+/// 220ms, 721ms) and the resident set.
 ///
-/// One window per generation thread lands at the top of that curve while
-/// keeping the in-flight bound proportional to the machine. Each window is
-/// `window_size^2` target chunks and the halo around it, so the cost is real
-/// memory: at 32-chunk windows this measured ~18 GB resident on a 127-thread
-/// host, against ~5 GB at the old fixed depth. Lower `PREGEN_ACTIVE_WINDOWS` on
-/// a memory-constrained host.
-const DEFAULT_PREGEN_ACTIVE_WINDOWS_PER_THREAD: usize = 1;
+/// So depth is a memory and latency knob, not a throughput one. Keep it low.
+const DEFAULT_PREGEN_ACTIVE_WINDOWS: usize = 16;
 const PREGEN_UNLOAD_BACKPRESSURE_ENV: &str = "PREGEN_UNLOAD_BACKPRESSURE";
 /// Unload backlog at which window activation pauses.
 ///
@@ -331,8 +328,7 @@ impl Server {
                 return false;
             }
         };
-        let generation_threads = overworld.chunk_map.generation_thread_count();
-        let active_window_limit = match get_pregen_active_windows(generation_threads) {
+        let active_window_limit = match get_pregen_active_windows() {
             Ok(active_windows) => active_windows,
             Err(error) => {
                 log::error!("{error}");
@@ -411,12 +407,10 @@ fn get_pregen_unload_backpressure(active_windows: usize) -> Result<UnloadBackpre
     Ok(UnloadBackpressure::from_high(high))
 }
 
-fn get_pregen_active_windows(generation_threads: usize) -> Result<usize, String> {
+fn get_pregen_active_windows() -> Result<usize, String> {
     match env::var(PREGEN_ACTIVE_WINDOWS_ENV) {
         Ok(value) => parse_pregen_active_windows(&value),
-        Err(env::VarError::NotPresent) => {
-            Ok((generation_threads * DEFAULT_PREGEN_ACTIVE_WINDOWS_PER_THREAD).max(1))
-        }
+        Err(env::VarError::NotPresent) => Ok(DEFAULT_PREGEN_ACTIVE_WINDOWS),
         Err(env::VarError::NotUnicode(_)) => {
             Err(format!("{PREGEN_ACTIVE_WINDOWS_ENV} must be valid unicode"))
         }
@@ -947,7 +941,7 @@ mod tests {
     }
 
     #[test]
-    fn default_generation_threads_leave_one_thread_for_the_rest_of_the_server() {
+    fn default_generation_threads_leave_headroom_for_the_other_pools() {
         use crate::server::default_chunk_generation_threads;
         // Small machines keep every thread; there is nothing to spare.
         assert_eq!(default_chunk_generation_threads(1), 1);
@@ -956,16 +950,15 @@ mod tests {
         // faster only while task creation was serialized on the scheduling
         // thread; once that was fixed, generation kept scaling to the top of the
         // machine.
-        assert_eq!(default_chunk_generation_threads(8), 7);
-        assert_eq!(default_chunk_generation_threads(128), 127);
+        assert_eq!(default_chunk_generation_threads(8), 6);
+        assert_eq!(default_chunk_generation_threads(128), 96);
     }
 
     #[test]
-    fn default_pipeline_depth_tracks_the_generation_pool() {
+    fn default_pipeline_depth_fits_its_own_backpressure_budget() {
         // Depth is what keeps the generation pool supplied, so it scales with
         // the pool rather than being a flat count.
-        assert_eq!(get_pregen_active_windows(127), Ok(127));
-        assert_eq!(get_pregen_active_windows(8), Ok(8));
+        assert_eq!(get_pregen_active_windows(), Ok(DEFAULT_PREGEN_ACTIVE_WINDOWS));
         // And a depth that large must not trip its own backpressure budget.
         for threads in [1, 8, 96, 127] {
             let budget =

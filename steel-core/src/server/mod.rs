@@ -170,24 +170,24 @@ fn configured_chunk_generation_threads(configured_threads: Option<usize>) -> usi
 
 /// Generation threads to use when the config leaves the count unset.
 ///
-/// This used to hold back a quarter of the machine, because taking every thread
-/// measured about 9% slower. That result was real but it was a symptom: task
-/// creation was serialized on the scheduling-epoch thread, so extra generation
-/// threads had nothing to do and only added cache and scheduling pressure. Once
-/// the dependency halo moved off that thread and the pregeneration pipeline was
-/// allowed to run deep, the ranking inverted and kept scaling.
+/// Deliberately not one per hardware thread. The generation pool is not the
+/// only consumer -- the chunk and main tokio runtimes and the encoding pool all
+/// want cores as well -- and past a point extra generation threads buy nothing
+/// but scheduling and cache pressure.
 ///
-/// Measured over a 90,601-chunk pregeneration on a 128-thread EPYC 9555P at a
-/// fixed seed, deep pipeline, two runs per point: 96 threads 6,875 chunks/s,
-/// 112 -> 7,309, 120 -> 7,555, 127 -> 7,648. Generation-pool occupancy holds
-/// near 0.83 across that whole range, so the pool is being fed rather than
-/// thrashing. One thread is left for the rest of the server.
+/// This was briefly raised to all-but-one on a measurement that turned out to
+/// be invalid: it was taken on a 301x301 pregeneration with a pipeline deep
+/// enough to hold the whole area, so nothing ever unloaded and the run was
+/// missing all of its unload and save work. Re-measured on a 601x601 area,
+/// where unloading is forced, three quarters beats all-but-one by 20%: 96
+/// threads 6,690 chunks/s against 127 at 5,576. That matches the original
+/// finding this briefly overrode.
 pub(crate) fn default_chunk_generation_threads(available_threads: usize) -> usize {
     let available = available_threads.max(1);
     if available <= 4 {
         available
     } else {
-        available - 1
+        (available * 3 / 4).max(4)
     }
 }
 
