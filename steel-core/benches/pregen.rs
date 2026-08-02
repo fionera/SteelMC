@@ -411,10 +411,8 @@ fn main() {
 
         let rate = total_chunks / elapsed.as_secs_f64();
         rates.push(rate);
-        let peak = peak_rss_mib().map_or_else(
-            || String::from(""),
-            |mib| format!("  peak RSS {mib} MiB"),
-        );
+        let peak = peak_rss_mib()
+            .map_or_else(String::new, |mib| format!("  peak RSS {mib} MiB"));
         println!(
             "  rep {}: {:.2}s  {rate:.1} chunks/s{peak}",
             rep + 1,
