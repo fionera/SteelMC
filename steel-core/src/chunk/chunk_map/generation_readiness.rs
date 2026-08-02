@@ -1,11 +1,11 @@
 use super::{
     Arc, ChunkGenerationTask, ChunkHolder, ChunkMap, ChunkPos, ChunkStatus, ChunkTicketLevel,
     DeferredChunkRevival, FullNeighborhoodCounts, FullNeighborhoodError, FullNeighborhoodIndex,
-    FullPublication, FxHashMap, FxHashSet, GENERATION_THREAD_MULTIPLE, GenerationTaskPriority,
-    Instant, LevelChange, Ordering, PackedChunkPos, PostProcessGenerationError,
-    ReadinessReconcileResult, RunningGenerationTaskPermit, TickableChunk, TickingChunkSnapshot,
+    FullPublication, FxHashMap, FxHashSet, GENERATION_THREAD_MULTIPLE, GenerationRunPermit,
+    GenerationTaskPriority, Instant, LevelChange, Ordering, PackedChunkPos,
+    PostProcessGenerationError, ReadinessReconcileResult, TickableChunk, TickingChunkSnapshot,
     TickingReadiness, TickingReadinessCandidate, instrument, is_block_ticking, is_entity_ticking,
-    is_full,
+    is_full, mem,
 };
 
 impl ChunkMap {
@@ -24,18 +24,45 @@ impl ChunkMap {
             self.generation_pool.clone(),
             self.cancel_token.child_token(),
         ));
-        self.pending_generation_tasks.lock().push(Arc::clone(&task));
+        let mut incoming = self.incoming_generation_tasks.lock();
+        // Tested under the inbox lock, against a flag stored before the stop
+        // path takes either queue lock, so a producer that misses the drain is
+        // guaranteed to see the flag. Scheduling epochs run as tracked blocking
+        // tasks, so one spawned by the last tick can still reach here after
+        // `stop_generation_refill_loop` emptied both queues; nothing prunes
+        // them afterwards, and a queued task pins its centre holder in
+        // `unloading_chunks` for the rest of the process.
+        if !self.generation_refill_stopped.load(Ordering::Acquire) {
+            incoming.push(Arc::clone(&task));
+        }
+        drop(incoming);
         task
     }
 
     /// Runs queued generation tasks.
     #[instrument(level = "trace", skip(self))]
     pub fn run_generation_tasks_b(&self) {
-        if self.generation_refill_stopped.load(Ordering::Acquire) {
-            return;
-        }
+        // Taken before the selection lock, and only with `mem::take`, so a
+        // producer never blocks behind the selection work below.
+        let arrivals = mem::take(&mut *self.incoming_generation_tasks.lock());
 
         let mut pending = self.pending_generation_tasks.lock();
+        // The stop is tested here and not at entry because the take above moves
+        // the arrivals into a local that `stop_generation_refill_loop`'s drain
+        // cannot reach: a pass that entered before the stop would merge them
+        // into a queue nothing prunes again, and each stranded task pins its
+        // centre holder in `unloading_chunks` for the rest of the process.
+        // Tested under the selection lock, against a flag the stop path stores
+        // before it takes either lock, so the batch is either dropped here or
+        // drained there -- and a pass that arrives after the stop drains the
+        // inbox on its way out rather than leaving it behind.
+        if self.generation_refill_stopped.load(Ordering::Acquire) {
+            drop(pending);
+            return;
+        }
+        // Appended, so tasks that lost an earlier selection round keep their
+        // precedence over the arrivals.
+        pending.extend(arrivals);
         if pending.is_empty() {
             return;
         }
@@ -81,13 +108,25 @@ impl ChunkMap {
             "Running generation tasks"
         );
         let tasks = pending.drain(..task_count).collect::<Vec<_>>();
-        self.running_generation_tasks
-            .fetch_add(tasks.len(), Ordering::AcqRel);
         drop(pending); // Release lock before spawning
 
+        if self.generation_refill_stopped.load(Ordering::Acquire) {
+            // This batch is already out of the queue, so a stop landing here
+            // has nothing left to prune it; dropping it is what the stop path
+            // would have done. Unsynchronized, unlike the two checks above --
+            // spawning holds no lock the stop path takes -- so a task can still
+            // slip through, but it is a tracked task and every caller of
+            // `stop_generation_refill_loop` closes and awaits `task_tracker`.
+            return;
+        }
+
+        let mut unadmitted = Vec::new();
         for task in tasks {
-            let permit = RunningGenerationTaskPermit {
-                chunk_map: task.chunk_map.clone(),
+            // `available_slots` was read before the lock was released, so a slot
+            // can be gone by now; the permit, not that count, is what decides.
+            let Some(permit) = GenerationRunPermit::acquire(&task.chunk_map) else {
+                unadmitted.push(task);
+                continue;
             };
             self.task_tracker.spawn_on(
                 async move {
@@ -96,6 +135,23 @@ impl ChunkMap {
                 },
                 self.chunk_runtime.handle(),
             );
+        }
+
+        if !unadmitted.is_empty() {
+            // Back at the head: these already outranked everything still queued.
+            let mut pending = self.pending_generation_tasks.lock();
+            // Same window as the merge above: requeueing behind a stop's drain
+            // strands these for good.
+            if self.generation_refill_stopped.load(Ordering::Acquire) {
+                drop(pending);
+                return;
+            }
+            pending.splice(0..0, unadmitted);
+            drop(pending);
+            // The permit drops that free the slots may all have happened before
+            // the requeue above, and each one only wakes the refill loop for the
+            // queue as it was then.
+            self.notify_generation_refill();
         }
     }
 

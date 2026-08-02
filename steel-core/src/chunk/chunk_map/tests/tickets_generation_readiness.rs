@@ -138,6 +138,101 @@ fn generation_priority_orders_normal_by_load_level() {
 }
 
 #[test]
+fn stopping_the_refill_loop_drains_both_generation_queues() {
+    let world = fresh_test_world("generation_queue_shutdown_drain");
+    let carried_pos = ChunkPos::new(2, 6);
+    let arriving_pos = ChunkPos::new(3, 6);
+    for pos in [carried_pos, arriving_pos] {
+        world
+            .chunk_map
+            .update_chunk_level(pos, Some(ChunkTicketLevel::FULL_CHUNK), None)
+            .expect("a loaded level should create a holder");
+    }
+
+    let _carried = world
+        .chunk_map
+        .schedule_generation_task_b(ChunkStatus::Empty, carried_pos);
+    // Scheduling only ever feeds the inbox, so a task that lost an earlier
+    // selection round has to be moved across the way the refill pass moves it.
+    let arrivals = mem::take(&mut *world.chunk_map.incoming_generation_tasks.lock());
+    world
+        .chunk_map
+        .pending_generation_tasks
+        .lock()
+        .extend(arrivals);
+    let _arriving = world
+        .chunk_map
+        .schedule_generation_task_b(ChunkStatus::Empty, arriving_pos);
+
+    assert_eq!(world.chunk_map.pending_generation_tasks.lock().len(), 1);
+    assert_eq!(world.chunk_map.incoming_generation_tasks.lock().len(), 1);
+
+    world.chunk_map.stop_generation_refill_loop();
+
+    // Queued tasks hold their centre holder, and nothing prunes either queue
+    // once the stop flag is set, so anything surviving here is leaked for good.
+    assert!(world.chunk_map.pending_generation_tasks.lock().is_empty());
+    assert!(world.chunk_map.incoming_generation_tasks.lock().is_empty());
+}
+
+#[test]
+fn stopping_the_refill_loop_rejects_later_producers() {
+    let world = fresh_test_world("generation_queue_shutdown_producers");
+    let pos = ChunkPos::new(-7, 4);
+    world
+        .chunk_map
+        .update_chunk_level(pos, Some(ChunkTicketLevel::FULL_CHUNK), None)
+        .expect("a loaded level should create a holder");
+
+    world.chunk_map.stop_generation_refill_loop();
+
+    // Scheduling epochs run as tracked blocking tasks, so one spawned by the
+    // last tick still produces tasks after the drain, and the drain does not
+    // run a second time.
+    let _late = world
+        .chunk_map
+        .schedule_generation_task_b(ChunkStatus::Empty, pos);
+
+    assert!(world.chunk_map.incoming_generation_tasks.lock().is_empty());
+    assert!(world.chunk_map.pending_generation_tasks.lock().is_empty());
+}
+
+#[test]
+fn a_refill_pass_after_the_stop_drops_what_it_takes() {
+    let world = fresh_test_world("generation_queue_shutdown_refill_pass");
+    let pos = ChunkPos::new(5, -3);
+    world
+        .chunk_map
+        .update_chunk_level(pos, Some(ChunkTicketLevel::FULL_CHUNK), None)
+        .expect("a loaded level should create a holder");
+    let task = world
+        .chunk_map
+        .schedule_generation_task_b(ChunkStatus::Empty, pos);
+
+    world.chunk_map.stop_generation_refill_loop();
+
+    // A pass that entered before the stop carries its arrivals in a local that
+    // the drain cannot reach, and merging them back is what strands them. The
+    // interleaving itself is a few instructions wide and not reachable from a
+    // test, but the property is the same one an inbox refilled after the drain
+    // exercises: the pass must consume the batch, not requeue it.
+    world
+        .chunk_map
+        .incoming_generation_tasks
+        .lock()
+        .push(Arc::clone(&task));
+    world.chunk_map.run_generation_tasks_b();
+
+    assert!(world.chunk_map.incoming_generation_tasks.lock().is_empty());
+    assert!(world.chunk_map.pending_generation_tasks.lock().is_empty());
+    assert_eq!(
+        Arc::strong_count(&task.center_holder),
+        2,
+        "the queues should hold no reference to the stranded task's holder"
+    );
+}
+
+#[test]
 fn cached_holder_rechecks_publication_and_generation_permission() {
     init_test_registry();
     let world = fresh_test_world("cached_holder_status_recheck");
@@ -530,4 +625,26 @@ fn full_load_activation_uses_packed_chunk_position_order() {
         world.block_entity_tickers().active_positions(),
         [first_sign, second_sign]
     );
+}
+
+#[test]
+fn a_scheduling_epoch_after_the_stop_queues_nothing() {
+    let world = fresh_test_world("generation_queue_shutdown_epoch");
+    let revision = world.chunk_map.add_chunk_ticket(
+        ChunkPos::new(0, 0),
+        ChunkTicket::loading(ChunkTicketLevel::FULL_CHUNK),
+    );
+
+    world.chunk_map.stop_generation_refill_loop();
+
+    // The real producer path: an epoch runs as a blocking task on
+    // `task_tracker`, so one spawned by the last tick still turns admitted
+    // holders into generation tasks well after shutdown drained both queues.
+    // A radius-11 halo is 529 chunks, so ungated this queues hundreds of tasks
+    // with no pass left that could ever prune them.
+    advance_until_revision(&world.chunk_map, revision);
+    thread::sleep(Duration::from_millis(100));
+
+    assert!(world.chunk_map.incoming_generation_tasks.lock().is_empty());
+    assert!(world.chunk_map.pending_generation_tasks.lock().is_empty());
 }

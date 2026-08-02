@@ -288,7 +288,28 @@ pub struct ChunkMap {
     pub(crate) unloading_chunks: scc::HashMap<ChunkPos, Arc<ChunkHolder>, FxBuildHasher>,
     /// Ticket states waiting for an unloading holder's save preparation to finish.
     deferred_revivals: SyncMutex<FxHashMap<ChunkPos, DeferredChunkRevival>>,
-    /// Queue of pending generation tasks.
+    /// Producer handoff for newly scheduled generation tasks.
+    ///
+    /// Split from `pending_generation_tasks` so a producer never waits on the
+    /// selection work: the refill pass holds this lock only for a `mem::take`,
+    /// while the `retain`/`select_nth_unstable`/`drain` pass runs under the
+    /// selection lock over a queue that reaches tens of thousands of entries
+    /// during a pregeneration. Under the per-holder generation drive the pushes
+    /// come from rayon generation workers inside the status-publish path, with
+    /// every chunk waiting on that status blocked behind the push, so one shared
+    /// lock would convoy 16+ generation workers behind a 20k partial sort.
+    /// `light::work_gate` records what that shape cost last time it was built:
+    /// 27% of the whole machine.
+    ///
+    /// Lock ordering: never take this lock while holding
+    /// `pending_generation_tasks`. Only the reverse, and only long enough to
+    /// `mem::take` the batch out.
+    incoming_generation_tasks: SyncMutex<Vec<Arc<ChunkGenerationTask>>>,
+    /// Generation tasks competing for admission, ordered by the refill pass.
+    ///
+    /// Appended to, never replaced, so entries that lost a previous selection
+    /// round stay ahead of the arrivals moved over from
+    /// `incoming_generation_tasks`.
     pub pending_generation_tasks: SyncMutex<Vec<Arc<ChunkGenerationTask>>>,
     /// Tracker for background scheduling, generation, save, and unload tasks.
     pub task_tracker: TaskTracker,
@@ -378,11 +399,33 @@ impl GenerationTaskPriority {
     }
 }
 
-struct RunningGenerationTaskPermit {
+/// One admission slot, held for the life of the generation task that took it.
+struct GenerationRunPermit {
     chunk_map: Arc<ChunkMap>,
 }
 
-impl Drop for RunningGenerationTaskPermit {
+impl GenerationRunPermit {
+    /// Takes one slot, or returns `None` if the cap is already reached.
+    ///
+    /// The increment lives here rather than being batched by the caller so a
+    /// counted slot cannot exist without a guard to give it back: the counter
+    /// only ever drops through `Drop`, so a slot counted but not guarded is
+    /// leaked for the lifetime of the map.
+    fn acquire(chunk_map: &Arc<ChunkMap>) -> Option<Self> {
+        let max_running_tasks = chunk_map.max_running_generation_tasks();
+        chunk_map
+            .running_generation_tasks
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |running| {
+                (running < max_running_tasks).then(|| running + 1)
+            })
+            .ok()?;
+        Some(Self {
+            chunk_map: Arc::clone(chunk_map),
+        })
+    }
+}
+
+impl Drop for GenerationRunPermit {
     fn drop(&mut self) {
         self.chunk_map
             .running_generation_tasks
@@ -443,6 +486,7 @@ impl ChunkMap {
             chunks: scc::HashMap::default(),
             unloading_chunks: scc::HashMap::default(),
             deferred_revivals: SyncMutex::new(FxHashMap::default()),
+            incoming_generation_tasks: SyncMutex::new(Vec::new()),
             pending_generation_tasks: SyncMutex::new(Vec::new()),
             task_tracker: TaskTracker::new(),
             scheduling: ChunkSchedulingCoordinator::new(chunk_tickets),
@@ -505,10 +549,28 @@ impl ChunkMap {
 
     /// Stops the generation refill loop. Active generation tasks are left alone.
     pub fn stop_generation_refill_loop(&self) {
+        // Stored before either queue lock is taken, which is what makes a single
+        // drain sufficient: `schedule_generation_task_b` tests this flag under
+        // the inbox lock and `run_generation_tasks_b` tests it under the
+        // selection lock, so anyone who acquires a lock after this store adds
+        // nothing, and anyone who acquired it before is drained below. Without
+        // that pairing an in-flight refill pass or a scheduling epoch still
+        // running on `task_tracker` refills behind the drain.
         self.generation_refill_stopped
             .store(true, Ordering::Release);
         self.generation_refill_cancel_token.cancel();
         self.generation_refill_notify.notify_waiters();
+
+        // Both queues must be emptied here because nothing else will:
+        // `run_generation_tasks_b` returns on the stop flag before its only
+        // prune. A queued task holds its centre `Arc<ChunkHolder>`, and
+        // `process_unloads` frees a holder only at `strong_count == 1`, so
+        // anything left queued keeps its holder pinned in `unloading_chunks`
+        // for the rest of the process -- never saved, never finalized.
+        let incoming = mem::take(&mut *self.incoming_generation_tasks.lock());
+        let pending = mem::take(&mut *self.pending_generation_tasks.lock());
+        drop(incoming);
+        drop(pending);
     }
 
     pub(crate) fn notify_generation_refill(&self) {
