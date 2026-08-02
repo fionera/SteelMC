@@ -1386,14 +1386,31 @@ impl ChunkMap {
         }
     }
 
+    /// Finalizes retired chunks' block entities, bounded by a time budget.
+    ///
+    /// This runs in the boundary half of a scheduling epoch, which is serialized
+    /// against generation-task creation, so its cost is latency rather than
+    /// throughput: the generation pool drains in about 18 ms and an unbounded
+    /// pass measured 38 ms at worst. The remainder stays queued and is finished
+    /// at the next boundary; nothing here is ordered against anything else.
     fn finish_block_entity_unloads(&self) {
-        let finalized = mem::take(&mut *self.finalized_block_entity_unloads.lock());
+        /// How long one boundary may spend finalizing block entities.
+        const BLOCK_ENTITY_UNLOAD_BUDGET: Duration = Duration::from_millis(2);
+
+        let mut finalized = mem::take(&mut *self.finalized_block_entity_unloads.lock());
         if finalized.is_empty() {
             return;
         }
 
+        let started_at = Instant::now();
+        let mut processed = 0;
         let world = self.world_gen_context.world();
-        for mut unload in finalized {
+        for mut unload in finalized.drain(..) {
+            if processed % 16 == 0 && processed != 0 && started_at.elapsed() >= BLOCK_ENTITY_UNLOAD_BUDGET
+            {
+                break;
+            }
+            processed += 1;
             let mut lifecycle_dispatchers = unload
                 .holder
                 .try_full_chunk()
@@ -1406,6 +1423,14 @@ impl ChunkMap {
             for block_entity in lifecycle_dispatchers {
                 block_entity.dispatch_lifecycle_events();
             }
+        }
+
+        if !finalized.is_empty() {
+            // Put back what the budget did not reach, ahead of anything queued
+            // since, so nothing is starved by a steady arrival of new unloads.
+            let mut queue = self.finalized_block_entity_unloads.lock();
+            finalized.append(&mut queue);
+            *queue = finalized;
         }
     }
 

@@ -2,6 +2,8 @@ use super::{
     Arc, Chunk, ChunkHolder, ChunkMap, ChunkPos, ChunkSaveDependency, ChunkStatus, ChunkStorage,
     ClearedBlockEntities, FinalizedBlockEntityUnload, FxHashSet, instrument, io, mem,
 };
+use std::time::{Duration, Instant};
+
 use crate::chunk_saver::PreparedChunkSave;
 use tokio::sync::oneshot;
 
@@ -127,10 +129,29 @@ impl ChunkMap {
     pub(super) fn process_unloads(self: &Arc<Self>, staged_revivals: &FxHashSet<ChunkPos>) {
         self.propagate_queued_light_changes();
 
+        // Bounded for the same reason scheduling is: this walk is part of a
+        // serialized epoch that gates generation-task creation, and the
+        // generation pool drains in about 18 ms. Left unbounded it walked every
+        // unloading holder each boundary -- tens of thousands of them under
+        // pregeneration -- for a worst single occurrence of 78 ms. Whatever is
+        // not reached stays in the map and is reconsidered next boundary, which
+        // is what would have happened anyway for anything still referenced.
+        const PROCESS_UNLOADS_BUDGET: Duration = Duration::from_millis(2);
+        const BUDGET_CHECK_INTERVAL: usize = 64;
+        let started_at = Instant::now();
+        let mut visited = 0usize;
+
         let mut finalized = Vec::new();
         {
             let light_updates = self.light_updates.lock();
             self.unloading_chunks.retain_sync(|pos, holder| {
+                visited += 1;
+                if visited % BUDGET_CHECK_INTERVAL == 0
+                    && started_at.elapsed() >= PROCESS_UNLOADS_BUDGET
+                {
+                    return true;
+                }
+
                 // Prepared ticket changes publish only at the next lifecycle boundary.
                 if staged_revivals.contains(pos) {
                     return true;
