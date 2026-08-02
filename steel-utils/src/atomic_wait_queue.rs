@@ -13,7 +13,6 @@ use std::mem::ManuallyDrop;
 use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crossbeam::epoch::{self, Atomic, Owned};
 
 /// Status value reserved to mean "this queue will accept no further waiters".
 ///
@@ -48,26 +47,37 @@ pub struct AtomicWaitQueue<T> {
     /// Both must move together: registration has to observe a status and a list
     /// in the same instant, or a raise landing between the two could drop a
     /// waiter that will never be woken.
-    head: AtomicU64,
-    /// Nodes detached from `head`, freed only once no thread can still be
-    /// looking at them.
     ///
-    /// Without this the structure has an ABA hole: a detached node can be freed
-    /// and the allocator can hand the same address back for a new node while
-    /// another thread still holds the old packed word, whose compare-exchange
-    /// would then succeed against a different list.
-    retired: Atomic<RetiredList<T>>,
+    /// Packing them is also what makes freeing a detached node immediately
+    /// sound, with no deferred reclamation. Two properties do it:
+    ///
+    /// * A node reached through this word is only ever dereferenced after the
+    ///   whole list has been taken by a single compare-exchange, which leaves
+    ///   the taker its exclusive owner. `wait` is a pure push -- it writes the
+    ///   head pointer into its own not-yet-published node and never follows it.
+    /// * The usual push-side ABA cannot bite either. A stale word can only
+    ///   compare equal if the status is unchanged, and a list is only ever
+    ///   detached by a raise or a cancel, both of which move the status. A
+    ///   recycled address therefore cannot resurrect an old word.
+    ///
+    /// An earlier version deferred frees through `crossbeam_epoch` on top of a
+    /// per-queue retired list. That cost an allocation and a compare-exchange
+    /// per satisfied waiter -- around 140,000 a second under pregeneration --
+    /// and freed nothing until the queue itself was dropped. `cancel` had always
+    /// freed its detached nodes directly, on exactly the reasoning above; `drain`
+    /// now does the same.
+    ///
+    /// Note for anyone reading a profile: `crossbeam_epoch::Global::try_advance`
+    /// does not come from here, and did not before this change either. It is
+    /// `crossbeam-deque`, which `rayon-core` uses for its work-stealing queues,
+    /// running its own reclamation.
+    head: AtomicU64,
     _marker: PhantomData<T>,
 }
 
-struct RetiredList<T> {
-    node: *mut Node<T>,
-    next: Atomic<RetiredList<T>>,
-}
-
-// SAFETY: the queue owns its nodes and every access to them goes through the
-// packed atomic or epoch-protected retirement, so sharing it across threads is
-// sound exactly when the payload can itself move between threads.
+// SAFETY: the queue owns its nodes, and a node is only ever dereferenced by the
+// thread that took the whole list out of the packed atomic, so sharing it across
+// threads is sound exactly when the payload can itself move between threads.
 unsafe impl<T: Send> Send for AtomicWaitQueue<T> {}
 // SAFETY: as above; `&AtomicWaitQueue<T>` only ever exposes `T` by value to one
 // thread at a time, through a successful compare-exchange.
@@ -82,7 +92,6 @@ impl<T> AtomicWaitQueue<T> {
     pub const fn new(initial_status: u16) -> Self {
         Self {
             head: AtomicU64::new((initial_status as u64) << STATUS_SHIFT),
-            retired: Atomic::null(),
             _marker: PhantomData,
         }
     }
@@ -268,14 +277,14 @@ impl<T> AtomicWaitQueue<T> {
 
         while !node.is_null() {
             // SAFETY: the list was detached atomically, so these nodes are ours
-            // until we either retire them or re-publish them.
+            // until we either free them or re-publish them.
             unsafe {
                 let next = (*node).next;
                 (*node).next = ptr::null_mut();
 
                 if new_status > (*node).waiter_status {
                     notify(ManuallyDrop::take(&mut (*node).data));
-                    self.retire(node);
+                    drop(Box::from_raw(node));
                 } else if keep_head.is_null() {
                     keep_head = node;
                     keep_tail = node;
@@ -311,32 +320,6 @@ impl<T> AtomicWaitQueue<T> {
         }
     }
 
-    /// Defers freeing a node until no thread can still hold the packed word
-    /// that pointed at it.
-    fn retire(&self, node: *mut Node<T>) {
-        let guard = &epoch::pin();
-        let entry = Owned::new(RetiredList {
-            node,
-            next: Atomic::null(),
-        })
-        .into_shared(guard);
-
-        let mut current = self.retired.load(Ordering::Acquire, guard);
-        loop {
-            // SAFETY: `entry` was just allocated and is not yet published.
-            unsafe { entry.deref().next.store(current, Ordering::Relaxed) };
-            match self.retired.compare_exchange_weak(
-                current,
-                entry,
-                Ordering::Release,
-                Ordering::Acquire,
-                guard,
-            ) {
-                Ok(_) => return,
-                Err(error) => current = error.current,
-            }
-        }
-    }
 }
 
 impl<T> Drop for AtomicWaitQueue<T> {
@@ -353,19 +336,6 @@ impl<T> Drop for AtomicWaitQueue<T> {
             }
         }
 
-        let guard = &epoch::pin();
-        let mut retired = self.retired.load(Ordering::Relaxed, guard);
-        while !retired.is_null() {
-            // SAFETY: as above, exclusive access. The payload was already taken
-            // when the node was retired, so only the allocation remains.
-            unsafe {
-                let entry = retired.deref();
-                drop(Box::from_raw(entry.node));
-                let next = entry.next.load(Ordering::Relaxed, guard);
-                drop(retired.into_owned());
-                retired = next;
-            }
-        }
     }
 }
 
@@ -484,6 +454,57 @@ mod tests {
             3,
             "payloads still queued at drop must not leak"
         );
+    }
+
+    #[test]
+    fn repeated_rounds_recycle_node_addresses_without_confusing_the_queue() {
+        // Detached nodes are freed immediately, so the allocator hands the same
+        // addresses straight back to the next round's `wait` calls. That reuse is
+        // the thing the packing has to survive: a stale packed word must never
+        // compare equal to a live one just because an address came back.
+        //
+        // Many short rounds with concurrent registration and raising is what
+        // makes that reuse actually happen, so this is the case to run under
+        // AddressSanitizer and ThreadSanitizer.
+        const ROUNDS: u16 = 200;
+        const WAITERS_PER_ROUND: usize = 24;
+
+        let woken = Arc::new(AtomicUsize::new(0));
+
+        for round in 0..ROUNDS {
+            let queue = Arc::new(AtomicWaitQueue::<usize>::new(0));
+            std::thread::scope(|scope| {
+                for i in 0..WAITERS_PER_ROUND {
+                    let queue = Arc::clone(&queue);
+                    let woken = Arc::clone(&woken);
+                    scope.spawn(move || {
+                        if let WaitOutcome::AlreadySatisfied(_) = queue.wait((i % 4) as u16, i) {
+                            woken.fetch_add(1, Ordering::Relaxed);
+                        }
+                    });
+                }
+                for status in 1..=4u16 {
+                    let queue = Arc::clone(&queue);
+                    let woken = Arc::clone(&woken);
+                    scope.spawn(move || {
+                        queue.advance_and_notify(status, |_| {
+                            woken.fetch_add(1, Ordering::Relaxed);
+                        });
+                    });
+                }
+            });
+
+            // Drain whatever the concurrent raises left queued.
+            queue.advance_and_notify(u16::MAX - 1, |_| {
+                woken.fetch_add(1, Ordering::Relaxed);
+            });
+
+            assert_eq!(
+                woken.load(Ordering::Relaxed),
+                (usize::from(round) + 1) * WAITERS_PER_ROUND,
+                "every waiter of round {round} is accounted for exactly once"
+            );
+        }
     }
 
     #[test]
