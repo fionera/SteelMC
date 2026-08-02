@@ -1428,7 +1428,12 @@ where
 {
     let (sender, receiver) = oneshot::channel();
     thread_pool.spawn(move || {
-        sender.send(func()).expect("Failed to send result");
+        // Ignore a dropped receiver rather than panicking on it. The awaiting
+        // task can go away -- the task tracker aborting at shutdown is enough --
+        // and with `panic = "abort"` in release a panic here takes the server
+        // down rather than losing one result. The work has already run by this
+        // point; only its delivery is lost.
+        let _ = sender.send(func());
     });
     async move { receiver.await.expect("Failed to receive rayon task result") }
 }
