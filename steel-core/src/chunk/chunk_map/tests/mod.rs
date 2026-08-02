@@ -175,13 +175,14 @@ fn insert_active_full_holder_with_ticks(
         ChunkLightData::for_valid_world_height(min_y, height),
     );
     let simulation_level = load_level.is_entity_ticking().then_some(load_level);
-    let holder = Arc::new(ChunkHolder::new_with_full_publications(
+    let holder = Arc::new(ChunkHolder::new_with_map_sinks(
         pos,
         load_level,
         simulation_level,
         min_y,
         height,
         Arc::downgrade(&world.chunk_map.full_publications),
+        Arc::downgrade(&world.chunk_map.generation_inbox),
     ));
     holder.insert_chunk(chunk, ChunkStatus::Full);
     let _ = world.chunk_map.chunks.insert_sync(pos, Arc::clone(&holder));

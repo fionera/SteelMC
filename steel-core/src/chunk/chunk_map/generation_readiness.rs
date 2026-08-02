@@ -162,13 +162,14 @@ impl ChunkMap {
                     let _ = self.chunks.insert_sync(pos, Arc::clone(&holder));
                     holder
                 } else {
-                    let holder = Arc::new(ChunkHolder::new_with_full_publications(
+                    let holder = Arc::new(ChunkHolder::new_with_map_sinks(
                         pos,
                         level,
                         new_simulation_level,
                         self.world_gen_context.min_y(),
                         self.world_gen_context.height(),
                         Arc::downgrade(&self.full_publications),
+                        Arc::downgrade(&self.generation_inbox),
                     ));
                     let _ = self.chunks.insert_sync(pos, holder.clone());
                     holder

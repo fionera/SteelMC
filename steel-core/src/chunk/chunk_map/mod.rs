@@ -234,6 +234,52 @@ struct ReadinessReconcileResult {
     candidate_count: usize,
 }
 
+/// Holders whose generation drive has become runnable again and that the map
+/// must admit.
+///
+/// Neither direction of the map/holder pair is strong here, and both are
+/// deliberate. `ChunkMap` owns the inbox while holders keep only a weak sink,
+/// for the same reason as [`FullPublicationQueue`]: an unloading holder must
+/// not retain its map. The queued entries are weak too, which matters more:
+/// `ChunkMap::process_unloads` frees a holder only at `strong_count == 1`, so a
+/// strong entry left here between a push and the next drain makes an unloading
+/// holder look referenced. A holder can be pushed and then lose its ticket
+/// before the drain, and there is no unload-time purge of this queue, so that
+/// entry would pin it in `unloading_chunks` -- never saved, never finalized,
+/// region handle never released. Holder references reachable from another
+/// holder's wake path leaking exactly that way is why an earlier attempt at
+/// this scheduler was abandoned.
+///
+/// An entry whose holder is gone by the drain is dropped there: it was
+/// unloaded, so its park went with it and there is nothing left to admit.
+///
+/// Both operations hold the lock for O(1) work -- `take_all` swaps the vector
+/// out and upgrades outside the lock -- because the pushes come from rayon
+/// generation workers inside the status-publish path, where every chunk waiting
+/// on the status being published is blocked behind the push.
+#[derive(Default)]
+pub(crate) struct GenerationInbox {
+    pending: SyncMutex<Vec<Weak<ChunkHolder>>>,
+}
+
+impl GenerationInbox {
+    pub(crate) fn push(&self, holder: &Arc<ChunkHolder>) {
+        self.pending.lock().push(Arc::downgrade(holder));
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "drained by the chunk scheduler in a follow-up change"
+        )
+    )]
+    pub(crate) fn take_all(&self) -> Vec<Arc<ChunkHolder>> {
+        let pending = mem::take(&mut *self.pending.lock());
+        pending.iter().filter_map(Weak::upgrade).collect()
+    }
+}
+
 /// A map of chunks managing their state, loading, and generation.
 pub struct ChunkMap {
     /// Map of active chunks.
@@ -250,6 +296,8 @@ pub struct ChunkMap {
     scheduling: ChunkSchedulingCoordinator,
     /// Full status completions awaiting lifecycle-boundary reconciliation.
     full_publications: Arc<FullPublicationQueue>,
+    /// Holders handed back for admission by the per-holder generation drive.
+    generation_inbox: Arc<GenerationInbox>,
     /// Incremental radius-1/radius-2 Full-neighborhood state.
     full_neighborhood: SyncMutex<FullNeighborhoodIndex>,
     /// Readiness-driven chunk views published at lifecycle boundaries.
@@ -399,6 +447,7 @@ impl ChunkMap {
             task_tracker: TaskTracker::new(),
             scheduling: ChunkSchedulingCoordinator::new(chunk_tickets),
             full_publications,
+            generation_inbox: Arc::new(GenerationInbox::default()),
             full_neighborhood: SyncMutex::new(FullNeighborhoodIndex::default()),
             ticking_chunks: ArcSwap::from_pointee(TickingChunkSnapshot::default()),
             finalized_block_entity_unloads: SyncMutex::new(Vec::new()),

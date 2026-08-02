@@ -145,13 +145,14 @@ fn cached_holder_rechecks_publication_and_generation_permission() {
     let load_level = ChunkTicketLevel::FULL_CHUNK;
     let min_y = world.chunk_map.world_gen_context.min_y();
     let height = world.chunk_map.world_gen_context.height();
-    let holder = Arc::new(ChunkHolder::new_with_full_publications(
+    let holder = Arc::new(ChunkHolder::new_with_map_sinks(
         pos,
         load_level,
         None,
         min_y,
         height,
         Arc::downgrade(&world.chunk_map.full_publications),
+        Arc::downgrade(&world.chunk_map.generation_inbox),
     ));
     let _ = world.chunk_map.chunks.insert_sync(pos, Arc::clone(&holder));
     let scope = GameplayChunkLookupCacheScope::enter(&world.chunk_map);

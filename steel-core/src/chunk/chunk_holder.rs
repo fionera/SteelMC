@@ -3,7 +3,7 @@ use futures::Future;
 use rustc_hash::FxHashSet;
 use std::fmt::Debug;
 use std::mem;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use steel_utils::atomic_wait_queue::{AtomicWaitQueue, WaitOutcome};
 use steel_utils::{BlockPos, ChunkPos, PackedSectionBlockPos, SectionPos, locks::SyncMutex};
@@ -20,10 +20,12 @@ use std::time::Duration;
 pub static SLOW_CHUNK_GEN: AtomicBool = AtomicBool::new(false);
 
 use crate::chunk::chunk_generation_task::{NeighborReady, StaticCache2D};
+use crate::chunk::chunk_map::GenerationInbox;
 use crate::chunk::chunk_ticket_manager::{
     ChunkTicketLevel, generation_status, is_entity_ticking, is_full,
 };
 use crate::chunk::full_chunk_readiness::FullPublicationQueue;
+use crate::chunk::generation_drive::{DecOutcome, GenerationDrive};
 use crate::chunk::light::{
     LightLayer, LightSectionRange, LightWorkWindowGate, LightWorkWindowReservation,
 };
@@ -143,6 +145,163 @@ impl ChangedLightSections {
     }
 }
 
+/// Instrumentation for the per-holder generation drive.
+///
+/// Statics rather than a field on `ChunkMap`, because two of these are bumped
+/// from places that hold no map: [`DependencyWaiter::drop`] runs on whichever
+/// rayon worker dropped the wait queue and has only a `Weak<ChunkHolder>` to
+/// work from. The worldgen ore profile keeps its totals in a static for the
+/// same reason.
+///
+/// Everything here stays at zero until the drive is wired into the scheduler.
+pub(crate) static GENERATION_DRIVE_COUNTERS: GenerationDriveCounters =
+    GenerationDriveCounters::new();
+
+/// The counters behind [`GENERATION_DRIVE_COUNTERS`].
+///
+/// The two gauges are signed: they are raised and lowered from different
+/// threads, and an unmatched decrement has to read as `-1` rather than as
+/// `u64::MAX`, which is the difference between "we have a bug" and "the counter
+/// is meaningless".
+pub(crate) struct GenerationDriveCounters {
+    /// Holders currently parked on at least one dependency.
+    #[expect(
+        dead_code,
+        reason = "moved by the drive's park and stall transitions in a follow-up change"
+    )]
+    pub(crate) parked_holders: AtomicI64,
+    /// Holders currently stalled, i.e. unable to progress until re-armed.
+    #[expect(
+        dead_code,
+        reason = "moved by the drive's park and stall transitions in a follow-up change"
+    )]
+    pub(crate) stalled_holders: AtomicI64,
+    /// [`DependencyWaiter`]s created and not yet released.
+    pub(crate) live_dependency_registrations: AtomicI64,
+    /// Registrations released by the wait queue being dropped rather than by
+    /// the status they wait for being published. See [`DependencyWaiter::drop`]
+    /// for why this is expected to stay at zero.
+    pub(crate) dependency_waiters_dropped_unfired: AtomicU64,
+    /// Parks whose last registration resolved, handing the holder back for
+    /// admission.
+    pub(crate) drive_wakes: AtomicU64,
+}
+
+impl GenerationDriveCounters {
+    const fn new() -> Self {
+        Self {
+            parked_holders: AtomicI64::new(0),
+            stalled_holders: AtomicI64::new(0),
+            live_dependency_registrations: AtomicI64::new(0),
+            dependency_waiters_dropped_unfired: AtomicU64::new(0),
+            drive_wakes: AtomicU64::new(0),
+        }
+    }
+}
+
+/// What a holder's status queue hands back when the status it waits for is
+/// published.
+pub(crate) enum StatusWaiter {
+    /// An `await_status_with` future.
+    Oneshot(oneshot::Sender<()>),
+    /// Another holder's parked generation drive.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "registered by the per-holder generation drive in a follow-up change"
+        )
+    )]
+    Dependency(DependencyWaiter),
+}
+
+/// One parked holder's registration on a neighbour's status.
+///
+/// Exactly one of [`Self::fire`] and [`Self::drop`] releases the registration
+/// with the parent's drive; see either for how that is arranged.
+pub(crate) struct DependencyWaiter {
+    /// Weak, and never an `Arc`. A strong reference held from one holder's wait
+    /// queue to another holder keeps the target's `Arc::strong_count` above one
+    /// for as long as the queue lives, and `ChunkMap::process_unloads` uses
+    /// exactly that count to decide a holder is unreferenced -- an earlier
+    /// attempt at this scheduler leaked every holder it generated that way.
+    parent: Weak<ChunkHolder>,
+    #[expect(
+        dead_code,
+        reason = "read by the drive's park pass in a follow-up change"
+    )]
+    required: ChunkStatus,
+    /// The park epoch of `parent` this registration belongs to. A release
+    /// carrying any other epoch is refused by the drive, so a registration can
+    /// never decrement a park it did not arm.
+    epoch: u64,
+}
+
+impl DependencyWaiter {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "registered by the per-holder generation drive in a follow-up change"
+        )
+    )]
+    pub(crate) fn new(parent: &Arc<ChunkHolder>, required: ChunkStatus, epoch: u64) -> Self {
+        GENERATION_DRIVE_COUNTERS
+            .live_dependency_registrations
+            .fetch_add(1, Ordering::Relaxed);
+        Self {
+            parent: Arc::downgrade(parent),
+            required,
+            epoch,
+        }
+    }
+
+    /// Releases this registration because the status it waited for was
+    /// published, and reports the parent when this caller now owns its requeue.
+    fn fire(mut self) -> Option<Arc<ChunkHolder>> {
+        // Empty the `Weak` so the `Drop` that runs at the end of this function
+        // finds nothing to release. `mem::forget` would do that too, but it
+        // would leak the `Weak` -- and its weak count keeps the parent's
+        // allocation alive. Doing neither releases twice, taking the drive's
+        // 16-bit outstanding count one below zero; it wraps to ~65k and the
+        // parent never leaves its park.
+        let parent = mem::replace(&mut self.parent, Weak::new());
+        // A parent that is gone was unloaded, and its park went with it.
+        let parent = parent.upgrade()?;
+        (parent.finish_dependency(self.epoch) == DecOutcome::Requeue).then_some(parent)
+    }
+}
+
+impl Drop for DependencyWaiter {
+    /// Runs on both paths: [`Self::fire`] consumes the waiter, so the gauge is
+    /// lowered here exactly once per registration however it ended.
+    ///
+    /// Reaching the release below, on the other hand, means the wait queue
+    /// itself was dropped with this waiter still registered -- the neighbour was
+    /// destroyed before it published the status. That should not happen, since a
+    /// neighbour cannot fall below the ticket level a dependent needs while that
+    /// dependent still holds one, so the counter exists to say whether it ever
+    /// does. The release is defence in depth: without it the parent keeps an
+    /// outstanding count for a status nobody will ever publish. It goes through
+    /// the same requeue as `fire` for the same reason -- the release that takes
+    /// the count to zero is the only one that will ever be told to admit the
+    /// parent again, whichever path it arrives on.
+    fn drop(&mut self) {
+        GENERATION_DRIVE_COUNTERS
+            .live_dependency_registrations
+            .fetch_sub(1, Ordering::Relaxed);
+        let Some(parent) = self.parent.upgrade() else {
+            return;
+        };
+        GENERATION_DRIVE_COUNTERS
+            .dependency_waiters_dropped_unfired
+            .fetch_add(1, Ordering::Relaxed);
+        if parent.finish_dependency(self.epoch) == DecOutcome::Requeue {
+            parent.requeue_for_generation();
+        }
+    }
+}
+
 /// Holds chunk data and coordinates asynchronous generation work.
 ///
 /// The published status is released only after the corresponding data and Full
@@ -160,7 +319,20 @@ impl ChangedLightSections {
 /// the queue deliberately cannot express.
 pub struct ChunkHolder {
     data: OnceLock<Chunk>,
-    status: AtomicWaitQueue<oneshot::Sender<()>>,
+    /// Published status, and everything waiting for a later one.
+    ///
+    /// Payloads are dropped wherever the queue is drained or destroyed, which
+    /// after the scheduler rewrite includes a rayon generation worker inside
+    /// the publish path. Every payload's drop must therefore stay a leaf:
+    /// `oneshot::Sender::drop` wakes a receiver, `Weak::drop` decrements a
+    /// refcount, and [`DependencyWaiter::drop`] touches one atomic word plus
+    /// the target's inbox. None of them re-enters the chunk map, and nothing
+    /// added here may either -- a payload drop that took a map lock would do so
+    /// while every chunk waiting on the status being published is blocked.
+    status: AtomicWaitQueue<StatusWaiter>,
+    /// The per-holder generation state machine. Nothing arms it yet; the
+    /// scheduler that drives it lands separately.
+    drive: GenerationDrive,
     status_changed: Notify,
     generation_task: SyncMutex<Option<Arc<ChunkGenerationTask>>>,
     generation_task_target: AtomicU8,
@@ -193,6 +365,8 @@ pub struct ChunkHolder {
     full_status_initialized: AtomicBool,
     /// Weak sink for Full status publication notifications.
     full_publications: Weak<FullPublicationQueue>,
+    /// Weak sink for holders this one hands back for generation admission.
+    generation_inbox: Weak<GenerationInbox>,
     /// Per-section sets of changed block positions.
     /// Index is `(block_y - min_y) / 16`.
     changed_blocks_per_section: Box<[SyncMutex<FxHashSet<PackedSectionBlockPos>>]>,
@@ -273,23 +447,30 @@ impl ChunkHolder {
         min_y: i32,
         height: i32,
     ) -> Self {
-        Self::new_with_full_publications(
+        Self::new_with_map_sinks(
             pos,
             load_level,
             simulation_level,
             min_y,
             height,
             Weak::new(),
+            Weak::new(),
         )
     }
 
-    pub(crate) fn new_with_full_publications(
+    /// Creates a holder wired to the map's sinks.
+    ///
+    /// [`Self::new`] passes `Weak::new()` for both, which never upgrades, so the
+    /// holders built by hand in tests, benches and worldgen simply publish
+    /// nowhere instead of each having to construct a map's queues.
+    pub(crate) fn new_with_map_sinks(
         pos: ChunkPos,
         load_level: ChunkTicketLevel,
         simulation_level: Option<ChunkTicketLevel>,
         min_y: i32,
         height: i32,
         full_publications: Weak<FullPublicationQueue>,
+        generation_inbox: Weak<GenerationInbox>,
     ) -> Self {
         let highest_allowed_status =
             generation_status(Some(load_level)).map_or(STATUS_NONE, |s| s.get_index() as u8);
@@ -302,6 +483,7 @@ impl ChunkHolder {
         Self {
             data: OnceLock::new(),
             status: AtomicWaitQueue::new(u16::from(UNPUBLISHED_STATUS)),
+            drive: GenerationDrive::new(),
             status_changed: Notify::new(),
             generation_task: SyncMutex::new(None),
             generation_task_target: AtomicU8::new(STATUS_NONE),
@@ -320,6 +502,7 @@ impl ChunkHolder {
             ticking_readiness: AtomicU64::new(0),
             full_status_initialized: AtomicBool::new(false),
             full_publications,
+            generation_inbox,
             changed_blocks_per_section,
             changed_light_sections: SyncMutex::new(ChangedLightSectionSets::default()),
         }
@@ -370,11 +553,58 @@ impl ChunkHolder {
     }
 
     /// Updates the highest allowed generation status based on the ticket level.
+    ///
+    /// `SeqCst`, not `Release`, and every load of this cell is `SeqCst` for the
+    /// same reason. The drive protocol pairs "store the new allowance, then arm
+    /// the drive" on the ticket side against "end the run, then read the
+    /// allowance" on the driver side. That is a Dekker pattern: it needs
+    /// Store-Load ordering, which Release/Acquire does not give -- both sides
+    /// may legally read the other's pre-store value, each concludes the other
+    /// will do the work, and the chunk sits below its allowed status forever.
+    /// Only a single total order over the two accesses rules that out.
     pub fn update_highest_allowed_status(&self, ticket_level: Option<ChunkTicketLevel>) {
         let new_status =
             generation_status(ticket_level).map_or(STATUS_NONE, |s| s.get_index() as u8);
         self.highest_allowed_status
-            .store(new_status, Ordering::Release);
+            .store(new_status, Ordering::SeqCst);
+    }
+
+    /// The highest status generation is currently allowed to reach, or `None`
+    /// while the chunk's ticket level allows no generation at all.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the stored allowance does not decode to a status. Only
+    /// [`Self::update_highest_allowed_status`] writes this cell, and only from
+    /// `generation_status`, so an undecodable value means an aliasing write --
+    /// and every caller here would otherwise silently read it as "generation is
+    /// forbidden" and abandon the chunk.
+    #[must_use]
+    pub fn highest_allowed_status(&self) -> Option<ChunkStatus> {
+        // See `update_highest_allowed_status` for why this is `SeqCst`.
+        let raw = self.highest_allowed_status.load(Ordering::SeqCst);
+        if raw == STATUS_NONE {
+            return None;
+        }
+        let status = ChunkStatus::from_index(usize::from(raw));
+        assert!(status.is_some(), "invalid highest allowed status: {raw}");
+        status
+    }
+
+    /// Whether this holder has generation work left to do.
+    ///
+    /// The allowance is read once, into `allowed`, and the target is not
+    /// reconstructed from the ticket level: a level read paired with a separate
+    /// allowance read can straddle an update and produce a target that was never
+    /// allowed (see `ChunkMap::schedule_admitted_holders`, which re-reads the
+    /// level for that reason). This cell is authoritative on its own.
+    #[must_use]
+    pub fn needs_generation(&self) -> bool {
+        let Some(allowed) = self.highest_allowed_status() else {
+            return false;
+        };
+        self.published_status()
+            .is_none_or(|published| published < allowed)
     }
 
     /// Records a block change at the given position.
@@ -544,11 +774,11 @@ impl ChunkHolder {
 
     /// Checks if the given status is disallowed.
     pub fn is_status_disallowed(&self, status: ChunkStatus) -> bool {
-        let allowed = self.highest_allowed_status.load(Ordering::Acquire);
-        if allowed == STATUS_NONE {
-            return true;
-        }
-        status.get_index() > allowed as usize
+        // Goes through the accessor so this shares its single `SeqCst` read of
+        // the cell; a second, differently ordered read of the same allowance is
+        // exactly what the Dekker pairing cannot tolerate.
+        self.highest_allowed_status()
+            .is_none_or(|allowed| status > allowed)
     }
 
     /// Schedules a generation task for this chunk if needed.
@@ -661,7 +891,7 @@ impl ChunkHolder {
             // The queue releases a waiter once its status is *exceeded*, so a
             // waiter for encoded status `e` registers at `e - 1`.
             let wait_for = u16::from(encoded_published_status(status)) - 1;
-            match self.status.wait(wait_for, sender) {
+            match self.status.wait(wait_for, StatusWaiter::Oneshot(sender)) {
                 WaitOutcome::AlreadySatisfied(_) => return self.published_status(),
                 WaitOutcome::Cancelled(_) => return None,
                 WaitOutcome::Registered => {}
@@ -1394,10 +1624,43 @@ impl ChunkHolder {
             return;
         }
         self.status
-            .advance_and_notify(u16::from(encoded), |waiter| {
+            .advance_and_notify(u16::from(encoded), |waiter| match waiter {
                 // A dropped receiver just means the waiter went away.
-                let _ = waiter.send(());
+                StatusWaiter::Oneshot(sender) => {
+                    let _ = sender.send(());
+                }
+                // Runs on the generation worker that just did the work, once per
+                // status of a fused run, with every chunk waiting on this status
+                // blocked behind it: a handful of atomic bumps, and for the one
+                // waiter per park that ends it, a push onto a vector. Nothing
+                // here allocates per waiter.
+                StatusWaiter::Dependency(dependency) => {
+                    if let Some(parent) = dependency.fire() {
+                        parent.requeue_for_generation();
+                    }
+                }
             });
+    }
+
+    /// Releases one dependency registration taken against `epoch` of this
+    /// holder's park.
+    fn finish_dependency(&self, epoch: u64) -> DecOutcome {
+        self.drive.finish_dependency(epoch)
+    }
+
+    /// Hands this holder back to the map for admission, after the park it was
+    /// waiting in ended.
+    ///
+    /// Exactly one release per park observes [`DecOutcome::Requeue`], so this
+    /// cannot queue the same park twice. A missing inbox means the map is gone
+    /// and nothing is going to admit anything again.
+    fn requeue_for_generation(self: &Arc<Self>) {
+        GENERATION_DRIVE_COUNTERS
+            .drive_wakes
+            .fetch_add(1, Ordering::Relaxed);
+        if let Some(inbox) = self.generation_inbox.upgrade() {
+            inbox.push(self);
+        }
     }
 
     /// Registers tick queues before Full status becomes observable to watchers.
@@ -1560,13 +1823,14 @@ mod tests {
     fn full_readiness_publication_waits_for_post_load_initialization() {
         init_chunk_test_registry();
         let publications = Arc::new(FullPublicationQueue::default());
-        let holder = Arc::new(ChunkHolder::new_with_full_publications(
+        let holder = Arc::new(ChunkHolder::new_with_map_sinks(
             ChunkPos::new(0, 0),
             ChunkTicketLevel::FULL_CHUNK,
             None,
             0,
             16,
             Arc::downgrade(&publications),
+            Weak::new(),
         ));
         let full = test_proto_chunk(ChunkStatus::Light);
         let _ = full.promote_to_full();
@@ -1833,6 +2097,237 @@ mod tests {
 
         assert!(holder.try_revive_from_unloading());
         assert!(holder.try_begin_save_preparation().is_none());
+    }
+
+    /// Serialises the tests that read [`GENERATION_DRIVE_COUNTERS`]. The
+    /// counters are process-wide, so two of these running at once would each
+    /// see the other's registrations in their deltas.
+    static COUNTER_LOCK: SyncMutex<()> = SyncMutex::new(());
+
+    fn dropped_unfired() -> u64 {
+        GENERATION_DRIVE_COUNTERS
+            .dependency_waiters_dropped_unfired
+            .load(Ordering::Relaxed)
+    }
+
+    fn live_registrations() -> i64 {
+        GENERATION_DRIVE_COUNTERS
+            .live_dependency_registrations
+            .load(Ordering::Relaxed)
+    }
+
+    /// Parks `holder` holding the park bias plus `registrations` slots, and
+    /// returns the park epoch every registration must carry.
+    fn park(holder: &Arc<ChunkHolder>, registrations: u32) -> u64 {
+        assert!(holder.drive.arm());
+        let ticket = holder.drive.begin_run().expect("an armed drive can run");
+        let epoch = holder
+            .drive
+            .park_begin(ticket)
+            .expect("a running drive can park");
+        for _ in 0..registrations {
+            assert!(holder.drive.arm_dependency(epoch));
+        }
+        epoch
+    }
+
+    #[test]
+    fn allowed_status_follows_the_ticket_level() {
+        init_chunk_test_registry();
+        let holder = test_holder();
+
+        assert_eq!(holder.highest_allowed_status(), Some(ChunkStatus::Full));
+        assert!(holder.needs_generation());
+        assert!(!holder.is_status_disallowed(ChunkStatus::Full));
+
+        let full = test_proto_chunk(ChunkStatus::Light);
+        let _ = full.promote_to_full();
+        holder.insert_chunk(full, ChunkStatus::Full);
+
+        assert!(
+            !holder.needs_generation(),
+            "a chunk published at its allowance has nothing left to generate"
+        );
+
+        holder.update_highest_allowed_status(None);
+
+        assert_eq!(holder.highest_allowed_status(), None);
+        assert!(holder.is_status_disallowed(ChunkStatus::Empty));
+        assert!(
+            !holder.needs_generation(),
+            "a chunk that may not generate at all never needs generation"
+        );
+    }
+
+    #[test]
+    fn an_unpublished_chunk_below_its_allowance_needs_generation() {
+        init_chunk_test_registry();
+        let holder = test_holder();
+        holder.insert_chunk(test_proto_chunk(ChunkStatus::Light), ChunkStatus::Light);
+
+        assert!(holder.needs_generation());
+
+        holder.update_highest_allowed_status(Some(ChunkTicketLevel::FULL_CHUNK));
+        assert!(holder.needs_generation());
+    }
+
+    /// The fire/drop pair. `fire` consumes the waiter, so its `Drop` still runs;
+    /// if that `Drop` released the registration again the park would lose a slot
+    /// it never armed, and at zero the count wraps to ~65k and strands the
+    /// holder.
+    #[test]
+    fn firing_a_dependency_waiter_releases_exactly_one_registration() {
+        let _lock = COUNTER_LOCK.lock();
+        let holder = test_holder();
+        let epoch = park(&holder, 2);
+        let live_before = live_registrations();
+        let dropped_before = dropped_unfired();
+
+        let waiter = DependencyWaiter::new(&holder, ChunkStatus::Light, epoch);
+        assert_eq!(live_registrations(), live_before + 1);
+
+        assert!(
+            waiter.fire().is_none(),
+            "a park with registrations left does not requeue yet"
+        );
+
+        assert_eq!(holder.drive.outstanding(), 2);
+        assert_eq!(
+            live_registrations(),
+            live_before,
+            "the gauge must fall exactly once per registration"
+        );
+        assert_eq!(
+            dropped_unfired(),
+            dropped_before,
+            "a fired waiter is not a waiter dropped unfired"
+        );
+    }
+
+    #[test]
+    fn dropping_a_dependency_waiter_unfired_still_releases_its_registration() {
+        let _lock = COUNTER_LOCK.lock();
+        let holder = test_holder();
+        let epoch = park(&holder, 2);
+        let live_before = live_registrations();
+        let dropped_before = dropped_unfired();
+
+        drop(DependencyWaiter::new(&holder, ChunkStatus::Light, epoch));
+
+        assert_eq!(holder.drive.outstanding(), 2);
+        assert_eq!(live_registrations(), live_before);
+        assert_eq!(
+            dropped_unfired(),
+            dropped_before + 1,
+            "the drop path must be distinguishable from the fire path"
+        );
+    }
+
+    #[test]
+    fn a_dependency_waiter_outliving_its_parent_releases_nothing() {
+        let _lock = COUNTER_LOCK.lock();
+        let holder = test_holder();
+        let epoch = park(&holder, 1);
+        let live_before = live_registrations();
+        let dropped_before = dropped_unfired();
+        let waiter = DependencyWaiter::new(&holder, ChunkStatus::Light, epoch);
+
+        drop(holder);
+        drop(waiter);
+
+        assert_eq!(live_registrations(), live_before);
+        assert_eq!(
+            dropped_unfired(),
+            dropped_before,
+            "an unloaded parent has no park left to release"
+        );
+    }
+
+    /// The publish path with a dependency payload on the queue: the neighbour
+    /// publishes on its generation worker, the last registration of the park
+    /// resolves, and the parent lands in the map's inbox exactly once.
+    #[test]
+    fn publishing_a_status_requeues_the_dependent_it_was_the_last_dependency_of() {
+        // Takes the counter lock even though it asserts on no gauge: it builds a
+        // `DependencyWaiter`, which raises the process-wide live-registration
+        // count, and that count straddles the sampling windows of the delta
+        // tests above. Without this the three of them fail intermittently.
+        let _lock = COUNTER_LOCK.lock();
+        init_chunk_test_registry();
+        let inbox = Arc::new(GenerationInbox::default());
+        let parent = Arc::new(ChunkHolder::new_with_map_sinks(
+            ChunkPos::new(1, 0),
+            ChunkTicketLevel::FULL_CHUNK,
+            None,
+            0,
+            16,
+            Weak::new(),
+            Arc::downgrade(&inbox),
+        ));
+        let epoch = park(&parent, 1);
+
+        let neighbour = test_holder();
+        let wait_for = u16::from(encoded_published_status(ChunkStatus::Light)) - 1;
+        assert!(matches!(
+            neighbour.status.wait(
+                wait_for,
+                StatusWaiter::Dependency(DependencyWaiter::new(&parent, ChunkStatus::Light, epoch)),
+            ),
+            WaitOutcome::Registered
+        ));
+
+        // The registration pass is complete; releasing the bias leaves this one
+        // registration as all the park is waiting for, so the publication below
+        // owns the requeue.
+        assert_eq!(parent.drive.finish_dependency(epoch), DecOutcome::Pending);
+        assert!(inbox.take_all().is_empty());
+        neighbour.insert_chunk(test_proto_chunk(ChunkStatus::Light), ChunkStatus::Light);
+
+        let requeued = inbox.take_all();
+        assert_eq!(requeued.len(), 1);
+        assert!(Arc::ptr_eq(&requeued[0], &parent));
+        assert_eq!(parent.drive.outstanding(), 0);
+    }
+
+    /// A queued holder that loses its ticket before the drain must still be
+    /// freeable: `ChunkMap::process_unloads` releases an unloading holder only
+    /// at `strong_count == 1`, and nothing purges this queue on unload, so an
+    /// entry that counted would pin the holder in `unloading_chunks` forever.
+    #[test]
+    fn a_queued_holder_is_not_kept_alive_by_the_inbox() {
+        init_chunk_test_registry();
+        let inbox = Arc::new(GenerationInbox::default());
+        let parent = Arc::new(ChunkHolder::new_with_map_sinks(
+            ChunkPos::new(2, 0),
+            ChunkTicketLevel::FULL_CHUNK,
+            None,
+            0,
+            16,
+            Weak::new(),
+            Arc::downgrade(&inbox),
+        ));
+        let epoch = park(&parent, 1);
+
+        let neighbour = test_holder();
+        let wait_for = u16::from(encoded_published_status(ChunkStatus::Light)) - 1;
+        assert!(matches!(
+            neighbour.status.wait(
+                wait_for,
+                StatusWaiter::Dependency(DependencyWaiter::new(&parent, ChunkStatus::Light, epoch)),
+            ),
+            WaitOutcome::Registered
+        ));
+        assert_eq!(parent.drive.finish_dependency(epoch), DecOutcome::Pending);
+        neighbour.insert_chunk(test_proto_chunk(ChunkStatus::Light), ChunkStatus::Light);
+
+        // The publication queued the parent. This handle stands in for the
+        // map's own entry, and it has to be the last one.
+        assert_eq!(Arc::strong_count(&parent), 1);
+
+        let unloaded = Arc::downgrade(&parent);
+        drop(parent);
+        assert!(unloaded.upgrade().is_none());
+        assert!(inbox.take_all().is_empty());
     }
 
     #[test]
