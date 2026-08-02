@@ -35,7 +35,7 @@ use crate::{
     chunk::{
         Chunk,
         chunk_generation_task::ChunkGenerationTask,
-        chunk_pyramid::ChunkStep,
+        chunk_pyramid::{ChunkStep, GENERATION_PYRAMID, can_fuse},
         full_chunk::{FullChunkPromotion, FullChunkRef},
         status::ChunkStatus,
     },
@@ -859,6 +859,37 @@ impl ChunkHolder {
             }));
         };
 
+        // Extend the claim into a fused run.
+        //
+        // Consecutive steps that need nothing from other chunks beyond what
+        // this one already needed can run back-to-back in a single job, which
+        // saves a rayon dispatch, a tokio task and a oneshot wake apiece and
+        // keeps the chunk's data in cache across them. Claiming the whole run
+        // up front is safe because a claim only advances `started_work`;
+        // publishing is separate and still happens per status, so a neighbour
+        // waiting on the first status of a run is not held up by the rest.
+        //
+        // The caller keeps asking for one status at a time. Those it finds
+        // already claimed and published fall into the branch above and resolve
+        // without dispatching anything.
+        let mut claims = vec![status_claim];
+        let mut steps = vec![step];
+        if target_status != ChunkStatus::Empty {
+            let mut previous = step;
+            while let Some(next_status) = previous.target_status.next() {
+                let next_step = GENERATION_PYRAMID.get_step_to(next_status);
+                if !can_fuse(previous, next_step) || self.is_status_disallowed(next_status) {
+                    break;
+                }
+                let Some(claim) = self.claim_status_work(next_status) else {
+                    break;
+                };
+                claims.push(claim);
+                steps.push(next_step);
+                previous = next_step;
+            }
+        }
+
         let cache = cache.clone();
         let context = chunk_map.world_gen_context.clone();
         let self_clone = self.clone();
@@ -866,15 +897,18 @@ impl ChunkHolder {
         let save_dependency = self.add_save_dependency();
 
         let future = chunk_map.task_tracker.spawn(async move {
-            // Keep the claim alive for the producer task so Drop can roll back abandoned work.
-            let _status_claim = status_claim;
+            // Keep the claims alive for the producer task so Drop can roll back
+            // abandoned work. Rolling several back is safe in any order: each
+            // rolls `started_work` to the published index, so whichever runs
+            // while it still matches wins and the rest are no-ops.
+            let _status_claims = claims;
             let _save_dependency = save_dependency;
             let result = if target_status == ChunkStatus::Empty {
                 Self::apply_empty_step(self_clone, step, context, cache, storage, thread_pool).await
             } else {
-                Self::apply_generated_step(
+                Self::apply_generated_steps(
                     self_clone,
-                    step,
+                    steps,
                     context,
                     cache,
                     thread_pool,
@@ -1080,42 +1114,12 @@ impl ChunkHolder {
         Some(true)
     }
 
-    async fn apply_generated_step(
-        holder: Arc<Self>,
-        step: &'static ChunkStep,
-        context: Arc<WorldGenContext>,
-        cache: Arc<StaticCache2D<Arc<ChunkHolder>>>,
-        thread_pool: Arc<rayon::ThreadPool>,
-        light_work_window_reservation: Option<LightWorkWindowReservation>,
-    ) -> Option<()> {
-        let target_status = step.target_status;
-        let Some(parent_status) = target_status.parent() else {
-            panic!("Target status must have parent if not Empty");
-        };
-        let has_parent = holder
-            .published_status()
-            .is_some_and(|status| parent_status <= status);
-        let holder_for_notify = holder.clone();
-
-        assert!(has_parent, "Parent chunk missing");
-
-        // Publish, and release the light window, on the generation worker that
-        // just did the work rather than after waking this task back up. Every
-        // chunk whose next step depends on this status is blocked until the
-        // publish lands, so routing it through a oneshot wake put a cross-
-        // runtime scheduler round trip in the critical path of all twelve steps
-        // of every chunk.
-        Self::run_step_task(thread_pool, step, context, cache, holder, move || {
-            holder_for_notify.finish_generation_status(target_status);
-            drop(light_work_window_reservation);
-        })
-        .await;
-        Some(())
-    }
-
     /// Runs one generation step on the generation pool.
     ///
-    /// `on_complete` runs on the same worker as soon as the step returns.
+    /// `on_complete` runs on the same worker as soon as the step returns. Only
+    /// the `Empty` step uses this; generated steps go through
+    /// [`Self::apply_generated_steps`], which fuses consecutive steps into one
+    /// job.
     async fn run_step_task<F>(
         thread_pool: Arc<rayon::ThreadPool>,
         step: &'static ChunkStep,
@@ -1132,6 +1136,54 @@ impl ChunkHolder {
             on_complete();
         })
         .await;
+    }
+
+    /// Runs a fused run of generation steps as one job on the generation pool.
+    ///
+    /// `steps` is one or more consecutive steps whose claims are already held;
+    /// see [`can_fuse`] for when a step may join a run.
+    async fn apply_generated_steps(
+        holder: Arc<Self>,
+        steps: Vec<&'static ChunkStep>,
+        context: Arc<WorldGenContext>,
+        cache: Arc<StaticCache2D<Arc<ChunkHolder>>>,
+        thread_pool: Arc<rayon::ThreadPool>,
+        light_work_window_reservation: Option<LightWorkWindowReservation>,
+    ) -> Option<()> {
+        let first = *steps.first().expect("a fused run has at least one step");
+        let Some(parent_status) = first.target_status.parent() else {
+            panic!("Target status must have parent if not Empty");
+        };
+        let has_parent = holder
+            .published_status()
+            .is_some_and(|status| parent_status <= status);
+
+        assert!(has_parent, "Parent chunk missing");
+
+        rayon_spawn(&thread_pool, move || {
+            let mut reservation = light_work_window_reservation;
+            for step in steps {
+                let task = step.task;
+                task(Arc::clone(&context), step, &cache, Arc::clone(&holder));
+
+                // Publish on the generation worker that just did the work
+                // rather than after waking a task back up. Every chunk whose
+                // next step depends on this status is blocked until the publish
+                // lands, so routing it through a oneshot wake put a
+                // cross-runtime scheduler round trip in the critical path of
+                // every step of every chunk.
+                holder.finish_generation_status(step.target_status);
+
+                if step.target_status == ChunkStatus::Light {
+                    // Release the light window as soon as the light work is
+                    // done instead of holding it across the rest of the run.
+                    reservation = None;
+                }
+            }
+            drop(reservation);
+        })
+        .await;
+        Some(())
     }
 
     fn claim_status_work(self: &Arc<Self>, status: ChunkStatus) -> Option<StatusWorkClaim> {

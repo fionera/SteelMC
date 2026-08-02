@@ -252,6 +252,56 @@ fn noop_task(
 ) {
 }
 
+/// Whether `next` may run in the same generation job as `prev`.
+///
+/// Every step is its own rayon job, tokio task and oneshot wake, so a chunk
+/// costs twelve of each. Most of that dispatch is avoidable: consecutive steps
+/// often need nothing from other chunks that the previous step did not already
+/// need, and the halo the job is already holding satisfies them. Fusing such a
+/// pair also lets the second step run with the first one's chunk data still in
+/// cache, on the same worker.
+///
+/// Sound exactly when `next` introduces no *new* cross-chunk dependency: for
+/// every status, what `next` needs from other chunks, `prev` already required
+/// at least as far out.
+///
+/// Radius 0 means "this chunk only" -- that covers both `next`'s parent, which
+/// `prev` has just produced on this chunk, and any status that is not a
+/// dependency at all -- so a radius-0 entry never blocks fusion.
+///
+/// Note that requiring a status at radius *r* implies requiring every earlier
+/// status at *r*, and `direct_dependencies` already carries that closure. So
+/// `Spawn`, which needs `Biomes` at radius 1, fuses after `Light`, which needs
+/// `InitializeLight` at radius 1 and therefore everything below it as well.
+///
+/// `Light` is excluded because it runs under the light work-window gate, whose
+/// reservation is taken outside the job. `Empty` is excluded on both sides: it
+/// loads from storage asynchronously instead of running on the generation pool.
+///
+/// Against the current pyramid this leaves six runs rather than twelve steps:
+/// `Empty` | `StructureStarts` | `StructureReferences`+`Biomes` |
+/// `Noise`+`Surface`+`Carvers` | `Features`+`InitializeLight` |
+/// `Light`+`Spawn`+`Full`.
+#[must_use]
+pub fn can_fuse(prev: &ChunkStep, next: &ChunkStep) -> bool {
+    if matches!(next.target_status, ChunkStatus::Empty | ChunkStatus::Light)
+        || prev.target_status == ChunkStatus::Empty
+    {
+        return false;
+    }
+
+    let mut status = Some(ChunkStatus::Empty);
+    while let Some(current) = status {
+        let needed = next.direct_dependencies.get_radius_of(current);
+        if needed > 0 && prev.direct_dependencies.get_radius_of(current) < needed {
+            return false;
+        }
+        status = current.next();
+    }
+
+    true
+}
+
 /// Represents the hierarchy and dependencies for chunk generation or loading.
 pub struct ChunkPyramid {
     steps: [ChunkStep; STATUS_COUNT],
@@ -420,3 +470,77 @@ define_pyramid! {
     };
 }
 
+
+#[cfg(test)]
+mod fusion_tests {
+    use super::{ChunkStatus, GENERATION_PYRAMID, can_fuse};
+
+    /// The fused runs the current pyramid produces.
+    ///
+    /// Pinned deliberately: fusion is only sound while a fused step needs
+    /// nothing from other chunks that its predecessor did not already need, so
+    /// a requirement added to any step here must show up as a change to this
+    /// list rather than silently widening what runs inside one job.
+    #[test]
+    fn fused_runs_match_the_pyramid_dependencies() {
+        let mut runs: Vec<Vec<ChunkStatus>> = Vec::new();
+        let mut current = Some(ChunkStatus::Empty);
+        while let Some(status) = current {
+            let step = GENERATION_PYRAMID.get_step_to(status);
+            let fuses = runs.last().is_some_and(|_| {
+                status.parent().is_some_and(|parent| {
+                    can_fuse(GENERATION_PYRAMID.get_step_to(parent), step)
+                })
+            });
+            if fuses {
+                runs.last_mut().expect("run exists").push(status);
+            } else {
+                runs.push(vec![status]);
+            }
+            current = status.next();
+        }
+
+        assert_eq!(
+            runs,
+            vec![
+                vec![ChunkStatus::Empty],
+                vec![ChunkStatus::StructureStarts],
+                vec![ChunkStatus::StructureReferences, ChunkStatus::Biomes],
+                vec![
+                    ChunkStatus::Noise,
+                    ChunkStatus::Surface,
+                    ChunkStatus::Carvers
+                ],
+                vec![ChunkStatus::Features, ChunkStatus::InitializeLight],
+                vec![
+                    ChunkStatus::Light,
+                    ChunkStatus::Spawn,
+                    ChunkStatus::Full
+                ],
+            ],
+        );
+    }
+
+    #[test]
+    fn a_new_cross_chunk_requirement_blocks_fusion() {
+        // Features needs Carvers at radius 1, which Carvers itself did not
+        // require of its neighbours, so it must start its own job.
+        assert!(!can_fuse(
+            GENERATION_PYRAMID.get_step_to(ChunkStatus::Carvers),
+            GENERATION_PYRAMID.get_step_to(ChunkStatus::Features),
+        ));
+        // Surface needs exactly what Noise needed.
+        assert!(can_fuse(
+            GENERATION_PYRAMID.get_step_to(ChunkStatus::Noise),
+            GENERATION_PYRAMID.get_step_to(ChunkStatus::Surface),
+        ));
+    }
+
+    #[test]
+    fn light_is_never_fused() {
+        assert!(!can_fuse(
+            GENERATION_PYRAMID.get_step_to(ChunkStatus::InitializeLight),
+            GENERATION_PYRAMID.get_step_to(ChunkStatus::Light),
+        ));
+    }
+}
