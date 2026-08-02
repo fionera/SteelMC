@@ -61,6 +61,16 @@ const DEFAULT_SEED: i64 = -9_091_483_014_810_473_238;
 const DEFAULT_SIZE: i32 = 301;
 const DEFAULT_REPS: usize = 3;
 
+/// The allocator the server uses.
+///
+/// Registered here too because the benchmark is its own binary and would
+/// otherwise measure the system allocator. Allocation shows up in this workload
+/// -- pregeneration runs at hundreds of thousands of minor page faults per
+/// second -- so the two must match for a benchmark result to predict a server
+/// result.
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 static INIT: Once = Once::new();
 
 struct Options {
