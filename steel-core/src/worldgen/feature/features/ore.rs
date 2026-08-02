@@ -651,13 +651,46 @@ impl OreTestedPositions {
         }
     }
 
+    /// Records `index`, returning whether it had not been seen before.
+    ///
+    /// Kept inlineable, which it was not: the grow branch below pulled `SmallVec`'s
+    /// reallocation into the body and the whole probe compiled to an out-of-line
+    /// call with seven callee pushes, so every candidate position paid a call,
+    /// ten spill stores and twelve reloads -- including reloading the loop's
+    /// floating-point constants, since all of xmm is caller-saved -- for what is
+    /// otherwise a shift and a test-and-set. The ore candidate loop runs this
+    /// 578 million times over a 601x601 pregeneration, roughly 3.7 times per
+    /// unique position.
+    ///
+    /// The grow path is unreachable in practice: the bitset is allocated for the
+    /// whole search volume in [`Self::with_capacity`], and every index comes from
+    /// [`OreSearchVolume::index_from_offsets`], which returns `None` outside it. It
+    /// stays for safety, out of line and marked cold.
+    #[expect(
+        clippy::inline_always,
+        reason = "measured: without it the probe compiles to an out-of-line call \
+                  paid once per candidate position, 578M times per 601x601 run"
+    )]
+    #[inline(always)]
     fn insert(&mut self, index: usize) -> bool {
         let word_index = index / u64::BITS as usize;
-        if word_index >= self.words.len() {
-            self.words.resize(word_index + 1, 0);
+        let mask = 1_u64 << (index % u64::BITS as usize);
+
+        let Some(word) = self.words.get_mut(word_index) else {
+            return self.insert_beyond_capacity(word_index, mask);
+        };
+        if *word & mask != 0 {
+            return false;
         }
 
-        let mask = 1_u64 << (index % u64::BITS as usize);
+        *word |= mask;
+        true
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn insert_beyond_capacity(&mut self, word_index: usize, mask: u64) -> bool {
+        self.words.resize(word_index + 1, 0);
         let word = &mut self.words[word_index];
         if *word & mask != 0 {
             return false;
