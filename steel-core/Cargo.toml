@@ -11,7 +11,9 @@ build = "build/build.rs"
 stand-alone = []
 slow_chunk_gen = []
 flint = []
-benchmark-support = []
+benchmark-support = ["mimalloc-tuning"]
+# Allocator tuning that needs mimalloc's option API.
+mimalloc-tuning = ["dep:libmimalloc-sys"]
 
 [dependencies]
 # Internal crates
@@ -76,6 +78,9 @@ enum_dispatch.workspace = true
 text_components.workspace = true
 simdnbt.workspace = true
 tracing.workspace = true
+# Only for the allocator option API; the allocator itself is registered by the
+# binary crate.
+libmimalloc-sys = { version = "0.1.49", features = ["extended"], optional = true }
 
 [build-dependencies]
 serde.workspace = true

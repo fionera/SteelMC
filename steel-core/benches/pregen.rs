@@ -35,6 +35,7 @@ use std::sync::{Arc, Once};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use steel_core::allocator::tune_for_throughput;
 use steel_core::behavior::init_behaviors;
 use steel_core::block_entity::init_block_entities;
 use steel_core::config::WorldStorageConfig;
@@ -349,6 +350,10 @@ impl Harness {
 }
 
 fn main() {
+    // Production does the same before it generates anything; without it the
+    // benchmark measures a differently-tuned allocator than the server.
+    tune_for_throughput();
+
     let options = match Options::parse() {
         Ok(options) => options,
         Err(error) => {

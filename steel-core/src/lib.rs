@@ -10,6 +10,9 @@ mod chunk_stage_hashes_tests;
 
 use crate::chunk::chunk_map::ChunkMap;
 
+/// Allocator tuning.
+#[cfg(feature = "mimalloc-tuning")]
+pub mod allocator;
 pub mod behavior;
 pub mod block_entity;
 pub mod chunk;

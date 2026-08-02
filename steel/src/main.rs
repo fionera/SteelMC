@@ -116,6 +116,9 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 // Windows defaults to a 1 MB main thread stack, which overflows in debug
 // builds due to deeply nested generated density functions.
 fn main() {
+    #[cfg(all(feature = "mimalloc", not(feature = "dhat-heap")))]
+    steel_core::allocator::tune_for_throughput();
+
     #[cfg(all(windows, debug_assertions))]
     {
         thread::Builder::new()
