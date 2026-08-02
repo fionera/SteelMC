@@ -174,6 +174,20 @@ Headless pregeneration benchmark.
     );
 }
 
+/// Peak resident set size in MiB, as the kernel has tracked it since startup.
+///
+/// Reported because a scheduler change's failure mode is often memory, not
+/// speed: a model that lets blocked chunks accumulate live state shows up here
+/// long before it shows up in chunks/s. One such attempt reached 13.6 GiB
+/// against a normal 8.4 GiB peak, and the throughput number simply never
+/// arrived because no repetition finished.
+fn peak_rss_mib() -> Option<u64> {
+    let status = fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|line| line.starts_with("VmHWM:"))?;
+    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kib / 1024)
+}
+
 fn ensure_globals() {
     INIT.call_once(|| {
         let mut registry = Registry::new_vanilla();
@@ -397,8 +411,12 @@ fn main() {
 
         let rate = total_chunks / elapsed.as_secs_f64();
         rates.push(rate);
+        let peak = peak_rss_mib().map_or_else(
+            || String::from(""),
+            |mib| format!("  peak RSS {mib} MiB"),
+        );
         println!(
-            "  rep {}: {:.2}s  {rate:.1} chunks/s",
+            "  rep {}: {:.2}s  {rate:.1} chunks/s{peak}",
             rep + 1,
             elapsed.as_secs_f64(),
         );
