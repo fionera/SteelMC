@@ -37,6 +37,11 @@ mod region_manager;
 pub mod registry;
 mod storage;
 
+// Exported so that anything reading a region file back -- the pregeneration
+// benchmark's content digest, for one -- unpacks section data with the same
+// code the loader uses, rather than a second copy of the bit layout that can
+// drift from it.
+pub use bit_pack::*;
 pub use format::*;
 pub use ram_only::*;
 pub use region_manager::*;
