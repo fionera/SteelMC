@@ -15,6 +15,8 @@ mod data;
 /// Tracks Full-neighborhood readiness for ticking chunk lifecycles.
 pub(crate) mod full_chunk_readiness;
 pub(crate) mod gameplay_chunk_lookup_cache;
+/// Per-holder generation state machine.
+pub(crate) mod generation_drive;
 pub mod heightmap;
 pub mod light;
 /// Tracks the chunks that are visible to a player.
