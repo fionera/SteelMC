@@ -60,6 +60,33 @@ impl<T> StaticCache2D<T> {
         }
     }
 
+    /// Creates a `StaticCache2D`, or returns `None` if any element is missing.
+    pub fn try_create<F>(center_x: i32, center_z: i32, radius: i32, factory: F) -> Option<Self>
+    where
+        F: Fn(i32, i32) -> Option<T>,
+    {
+        let size = radius * 2 + 1;
+        let min_x = center_x - radius;
+        let min_z = center_z - radius;
+        let cap = (size * size) as usize;
+        let size_usize = size as usize;
+
+        let cache = (0..cap)
+            .map(|index| {
+                let x_offset = (index % size_usize) as i32;
+                let z_offset = (index / size_usize) as i32;
+                factory(min_x + x_offset, min_z + z_offset)
+            })
+            .collect::<Option<Vec<T>>>()?;
+
+        Some(Self {
+            min_x,
+            min_z,
+            size,
+            cache,
+        })
+    }
+
     /// Gets a reference to an element by world coordinates.
     ///
     /// # Panics
@@ -120,7 +147,8 @@ pub struct ChunkGenerationTask {
     /// Futures for neighbors. Protected by a mutex.
     pub neighbor_ready: SyncMutex<Vec<NeighborReady>>,
     /// Cache of required chunks.
-    pub cache: Arc<StaticCache2D<Arc<ChunkHolder>>>,
+    /// Radius over which this task's dependency halo must be resolved.
+    worst_case_radius: i32,
     /// Holder for the chunk this task is targeting.
     pub center_holder: Arc<ChunkHolder>,
     /// Whether generation is required for this task.
@@ -149,14 +177,10 @@ impl ChunkGenerationTask {
             .accumulated_dependencies
             .get_radius_of(ChunkStatus::Empty) as i32;
 
-        let chunk_map_clone = chunk_map.clone();
-        let cache = StaticCache2D::create(pos.0.x, pos.0.y, worst_case_radius, move |x, y| {
-            chunk_map_clone
-                .chunks
-                .read_sync(&ChunkPos::new(x, y), |_, chunk_holder| chunk_holder.clone())
-                .expect("The chunkholder should be created by distance manager before the generation task is scheduled. This occurring means there is a bug in the distance manager or you called this yourself.")
-        });
-        let center_holder = Arc::clone(cache.get(pos.0.x, pos.0.y));
+        let center_holder = chunk_map
+            .chunks
+            .read_sync(&pos, |_, chunk_holder| chunk_holder.clone())
+            .expect("The chunkholder should be created by distance manager before the generation task is scheduled. This occurring means there is a bug in the distance manager or you called this yourself.");
 
         Self {
             chunk_map,
@@ -166,11 +190,40 @@ impl ChunkGenerationTask {
             cancel_token,
             cancelled: AtomicBool::new(false),
             neighbor_ready: SyncMutex::new(Vec::new()),
-            cache: Arc::new(cache),
+            worst_case_radius,
             center_holder,
             needs_generation: AtomicBool::new(true),
             thread_pool,
         }
+    }
+
+    /// Resolves the dependency halo this task will operate on.
+    ///
+    /// Deliberately not done in `new`. Task construction runs on the single
+    /// scheduling-epoch thread, and a `Full` target resolves a radius-11 halo --
+    /// 529 holder lookups and 529 `Arc` clones per chunk. Over a pregeneration
+    /// that put tens of millions of map lookups on the one thread every chunk
+    /// has to pass through to exist: it measured 44-55% of wall clock, with
+    /// individual epochs stalling task creation for up to 2.3s while the
+    /// generation pool drained. Resolving it here instead spreads the same work
+    /// across the chunk runtime, where each task pays only for itself.
+    ///
+    /// Returns `None` when a halo holder has been unloaded since the task was
+    /// scheduled, which construction could treat as impossible but this cannot:
+    /// tickets may be dropped while the task waits in the pending queue.
+    fn resolve_halo(&self) -> Option<Arc<StaticCache2D<Arc<ChunkHolder>>>> {
+        let chunk_map = self.chunk_map.clone();
+        StaticCache2D::try_create(
+            self.pos.0.x,
+            self.pos.0.y,
+            self.worst_case_radius,
+            move |x, y| {
+                chunk_map
+                    .chunks
+                    .read_sync(&ChunkPos::new(x, y), |_, chunk_holder| chunk_holder.clone())
+            },
+        )
+        .map(Arc::new)
     }
 
     /// Cancels this task by triggering the cancellation token.
@@ -197,6 +250,7 @@ impl ChunkGenerationTask {
     /// Panics if generation is required but not expected.
     pub fn schedule_chunk_in_layer(
         &self,
+        halo: &Arc<StaticCache2D<Arc<ChunkHolder>>>,
         status: ChunkStatus,
         needs_generation: bool,
         chunk_holder: &Arc<ChunkHolder>,
@@ -210,11 +264,25 @@ impl ChunkGenerationTask {
             generate = true;
         }
 
-        let pyramid = if generate {
-            &GENERATION_PYRAMID
-        } else {
-            &LOADING_PYRAMID
-        };
+        if !generate {
+            // Already published at or past this status, so there is nothing to
+            // run and nothing to wait for: `apply_step` would lose the
+            // `claim_status_work` race and hand back a future that resolves on
+            // its first poll.
+            //
+            // Skipping matters because a task schedules its entire accumulated
+            // dependency neighbourhood at every layer -- 1,252 `apply_step`
+            // calls for a `Full` target, of which the two widest layers are 529
+            // chunks each -- while only the handful covering its own centre have
+            // work left. Every one of the rest was allocating a boxed future,
+            // cloning an `Arc<ChunkHolder>` and registering a `Notify` waiter to
+            // observe a status that was already published. At ~4,000 chunks/s
+            // that is over five million such calls per second, and it is why the
+            // chunk runtime was consuming ~12 cores of pure bookkeeping.
+            return true;
+        }
+
+        let pyramid = &GENERATION_PYRAMID;
 
         assert!(
             !generate || needs_generation,
@@ -224,7 +292,7 @@ impl ChunkGenerationTask {
         if let Some(future) = chunk_holder.apply_step(
             pyramid.get_step_to(status),
             &self.chunk_map,
-            &self.cache,
+            halo,
             self.thread_pool.clone(),
         ) {
             self.neighbor_ready.lock().push(future);
@@ -236,14 +304,19 @@ impl ChunkGenerationTask {
     }
 
     /// Schedules tasks for the current layer's neighbors.
-    pub fn schedule_layer(&self, status: ChunkStatus, needs_generation: bool) {
+    pub fn schedule_layer(
+        &self,
+        halo: &Arc<StaticCache2D<Arc<ChunkHolder>>>,
+        status: ChunkStatus,
+        needs_generation: bool,
+    ) {
         let radius = self.get_radius_for_layer(status, needs_generation);
         // This for loop is inclusive, so if the radius is 0, we will only schedule the center chunk.
         for x in (self.pos.0.x - radius)..=(self.pos.0.x + radius) {
             for y in (self.pos.0.y - radius)..=(self.pos.0.y + radius) {
-                let chunk_holder = self.cache.get(x, y);
+                let chunk_holder = halo.get(x, y);
                 if self.is_cancelled()
-                    || !self.schedule_chunk_in_layer(status, needs_generation, chunk_holder)
+                    || !self.schedule_chunk_in_layer(halo, status, needs_generation, chunk_holder)
                 {
                     return;
                 }
@@ -267,12 +340,12 @@ impl ChunkGenerationTask {
     ///
     /// # Panics
     /// Panics if the schedule is invalid.
-    pub fn schedule_next_layer(&self) {
+    pub fn schedule_next_layer(&self, halo: &Arc<StaticCache2D<Arc<ChunkHolder>>>) {
         let status_to_schedule = if self.scheduled_status.lock().is_none() {
             ChunkStatus::Empty
         } else if !self.needs_generation.load(Ordering::Relaxed)
             && *self.scheduled_status.lock() == Some(ChunkStatus::Empty)
-            && !self.can_load_without_generation()
+            && !self.can_load_without_generation(halo)
         {
             self.needs_generation.store(true, Ordering::Relaxed);
             ChunkStatus::Empty
@@ -285,18 +358,18 @@ impl ChunkGenerationTask {
         };
 
         self.schedule_layer(
+            halo,
             status_to_schedule,
             self.needs_generation.load(Ordering::Relaxed),
         );
         self.scheduled_status.lock().replace(status_to_schedule);
     }
 
-    fn can_load_without_generation(&self) -> bool {
+    fn can_load_without_generation(&self, halo: &StaticCache2D<Arc<ChunkHolder>>) -> bool {
         if self.target_status == ChunkStatus::Empty {
             return true;
         }
-        let center = self.cache.get(self.pos.0.x, self.pos.0.y);
-        let highest_generated_status = center.published_status();
+        let highest_generated_status = self.center_holder.published_status();
 
         if let Some(highest_status) = highest_generated_status {
             if highest_status < self.target_status {
@@ -312,7 +385,7 @@ impl ChunkGenerationTask {
                 for z in (self.pos.0.y - range)..=(self.pos.0.y + range) {
                     let distance = max((self.pos.0.x - x).abs(), (self.pos.0.y - z).abs()) as usize;
                     if let Some(required_status) = dependencies.get(distance) {
-                        let neighbor = self.cache.get(x, z);
+                        let neighbor = halo.get(x, z);
                         let published = neighbor.published_status();
                         if published < Some(required_status) {
                             return false;
@@ -328,6 +401,12 @@ impl ChunkGenerationTask {
 
     /// Runs the generation task loop.
     pub async fn run(self: Arc<Self>) {
+        let Some(halo) = self.resolve_halo() else {
+            self.cancel();
+            self.center_holder.clear_generation_task_if_current(&self);
+            return;
+        };
+
         loop {
             tokio::select! {
                 () = self.cancel_token.cancelled() => break,
@@ -338,10 +417,10 @@ impl ChunkGenerationTask {
                 break;
             }
 
-            self.schedule_next_layer();
+            self.schedule_next_layer(&halo);
         }
-        let center_chunk = self.cache.get(self.pos.0.x, self.pos.0.y);
-        center_chunk.clear_generation_task_if_current(&self);
+        self.center_holder
+            .clear_generation_task_if_current(&self);
     }
 
     /// Waits for all scheduled neighbor tasks to complete.

@@ -20,7 +20,7 @@ mod perlin_simplex_noise;
 mod simplex_noise;
 
 pub use aquifer::{Aquifer, AquiferResult, LazyAquifer, preliminary_surface_level};
-pub use beardifier::Beardifier;
+pub use beardifier::{Beardifier, BeardifierColumn};
 pub use blended_noise::BlendedNoise;
 pub use end_islands::EndIslands;
 pub use improved_noise::ImprovedNoise;

@@ -53,8 +53,13 @@ impl<'a, Phase> GenerationChunk<'a, Phase> {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) const fn for_test(chunk: &'a Chunk) -> Self {
+    /// Wraps a chunk in a generation phase without going through the pipeline.
+    ///
+    /// Exists for the vanilla-parity integration test, which drives individual
+    /// generation stages directly against extracted reference data and so cannot
+    /// obtain a phase the normal way. Not part of the supported API.
+    #[doc(hidden)]
+    pub const fn for_test(chunk: &'a Chunk) -> Self {
         Self::from_chunk(chunk)
     }
 

@@ -48,6 +48,7 @@ use crate::permission::{
 use crate::player::chunk_sender::{ChunkSender, EncodedChunk};
 use crate::player::connection::NetworkConnection;
 use crate::player::connection::ScheduledPlayPacket;
+use crate::player::lookup_online_profile;
 use crate::player::player_data::{
     PersistentEnderPearl, PersistentPlayerData, PersistentRootVehicle,
 };
@@ -55,7 +56,7 @@ use crate::player::player_data_storage::{GlobalPlayerData, PlayerDataStorage};
 use crate::player::player_inventory::MenuRemovalStatus;
 use crate::player::{
     DomainResidenceToken, GameProfile, KnownPlayer, KnownPlayerNameLookup, KnownPlayers, Player,
-    ProfileLookupError, ResetReason, is_valid_player_name, lookup_online_profile, offline_uuid,
+    ProfileLookupError, ResetReason, is_valid_player_name, offline_uuid,
 };
 use crate::portal::{
     PortalKind, TeleportPostTransition, TeleportTransition, WorldChangeRequest, end_gateway,
@@ -161,12 +162,56 @@ const CHUNK_SENDING_TPS: u64 = 20;
 /// Work duration at which background chunk work is considered slow.
 const SLOW_CHUNK_TICK_THRESHOLD: Duration = Duration::from_millis(50);
 
-fn configured_chunk_generation_threads(configured_threads: Option<usize>) -> Option<usize> {
-    cap_positive_thread_count(configured_threads, available_worker_threads())
+fn configured_chunk_generation_threads(configured_threads: Option<usize>) -> usize {
+    let available = available_worker_threads();
+    cap_positive_thread_count(configured_threads, available)
+        .unwrap_or_else(|| default_chunk_generation_threads(available))
 }
 
-fn configured_chunk_encoding_threads(configured_threads: Option<usize>) -> Option<usize> {
-    cap_positive_thread_count(configured_threads, available_worker_threads())
+/// Generation threads to use when the config leaves the count unset.
+///
+/// This used to hold back a quarter of the machine, because taking every thread
+/// measured about 9% slower. That result was real but it was a symptom: task
+/// creation was serialized on the scheduling-epoch thread, so extra generation
+/// threads had nothing to do and only added cache and scheduling pressure. Once
+/// the dependency halo moved off that thread and the pregeneration pipeline was
+/// allowed to run deep, the ranking inverted and kept scaling.
+///
+/// Measured over a 90,601-chunk pregeneration on a 128-thread EPYC 9555P at a
+/// fixed seed, deep pipeline, two runs per point: 96 threads 6,875 chunks/s,
+/// 112 -> 7,309, 120 -> 7,555, 127 -> 7,648. Generation-pool occupancy holds
+/// near 0.83 across that whole range, so the pool is being fed rather than
+/// thrashing. One thread is left for the rest of the server.
+pub(crate) fn default_chunk_generation_threads(available_threads: usize) -> usize {
+    let available = available_threads.max(1);
+    if available <= 4 {
+        available
+    } else {
+        available - 1
+    }
+}
+
+fn configured_chunk_encoding_threads(configured_threads: Option<usize>) -> usize {
+    let available = available_worker_threads();
+    cap_positive_thread_count(configured_threads, available)
+        .unwrap_or_else(|| default_chunk_encoding_threads(available))
+}
+
+/// Encoding threads to use when the config leaves the count unset.
+///
+/// Previously an unset count meant rayon's own default, one thread per hardware
+/// thread. That is far more than the pool ever needs: a 90,601-chunk
+/// pregeneration, the heaviest sustained save load there is, spends 34 CPU-s in
+/// this pool over a 15.4s run -- 2.2 cores' worth against 128 threads. The idle
+/// workers are not free, since rayon keeps them contending for its shared sleep
+/// state: they produced 29k `sched_yield` and 31k involuntary preemptions per
+/// six seconds, against generation threads that want those cores.
+///
+/// An eighth of the machine leaves 3-7x headroom over the measured pregeneration
+/// demand, which also covers the burstier gameplay path where this pool encodes
+/// chunk packets for joining players.
+pub(crate) fn default_chunk_encoding_threads(available_threads: usize) -> usize {
+    (available_threads.max(1) / 8).clamp(2, 16)
 }
 
 fn configured_packet_workers(configured_workers: Option<usize>) -> usize {
@@ -572,11 +617,9 @@ impl Server {
 
         let generation_pool: Arc<ThreadPool> = Arc::new({
             let mut builder = ThreadPoolBuilder::new().thread_name(|i| format!("rayon-gen-{i}"));
-            if let Some(chunk_generation_threads) =
-                configured_chunk_generation_threads(config.chunk_generation_threads)
-            {
-                builder = builder.num_threads(chunk_generation_threads);
-            }
+            builder = builder.num_threads(configured_chunk_generation_threads(
+                config.chunk_generation_threads,
+            ));
             // Debug builds have deep call chains in density functions that overflow the default 2 MB stack
             if cfg!(debug_assertions) {
                 builder = builder.stack_size(8 * 1024 * 1024);
@@ -586,14 +629,11 @@ impl Server {
                 .map_err(|e| format!("failed to create generation thread pool: {e}"))?
         });
         let chunk_encoding_pool = Arc::new({
-            let mut builder =
-                ThreadPoolBuilder::new().thread_name(|i| format!("rayon-chunk-encode-{i}"));
-            if let Some(chunk_encoding_threads) =
-                configured_chunk_encoding_threads(config.chunk_encoding_threads)
-            {
-                builder = builder.num_threads(chunk_encoding_threads);
-            }
-            builder
+            ThreadPoolBuilder::new()
+                .thread_name(|i| format!("rayon-chunk-encode-{i}"))
+                .num_threads(configured_chunk_encoding_threads(
+                    config.chunk_encoding_threads,
+                ))
                 .build()
                 .map_err(|e| format!("failed to create chunk encoding thread pool: {e}"))?
         });

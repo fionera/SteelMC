@@ -963,10 +963,13 @@ impl ChunkHolder {
 
         let holder_for_notify = holder.clone();
         let world = context.world();
-        Self::run_step_task(thread_pool, step, context, cache, holder).await;
-        holder_for_notify.finish_generation_status(target_status);
+        let pos = holder.pos;
+        Self::run_step_task(thread_pool, step, context, cache, holder, move || {
+            holder_for_notify.finish_generation_status(target_status);
+        })
+        .await;
         if target_status == ChunkStatus::Empty {
-            world.on_entity_chunk_loaded(holder_for_notify.pos);
+            world.on_entity_chunk_loaded(pos);
         }
         Some(())
     }
@@ -1073,22 +1076,37 @@ impl ChunkHolder {
 
         assert!(has_parent, "Parent chunk missing");
 
-        Self::run_step_task(thread_pool, step, context, cache, holder).await;
-        holder_for_notify.finish_generation_status(target_status);
-        drop(light_work_window_reservation);
+        // Publish, and release the light window, on the generation worker that
+        // just did the work rather than after waking this task back up. Every
+        // chunk whose next step depends on this status is blocked until the
+        // publish lands, so routing it through a oneshot wake put a cross-
+        // runtime scheduler round trip in the critical path of all twelve steps
+        // of every chunk.
+        Self::run_step_task(thread_pool, step, context, cache, holder, move || {
+            holder_for_notify.finish_generation_status(target_status);
+            drop(light_work_window_reservation);
+        })
+        .await;
         Some(())
     }
 
-    async fn run_step_task(
+    /// Runs one generation step on the generation pool.
+    ///
+    /// `on_complete` runs on the same worker as soon as the step returns.
+    async fn run_step_task<F>(
         thread_pool: Arc<rayon::ThreadPool>,
         step: &'static ChunkStep,
         context: Arc<WorldGenContext>,
         cache: Arc<StaticCache2D<Arc<ChunkHolder>>>,
         holder: Arc<Self>,
-    ) {
+        on_complete: F,
+    ) where
+        F: FnOnce() + Send + 'static,
+    {
         let task = step.task;
         rayon_spawn(&thread_pool, move || {
             task(context, step, &cache, holder);
+            on_complete();
         })
         .await;
     }

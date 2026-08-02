@@ -214,6 +214,22 @@ impl Beardifier {
         self.rigids.is_empty() && self.junctions.is_empty()
     }
 
+    /// Rigid pieces and junctions, for the per-column filter.
+    #[must_use]
+    pub(crate) const fn rigids(&self) -> &Vec<Rigid> {
+        &self.rigids
+    }
+
+    #[must_use]
+    pub(crate) const fn junctions(&self) -> &Vec<JigsawJunction> {
+        &self.junctions
+    }
+
+    #[must_use]
+    pub(crate) const fn affected_box(&self) -> Option<&BoundingBox> {
+        self.affected_box.as_ref()
+    }
+
     /// Compute the total density contribution at a world-space block position.
     ///
     /// Returns 0.0 if no structures are nearby.
@@ -289,4 +305,146 @@ const fn is_close_to_chunk(bb: &BoundingBox, chunk_x: i32, chunk_z: i32, margin:
         && bb.min_x() <= chunk_end_x + margin
         && bb.max_z() >= chunk_start_z - margin
         && bb.min_z() <= chunk_end_z + margin
+}
+
+/// A `Beardifier` narrowed to one world column.
+///
+/// `NoiseChunk::fill` queries the beardifier once per block, but the horizontal
+/// distances that decide whether a piece can contribute anything depend only on
+/// the column. Both kernels have an exact zero range -- the beard kernel is a
+/// 24-wide table indexed by `d + 12`, and the bury falloff clamps to exactly
+/// 0.0 at distance 6 -- so a piece failing the horizontal test contributes
+/// exactly `0.0` for every block in the column. Filtering once per column and
+/// keeping the survivors in their original order therefore produces bit-
+/// identical sums: the accumulator starts at `+0.0` and can never become
+/// `-0.0`, so dropping `+0.0` terms is an identity.
+///
+/// Most columns keep nothing at all, which skips the whole piece loop for all
+/// 384 blocks of the column.
+pub struct BeardifierColumn<'a> {
+    beardifier: &'a Beardifier,
+    rigids: Vec<u32>,
+    junctions: Vec<u32>,
+}
+
+impl<'a> BeardifierColumn<'a> {
+    #[must_use]
+    pub fn new(beardifier: &'a Beardifier) -> Self {
+        Self {
+            beardifier,
+            rigids: Vec::new(),
+            junctions: Vec::new(),
+        }
+    }
+
+    /// Re-narrows the view to the column at `block_x`/`block_z`.
+    ///
+    /// Returns `false` when nothing in the chunk can contribute to the column,
+    /// letting the caller skip the beardifier entirely for it.
+    pub fn retarget(&mut self, block_x: i32, block_z: i32) -> bool {
+        self.rigids.clear();
+        self.junctions.clear();
+
+        let Some(affected) = self.beardifier.affected_box() else {
+            return false;
+        };
+        if block_x < affected.min_x()
+            || block_x > affected.max_x()
+            || block_z < affected.min_z()
+            || block_z > affected.max_z()
+        {
+            return false;
+        }
+
+        for (index, rigid) in self.beardifier.rigids().iter().enumerate() {
+            let bb = &rigid.bounding_box;
+            let dx = 0.max((bb.min_x() - block_x).max(block_x - bb.max_x()));
+            let dz = 0.max((bb.min_z() - block_z).max(block_z - bb.max_z()));
+            let contributes = match rigid.terrain_adjustment {
+                TerrainAdjustment::None => false,
+                // Kernel table is indexed by `d + KERNEL_RADIUS` over `0..KERNEL_SIZE`,
+                // and `dx`/`dz` are non-negative here.
+                TerrainAdjustment::BeardThin | TerrainAdjustment::BeardBox => {
+                    dx < KERNEL_SIZE as i32 - KERNEL_RADIUS && dz < KERNEL_SIZE as i32 - KERNEL_RADIUS
+                }
+                // Falloff reaches exactly 0.0 at distance 6, and the horizontal
+                // components alone already meet it.
+                TerrainAdjustment::Bury => dx * dx + dz * dz < 36,
+                // Same, with every component halved.
+                TerrainAdjustment::Encapsulate => dx * dx + dz * dz < 144,
+            };
+            if contributes {
+                self.rigids.push(index as u32);
+            }
+        }
+
+        for (index, junction) in self.beardifier.junctions().iter().enumerate() {
+            let dx = block_x - junction.source_pos.x;
+            let dz = block_z - junction.source_pos.z;
+            if is_in_kernel_range(dx + KERNEL_RADIUS) && is_in_kernel_range(dz + KERNEL_RADIUS) {
+                self.junctions.push(index as u32);
+            }
+        }
+
+        !(self.rigids.is_empty() && self.junctions.is_empty())
+    }
+
+    /// Total density contribution at `block_y` in the current column.
+    #[must_use]
+    pub fn compute(&self, block_x: i32, block_y: i32, block_z: i32) -> f64 {
+        let Some(affected) = self.beardifier.affected_box() else {
+            return 0.0;
+        };
+        if !affected.contains_xyz(block_x, block_y, block_z) {
+            return 0.0;
+        }
+
+        let mut value = 0.0;
+        let rigids = self.beardifier.rigids();
+        for &index in &self.rigids {
+            let rigid = &rigids[index as usize];
+            let bb = &rigid.bounding_box;
+            let dx = 0.max((bb.min_x() - block_x).max(block_x - bb.max_x()));
+            let dz = 0.max((bb.min_z() - block_z).max(block_z - bb.max_z()));
+            let ground_y = bb.min_y() + rigid.ground_level_delta;
+            let dy_to_ground = block_y - ground_y;
+
+            match rigid.terrain_adjustment {
+                TerrainAdjustment::None => {}
+                TerrainAdjustment::Bury => {
+                    value += get_bury_contribution(
+                        f64::from(dx),
+                        f64::from(dy_to_ground) / 2.0,
+                        f64::from(dz),
+                    );
+                }
+                TerrainAdjustment::BeardThin => {
+                    value += get_beard_contribution(dx, dy_to_ground, dz, dy_to_ground) * 0.8;
+                }
+                TerrainAdjustment::BeardBox => {
+                    let dy = 0.max((ground_y - block_y).max(block_y - bb.max_y()));
+                    value += get_beard_contribution(dx, dy, dz, dy_to_ground) * 0.8;
+                }
+                TerrainAdjustment::Encapsulate => {
+                    let dy = 0.max((bb.min_y() - block_y).max(block_y - bb.max_y()));
+                    value += get_bury_contribution(
+                        f64::from(dx) / 2.0,
+                        f64::from(dy) / 2.0,
+                        f64::from(dz) / 2.0,
+                    ) * 0.8;
+                }
+            }
+        }
+
+        let junctions = self.beardifier.junctions();
+        for &index in &self.junctions {
+            let junction = &junctions[index as usize];
+            let dx = block_x - junction.source_pos.x;
+            let dy = block_y - junction.source_pos.y;
+            let dz = block_z - junction.source_pos.z;
+            value += get_beard_contribution(dx, dy, dz, dy) * 0.4;
+        }
+
+        value
+    }
 }

@@ -106,6 +106,23 @@ impl OreVeinifier {
         world_y: i32,
         world_z: i32,
     ) -> Option<BlockStateId> {
+        // Whichever vein type the toggle selects, a Y outside both types'
+        // ranges returns `None` below, so test the ranges before evaluating the
+        // toggle rather than after. This runs for every solid block of a
+        // 384-tall column while the two ranges together cover only 104 levels.
+        // It measured flat on the overworld, where the toggle reads channels the
+        // trilerp has already interpolated and is nearly free; it is worth
+        // keeping for the `vein_interp_enabled() == false` path, where the toggle
+        // is a full router evaluation behind `ensure`.
+        //
+        // Skips nothing but that evaluation: no RNG is drawn before this point,
+        // and `ensure` is memoization keyed on the column.
+        if (world_y < self.copper.min_y || world_y > self.copper.max_y)
+            && (world_y < self.iron.min_y || world_y > self.iron.max_y)
+        {
+            return None;
+        }
+
         let vein_toggle = if N::vein_interp_enabled() {
             noises.combine_vein_toggle(cache, interpolated, 0, world_y, 0)
         } else {

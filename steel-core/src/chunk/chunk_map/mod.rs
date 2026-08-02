@@ -1,10 +1,11 @@
 use arc_swap::ArcSwap;
+use crossbeam::utils::CachePadded;
 use rayon::ThreadPool;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use std::{
     io, mem,
     sync::{
-        Arc, Weak,
+        Arc, LazyLock, Weak,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -83,7 +84,25 @@ mod scheduled_ticks;
 use light_update_state::PendingLightUpdates;
 use light_update_state::{InFlightLightUpdates, LightUpdateState, PendingChunkLightUpdates};
 
-const GENERATION_THREAD_MULTIPLE: usize = 2;
+/// In-flight generation tasks allowed per generation thread.
+///
+/// A task holds a slot for its whole life but spends most of it parked, waiting
+/// on neighbour statuses, a light work window or a step handoff, so this cap is
+/// reached long before the generation pool is saturated. That makes it look like
+/// the throughput limit, and it is not: sweeping it over a 90,601-chunk
+/// pregeneration (7 interleaved runs each) left generation-pool occupancy flat
+/// at 0.72 for every value -- 2, 4 and 6 all measured 0.718-0.721, and 8 was
+/// worse. Tasks are not waiting to be admitted; the pool idles because runnable
+/// work is not produced fast enough, which happens upstream in the single
+/// scheduling-epoch thread. Raise this only alongside evidence that admission,
+/// rather than task creation, is what starves the pool.
+static GENERATION_THREAD_MULTIPLE: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("STEEL_GENERATION_TASK_MULTIPLE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&multiple| multiple > 0)
+        .unwrap_or(2)
+});
 // Vanilla applies this limit independently to block ticks and fluid ticks.
 const MAX_SCHEDULED_TICKS_PER_TICK: usize = 65_536;
 
@@ -260,7 +279,11 @@ pub struct ChunkMap {
     /// Radius-2 work-window gate for light-engine worksets.
     light_work_window_gate: Arc<LightWorkWindowGate>,
     /// Number of top-level generation tasks currently running.
-    running_generation_tasks: AtomicUsize,
+    ///
+    /// Padded: every task increments this on admission and decrements it on
+    /// completion from whichever core ran it, so unpadded it drags whatever
+    /// `ChunkMap` field shares its line across every generation thread.
+    running_generation_tasks: CachePadded<AtomicUsize>,
     /// Wakes the generation refill loop when pending/running task state changes.
     generation_refill_notify: Notify,
     /// Cancels the generation refill loop without cancelling active generation tasks.
@@ -389,7 +412,7 @@ impl ChunkMap {
             light_updates: SyncMutex::new(LightUpdateState::default()),
             light_updates_progress_notify: Notify::new(),
             light_work_window_gate: Arc::new(LightWorkWindowGate::new()),
-            running_generation_tasks: AtomicUsize::new(0),
+            running_generation_tasks: CachePadded::new(AtomicUsize::new(0)),
             generation_refill_notify: Notify::new(),
             generation_refill_cancel_token: CancellationToken::new(),
             generation_refill_stopped: AtomicBool::new(false),

@@ -15,15 +15,46 @@ use std::simd::f64x4;
 use steel_math::lerp;
 use steel_worldgen::density::{ColumnCache, DimensionNoises, NoiseSettings};
 
-use crate::noise::Beardifier;
+use crate::noise::{Beardifier, BeardifierColumn};
 
 /// Maximum number of interpolation channels supported.
 /// Overworld uses 8 (1 terrain + 4 noodle caves + 3 vein channels), nether/end use 1.
-const MAX_INTERP: usize = 16;
+/// Interpolation channels a slice reserves per cell corner.
+///
+/// This is the `SoA` stride, so it is also how far apart two corners' channel
+/// blocks sit in memory. Overworld uses 8 channels and the other dimensions
+/// use 1, so a wider stride buys nothing and costs the trilerp loop a second
+/// cache line per corner: at stride 16 a corner's live 64 bytes sat in the
+/// first half of a 128-byte span, and the loop sweeps every corner of a cell
+/// sixteen times.
+const MAX_INTERP: usize = 8;
 
 /// Maximum slice length (`z_corners` * `corners_y`) across all dimensions.
 /// Overworld: (16/4+1) * (384/8+1) = 5 * 49 = 245. Rounded up for headroom.
 const MAX_SLICE_LEN: usize = 256;
+
+/// Cache-line aligned slice storage.
+///
+/// With `MAX_INTERP` at 8 a corner's channels occupy exactly 64 bytes, so
+/// aligning the allocation makes each corner one whole cache line and keeps
+/// either `f64x4` half of it from straddling two lines. `Box` alone only
+/// promises 8-byte alignment.
+#[repr(C, align(64))]
+struct SliceStorage([f64; MAX_INTERP * MAX_SLICE_LEN]);
+
+impl std::ops::Deref for SliceStorage {
+    type Target = [f64; MAX_INTERP * MAX_SLICE_LEN];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for SliceStorage {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
 
 /// Stores density values at cell corners for a single chunk and provides
 /// trilinear interpolation between corners for block-level resolution.
@@ -47,7 +78,7 @@ pub struct NoiseChunk<N: DimensionNoises> {
     /// the slice-fill phase can run in parallel: each `cx` boundary's noise
     /// tree evaluation is independent. The per-block trilerp loop then
     /// indexes `slices[cx]` and `slices[cx + 1]` sequentially.
-    slices: Vec<Box<[f64; MAX_INTERP * MAX_SLICE_LEN]>>,
+    slices: Vec<Box<SliceStorage>>,
     /// Number of active interpolation channels.
     interp_count: usize,
     /// Number of Y corners per Z column (`cell_count_y` + 1).
@@ -121,7 +152,7 @@ impl<N: DimensionNoises> NoiseChunk<N> {
                 clippy::large_stack_arrays,
                 reason = "fixed-size boxed array keeps the [f64; N] type the SIMD fill path relies on; cold per-chunk constructor"
             )]
-            slices.push(Box::new([0.0; MAX_INTERP * MAX_SLICE_LEN]));
+            slices.push(Box::new(SliceStorage([0.0; MAX_INTERP * MAX_SLICE_LEN])));
         }
 
         Self {
@@ -275,6 +306,7 @@ impl<N: DimensionNoises> NoiseChunk<N> {
         // across slices without cloning. The chunk pipeline already parallelises
         // across chunks, so parallelising the 5 slices here would nest rayon work
         // and add coordination + cache-clone overhead with no spare cores to use.
+        let mut beard_column = beardifier.map(BeardifierColumn::new);
         let n_slices = cell_count_xz + 1;
         let mut local_blended = vec![0.0f64; corners_y];
         for cx_off in 0..n_slices {
@@ -304,6 +336,17 @@ impl<N: DimensionNoises> NoiseChunk<N> {
                     for z_in_cell in 0..cell_width {
                         let factor_z = f64::from(z_in_cell) / f64::from(cell_width);
                         let local_z = (cell_z_idx as i32 * cell_width + z_in_cell) as usize;
+
+                        // The beardifier's horizontal reach is fixed for the
+                        // column, so narrow it here rather than re-testing every
+                        // piece for all 384 blocks below.
+                        let world_x_col =
+                            cell_x_idx as i32 * cell_width + x_in_cell + self.first_cell_x * cell_width;
+                        let world_z_col =
+                            cell_z_idx as i32 * cell_width + z_in_cell + self.first_cell_z * cell_width;
+                        let beard_in_column = beard_column
+                            .as_mut()
+                            .is_some_and(|column| column.retarget(world_x_col, world_z_col));
 
                         // Pre-compute flat indices for this Z column
                         let z0_base = cell_z_idx * corners_y;
@@ -427,14 +470,10 @@ impl<N: DimensionNoises> NoiseChunk<N> {
                                 // would put it inside the squeeze and trilerp it linearly across
                                 // the cell, both of which diverge from vanilla for large beardifier
                                 // values inside a structure's pieces.
-                                let world_x = cell_x_idx as i32 * cell_width
-                                    + x_in_cell
-                                    + self.first_cell_x * cell_width;
-                                let world_z = cell_z_idx as i32 * cell_width
-                                    + z_in_cell
-                                    + self.first_cell_z * cell_width;
-                                if let Some(beard) = beardifier {
-                                    density += beard.compute(world_x, world_y, world_z);
+                                if beard_in_column
+                                    && let Some(beard) = beard_column.as_ref()
+                                {
+                                    density += beard.compute(world_x_col, world_y, world_z_col);
                                 }
 
                                 place_block(

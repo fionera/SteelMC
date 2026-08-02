@@ -60,7 +60,17 @@ impl ChunkMap {
 
         let task_count = pending.len().min(available_slots);
         if task_count < pending.len() {
-            pending.sort_by_cached_key(|task| Self::generation_task_priority(task));
+            // Only the `task_count` highest-priority tasks are about to be
+            // spawned, and they are spawned as an unordered batch, so ordering
+            // the rest of the queue is wasted work. During a pregeneration the
+            // queue runs to tens of thousands of entries while `task_count` is
+            // a couple of hundred, and this runs on the single refill task once
+            // per freed slot -- a full sort there costs more than the admission
+            // it is gating, and it grows with the backlog rather than with the
+            // number of tasks being admitted.
+            pending.select_nth_unstable_by_key(task_count - 1, |task| {
+                Self::generation_task_priority(task)
+            });
         }
 
         tracing::trace!(
@@ -89,8 +99,26 @@ impl ChunkMap {
         }
     }
 
+    /// Generation tasks currently running, for diagnostics.
+    #[must_use]
+    pub fn running_generation_task_count(&self) -> usize {
+        self.running_generation_tasks.load(Ordering::Acquire)
+    }
+
+    /// Worker threads in the generation pool.
+    #[must_use]
+    pub fn generation_thread_count(&self) -> usize {
+        self.generation_pool.current_num_threads().max(1)
+    }
+
+    /// The cap on concurrently running generation tasks.
+    #[must_use]
+    pub fn generation_task_capacity(&self) -> usize {
+        self.max_running_generation_tasks()
+    }
+
     pub(super) fn max_running_generation_tasks(&self) -> usize {
-        self.generation_pool.current_num_threads().max(1) * GENERATION_THREAD_MULTIPLE
+        self.generation_pool.current_num_threads().max(1) * *GENERATION_THREAD_MULTIPLE
     }
 
     pub(super) fn generation_task_priority(task: &ChunkGenerationTask) -> GenerationTaskPriority {

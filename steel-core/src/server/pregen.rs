@@ -10,6 +10,7 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
 use crate::chunk::chunk_pyramid::GENERATION_PYRAMID;
+use crate::chunk::chunk_map::ChunkMapSchedulingTimings;
 use crate::chunk::chunk_request::{
     ChunkRequest, ChunkRequestHandle, ChunkRequestState, ChunkTicketKind,
 };
@@ -24,15 +25,158 @@ use std::sync::atomic::Ordering;
 
 const PREGEN_SIZE_ENV: &str = "PREGEN_SIZE";
 const PREGEN_WINDOW_SIZE_ENV: &str = "PREGEN_WINDOW_SIZE";
+const PREGEN_ACTIVE_WINDOWS_ENV: &str = "PREGEN_ACTIVE_WINDOWS";
 const VANILLA_PLAYER_SPAWN_SIZE_CHUNKS: i32 = 7;
 const DEFAULT_PREGEN_WINDOW_SIZE: i32 = 32;
-const PREGEN_ACTIVE_WINDOWS: usize = 2;
-const PREGEN_UNLOAD_BACKPRESSURE_HIGH: usize = 8192;
-const PREGEN_UNLOAD_BACKPRESSURE_LOW: usize = 4096;
+/// How many windows may be generating at once.
+///
+/// This is the pregeneration pipeline's depth. Each window is
+/// `window_size * window_size` target chunks, and a new one is admitted only as
+/// an active one finishes, so this bounds how much work the generation threads
+/// can see at any moment. Too shallow and the tail of every window -- when a
+/// handful of chunks remain and the rest of the pool has nothing to do -- is
+/// paid with idle threads.
+///
+/// It was 2, which starves the pool badly. A scheduler trace of the generation
+/// threads showed 90.8% of their context switches were blocking sleeps in
+/// rayon's idle path -- they were not contending, they had no work -- while
+/// disk waits were 14 events out of 155,697. Raising the depth to 16 measured
+/// +18.5% throughput over a 90,601-chunk pregeneration, and just as usefully it
+/// collapsed the run-to-run spread: median absolute deviation fell from 2.77s
+/// to 0.26s, because the tail stalls a shallow pipeline suffers simply stop
+/// happening.
+/// Active windows per generation thread when the depth is left unset.
+///
+/// Pipeline depth exists to keep the generation pool supplied, so it belongs in
+/// units of generation threads rather than as a flat count: a 128-thread host
+/// needs far more chunks in flight than an 8-thread one to reach the same
+/// occupancy, and a flat default either starves the big host or makes the small
+/// one hold a pointless amount of world in memory.
+///
+/// Depth 16 was tuned when task creation was serialized on the scheduling
+/// thread, where deeper pipelines made things worse -- 32 windows measured 13%
+/// slower than 16. With that bottleneck removed the relationship inverted.
+/// Measured on a 128-thread EPYC 9555P over a 90,601-chunk pregeneration at 96
+/// generation threads: 16 windows 6,130 chunks/s, 32 -> 6,190, 64 -> 6,574,
+/// 128 -> 6,861, with generation-pool occupancy rising from 0.73 to 0.83.
+///
+/// One window per generation thread lands at the top of that curve while
+/// keeping the in-flight bound proportional to the machine. Each window is
+/// `window_size^2` target chunks and the halo around it, so the cost is real
+/// memory: at 32-chunk windows this measured ~18 GB resident on a 127-thread
+/// host, against ~5 GB at the old fixed depth. Lower `PREGEN_ACTIVE_WINDOWS` on
+/// a memory-constrained host.
+const DEFAULT_PREGEN_ACTIVE_WINDOWS_PER_THREAD: usize = 1;
+const PREGEN_UNLOAD_BACKPRESSURE_ENV: &str = "PREGEN_UNLOAD_BACKPRESSURE";
+/// Unload backlog at which window activation pauses.
+///
+/// Has to clear `window_size^2 * active_windows`, or the budget check rejects
+/// the default configuration outright. At the default 32-chunk window and depth
+/// 16 that floor is 16,384; the value here leaves room above it so ordinary
+/// backlog growth does not trip backpressure and re-introduce the stalls the
+/// deeper pipeline was meant to remove.
+const DEFAULT_PREGEN_UNLOAD_BACKPRESSURE_HIGH: usize = 65536;
+/// Backlog watermarks that pause window activation while unloads drain.
+///
+/// Deeper pipelines retain more finished-window halo, so the high watermark and
+/// the pipeline depth have to move together: raising depth alone just trades
+/// generation stalls for backpressure stalls.
+/// Unload backlog watermark that leaves the configured pipeline room to run.
+///
+/// The budget check rejects a depth whose in-flight chunks exceed the high
+/// watermark, so a fixed watermark silently caps how deep the pipeline may go.
+/// Now that depth tracks the generation pool, the watermark has to track depth,
+/// with headroom above the floor so ordinary backlog growth does not trip
+/// backpressure and reintroduce the stalls a deep pipeline removes.
+fn default_pregen_unload_backpressure_high(active_windows: usize) -> usize {
+    let window_size = DEFAULT_PREGEN_WINDOW_SIZE as usize;
+    let in_flight_floor = window_size
+        .saturating_mul(window_size)
+        .saturating_mul(active_windows);
+    in_flight_floor
+        .saturating_mul(2)
+        .max(DEFAULT_PREGEN_UNLOAD_BACKPRESSURE_HIGH)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct UnloadBackpressure {
+    high: usize,
+    low: usize,
+}
+
+impl UnloadBackpressure {
+    const fn from_high(high: usize) -> Self {
+        Self {
+            high,
+            low: high / 2,
+        }
+    }
+}
 const FULL_DEPENDENCY_RADIUS: i32 = GENERATION_PYRAMID
     .get_step_to(ChunkStatus::Full)
     .accumulated_dependencies
     .get_radius_of(ChunkStatus::Empty) as i32;
+
+/// Running cost of the scheduling epochs driven by a pregeneration.
+///
+/// Both halves of an epoch are single-threaded, and every chunk has to pass
+/// through them to be created and to retire, so their cost bounds throughput no
+/// matter how many generation threads are waiting. Tracking the maximum as well
+/// as the total matters: one long epoch stalls task creation outright, and the
+/// generation pool drains behind it.
+#[derive(Default)]
+struct EpochCost {
+    epochs: u64,
+    ticket_updates: Duration,
+    schedule_generation: Duration,
+    run_generation: Duration,
+    process_unloads: Duration,
+    readiness_reconcile: Duration,
+    lifecycle_commit: Duration,
+    worst_epoch: Duration,
+    scheduled: usize,
+}
+
+impl EpochCost {
+    fn record(&mut self, timings: &ChunkMapSchedulingTimings) {
+        let total = timings.ticket_updates
+            + timings.schedule_generation
+            + timings.run_generation
+            + timings.process_unloads
+            + timings.readiness_reconcile
+            + timings.lifecycle_commit;
+        if total.is_zero() {
+            return;
+        }
+        self.epochs += 1;
+        self.ticket_updates += timings.ticket_updates;
+        self.schedule_generation += timings.schedule_generation;
+        self.run_generation += timings.run_generation;
+        self.process_unloads += timings.process_unloads;
+        self.readiness_reconcile += timings.readiness_reconcile;
+        self.lifecycle_commit += timings.lifecycle_commit;
+        self.scheduled += timings.scheduled_count;
+        self.worst_epoch = self.worst_epoch.max(total);
+    }
+
+    fn log(&self, elapsed: Duration) {
+        let pct = |part: Duration| part.as_secs_f64() / elapsed.as_secs_f64() * 100.0;
+        log::info!(
+            "Scheduling epochs: {} epochs, {} chunks scheduled, worst epoch {:.1}ms | \
+             share of wall clock: tickets {:.1}%, schedule {:.1}%, refill {:.1}%, unloads {:.1}%, \
+             readiness {:.1}%, lifecycle {:.1}%",
+            self.epochs,
+            self.scheduled,
+            self.worst_epoch.as_secs_f64() * 1000.0,
+            pct(self.ticket_updates),
+            pct(self.schedule_generation),
+            pct(self.run_generation),
+            pct(self.process_unloads),
+            pct(self.readiness_reconcile),
+            pct(self.lifecycle_commit),
+        );
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 struct PregenWindow {
@@ -187,7 +331,22 @@ impl Server {
                 return false;
             }
         };
-        let window_size = match get_pregen_window_size() {
+        let generation_threads = overworld.chunk_map.generation_thread_count();
+        let active_window_limit = match get_pregen_active_windows(generation_threads) {
+            Ok(active_windows) => active_windows,
+            Err(error) => {
+                log::error!("{error}");
+                return false;
+            }
+        };
+        let backpressure = match get_pregen_unload_backpressure(active_window_limit) {
+            Ok(backpressure) => backpressure,
+            Err(error) => {
+                log::error!("{error}");
+                return false;
+            }
+        };
+        let window_size = match get_pregen_window_size(active_window_limit, backpressure) {
             Ok(window_size) => window_size,
             Err(error) => {
                 log::error!("{error}");
@@ -209,6 +368,8 @@ impl Server {
             center_chunk,
             pregen_size,
             window_size,
+            active_window_limit,
+            backpressure,
             &self.cancel_token,
         )
         .await
@@ -229,17 +390,72 @@ fn get_pregen_size() -> Result<Option<PregenSize>, String> {
     PregenSize::from_side_length(side_length)
 }
 
-fn get_pregen_window_size() -> Result<i32, String> {
+fn get_pregen_unload_backpressure(active_windows: usize) -> Result<UnloadBackpressure, String> {
+    let high = match env::var(PREGEN_UNLOAD_BACKPRESSURE_ENV) {
+        Ok(value) => value.parse::<usize>().map_err(|error| {
+            format!("{PREGEN_UNLOAD_BACKPRESSURE_ENV} must be a positive integer: {error}")
+        })?,
+        Err(env::VarError::NotPresent) => default_pregen_unload_backpressure_high(active_windows),
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err(format!(
+                "{PREGEN_UNLOAD_BACKPRESSURE_ENV} must be valid unicode"
+            ));
+        }
+    };
+    if high < 2 {
+        return Err(format!(
+            "{PREGEN_UNLOAD_BACKPRESSURE_ENV} must be at least 2"
+        ));
+    }
+
+    Ok(UnloadBackpressure::from_high(high))
+}
+
+fn get_pregen_active_windows(generation_threads: usize) -> Result<usize, String> {
+    match env::var(PREGEN_ACTIVE_WINDOWS_ENV) {
+        Ok(value) => parse_pregen_active_windows(&value),
+        Err(env::VarError::NotPresent) => {
+            Ok((generation_threads * DEFAULT_PREGEN_ACTIVE_WINDOWS_PER_THREAD).max(1))
+        }
+        Err(env::VarError::NotUnicode(_)) => {
+            Err(format!("{PREGEN_ACTIVE_WINDOWS_ENV} must be valid unicode"))
+        }
+    }
+}
+
+fn parse_pregen_active_windows(value: &str) -> Result<usize, String> {
+    let active_windows = value.parse::<usize>().map_err(|error| {
+        format!("{PREGEN_ACTIVE_WINDOWS_ENV} must be a positive integer: {error}")
+    })?;
+    if active_windows == 0 {
+        return Err(format!(
+            "{PREGEN_ACTIVE_WINDOWS_ENV} must be a positive integer"
+        ));
+    }
+
+    Ok(active_windows)
+}
+
+fn get_pregen_window_size(
+    active_windows: usize,
+    backpressure: UnloadBackpressure,
+) -> Result<i32, String> {
     match env::var(PREGEN_WINDOW_SIZE_ENV) {
-        Ok(value) => parse_pregen_window_size(&value),
-        Err(env::VarError::NotPresent) => Ok(DEFAULT_PREGEN_WINDOW_SIZE),
+        Ok(value) => parse_pregen_window_size(&value, active_windows, backpressure),
+        Err(env::VarError::NotPresent) => {
+            check_pregen_window_budget(DEFAULT_PREGEN_WINDOW_SIZE, active_windows, backpressure)
+        }
         Err(env::VarError::NotUnicode(_)) => {
             Err(format!("{PREGEN_WINDOW_SIZE_ENV} must be valid unicode"))
         }
     }
 }
 
-fn parse_pregen_window_size(value: &str) -> Result<i32, String> {
+fn parse_pregen_window_size(
+    value: &str,
+    active_windows: usize,
+    backpressure: UnloadBackpressure,
+) -> Result<i32, String> {
     let window_size = value
         .parse::<i32>()
         .map_err(|error| format!("{PREGEN_WINDOW_SIZE_ENV} must be a positive integer: {error}"))?;
@@ -249,18 +465,35 @@ fn parse_pregen_window_size(value: &str) -> Result<i32, String> {
         ));
     }
 
+    check_pregen_window_budget(window_size, active_windows, backpressure)
+}
+
+/// Rejects window/depth pairs whose in-flight chunks exceed the unload budget.
+///
+/// Active windows keep their tickets until their dependency halo is no longer
+/// needed, so window area times pipeline depth bounds how many chunks can be
+/// waiting to unload. Exceeding the high watermark would make backpressure
+/// engage permanently and stall window activation outright.
+fn check_pregen_window_budget(
+    window_size: i32,
+    active_windows: usize,
+    backpressure: UnloadBackpressure,
+) -> Result<i32, String> {
     let window_size_as_usize = window_size as usize;
     let Some(active_target_chunks) = window_size_as_usize
         .checked_mul(window_size_as_usize)
-        .and_then(|chunk_count| chunk_count.checked_mul(PREGEN_ACTIVE_WINDOWS))
+        .and_then(|chunk_count| chunk_count.checked_mul(active_windows))
     else {
         return Err(format!(
             "{PREGEN_WINDOW_SIZE_ENV} is too large for the pregeneration window budget"
         ));
     };
-    if active_target_chunks > PREGEN_UNLOAD_BACKPRESSURE_HIGH {
+    if active_target_chunks > backpressure.high {
         return Err(format!(
-            "{PREGEN_WINDOW_SIZE_ENV} must keep {PREGEN_ACTIVE_WINDOWS} active windows within the {PREGEN_UNLOAD_BACKPRESSURE_HIGH}-chunk unload-backpressure budget"
+            "{PREGEN_WINDOW_SIZE_ENV} of {window_size} must keep {active_windows} active windows \
+             within the {}-chunk unload-backpressure budget (raise \
+             {PREGEN_UNLOAD_BACKPRESSURE_ENV} to allow a deeper pipeline)",
+            backpressure.high
         ));
     }
 
@@ -272,6 +505,8 @@ async fn pregen_overworld(
     center_chunk: ChunkPos,
     pregen_size: PregenSize,
     window_size: i32,
+    active_window_limit: usize,
+    backpressure: UnloadBackpressure,
     cancel_token: &CancellationToken,
 ) -> bool {
     let total_chunks = total_chunks(pregen_size.side_length);
@@ -290,8 +525,16 @@ async fn pregen_overworld(
 
     let elapsed = {
         let start = Instant::now();
-        let completed =
-            generate_pregen(world, center_chunk, pregen_size, window_size, cancel_token).await;
+        let completed = generate_pregen(
+            world,
+            center_chunk,
+            pregen_size,
+            window_size,
+            active_window_limit,
+            backpressure,
+            cancel_token,
+        )
+        .await;
         (start.elapsed(), completed)
     };
 
@@ -371,23 +614,31 @@ async fn generate_pregen(
     center_chunk: ChunkPos,
     pregen_size: PregenSize,
     window_size: i32,
+    active_window_limit: usize,
+    backpressure: UnloadBackpressure,
     cancel_token: &CancellationToken,
 ) -> bool {
     let total_chunks = total_chunks(pregen_size.side_length);
     let mut pending_windows = build_pregen_windows(center_chunk, pregen_size.radius, window_size);
-    let mut active_windows = Vec::with_capacity(PREGEN_ACTIVE_WINDOWS + 1);
+    let mut active_windows = Vec::with_capacity(active_window_limit + 1);
     let mut last_report = Instant::now();
     let mut last_completed = 0usize;
     let mut completed = 0usize;
     let mut unload_backpressure = false;
     let mut peak_unloading_chunks = 0usize;
+    let mut epoch_cost = EpochCost::default();
     let start = Instant::now();
 
     log::info!(
-        "Pregeneration windowing: {window_size}x{window_size} target chunks, {PREGEN_ACTIVE_WINDOWS} active windows, dependency halo {FULL_DEPENDENCY_RADIUS} chunks",
+        "Pregeneration windowing: {window_size}x{window_size} target chunks, {active_window_limit} active windows, dependency halo {FULL_DEPENDENCY_RADIUS} chunks",
     );
 
-    fill_active_windows(world, &mut pending_windows, &mut active_windows);
+    fill_active_windows(
+        world,
+        &mut pending_windows,
+        &mut active_windows,
+        active_window_limit,
+    );
 
     while completed < total_chunks {
         if cancel_token.is_cancelled() {
@@ -396,9 +647,9 @@ async fn generate_pregen(
         }
 
         drain_pregen_broadcasts(world);
-        world.chunk_map.advance_scheduling();
+        epoch_cost.record(&world.chunk_map.advance_scheduling());
         peak_unloading_chunks = peak_unloading_chunks.max(world.chunk_map.unloading_chunks.len());
-        update_unload_backpressure(world, &mut unload_backpressure);
+        update_unload_backpressure(world, &mut unload_backpressure, backpressure);
 
         for active in &mut active_windows {
             active.poll(world);
@@ -421,13 +672,18 @@ async fn generate_pregen(
             }
         }
         if !unload_backpressure {
-            fill_active_windows(world, &mut pending_windows, &mut active_windows);
+            fill_active_windows(
+                world,
+                &mut pending_windows,
+                &mut active_windows,
+                active_window_limit,
+            );
         }
         drain_pregen_broadcasts(world);
-        world.chunk_map.advance_scheduling();
+        epoch_cost.record(&world.chunk_map.advance_scheduling());
         release_unneeded_completed_windows(world, &mut active_windows);
         peak_unloading_chunks = peak_unloading_chunks.max(world.chunk_map.unloading_chunks.len());
-        update_unload_backpressure(world, &mut unload_backpressure);
+        update_unload_backpressure(world, &mut unload_backpressure, backpressure);
 
         if completed == total_chunks {
             break;
@@ -436,31 +692,16 @@ async fn generate_pregen(
         if pregen_size.side_length > VANILLA_PLAYER_SPAWN_SIZE_CHUNKS
             && last_report.elapsed() >= Duration::from_secs(5)
         {
-            let report_elapsed = last_report.elapsed().as_secs_f64();
-            let ready_in_active = active_windows
-                .iter()
-                .filter(|active| !active.counted)
-                .map(|active| active.ready_chunks)
-                .sum::<usize>();
-            let current_completed = (completed + ready_in_active).min(total_chunks);
-            let elapsed = start.elapsed().as_secs_f64();
-            let chunks_per_sec = if elapsed > 0.0 {
-                (current_completed.saturating_sub(last_completed)) as f64 / report_elapsed
-            } else {
-                0.0
-            };
-            let percent = (current_completed as f64 / total_chunks as f64) * 100.0;
-            let remaining = total_chunks.saturating_sub(current_completed);
-            let eta = if chunks_per_sec > 0.0 && remaining > 0 {
-                remaining as f64 / chunks_per_sec
-            } else {
-                0.0
-            };
-            log::info!(
-                "Progress: {current_completed}/{total_chunks} ({percent:.1}%), {chunks_per_sec:.1} chunks/s, ETA: {eta:.0}s",
+            last_completed = report_pregen_progress(
+                world,
+                &active_windows,
+                completed,
+                last_completed,
+                total_chunks,
+                last_report,
+                start,
             );
             last_report = Instant::now();
-            last_completed = current_completed;
         }
 
         tokio::select! {
@@ -475,25 +716,70 @@ async fn generate_pregen(
     release_all_windows(world, &mut active_windows);
     peak_unloading_chunks = peak_unloading_chunks.max(world.chunk_map.unloading_chunks.len());
     log::info!("Pregeneration peak unload backlog: {peak_unloading_chunks} chunks");
+    epoch_cost.log(start.elapsed());
     true
 }
 
-fn update_unload_backpressure(world: &Arc<World>, unload_backpressure: &mut bool) {
+/// Logs one pregeneration progress line and returns the new completed count.
+fn report_pregen_progress(
+    world: &Arc<World>,
+    active_windows: &[ActivePregenWindow],
+    completed: usize,
+    last_completed: usize,
+    total_chunks: usize,
+    last_report: Instant,
+    start: Instant,
+) -> usize {
+    let report_elapsed = last_report.elapsed().as_secs_f64();
+    let ready_in_active = active_windows
+        .iter()
+        .filter(|active| !active.counted)
+        .map(|active| active.ready_chunks)
+        .sum::<usize>();
+    let current_completed = (completed + ready_in_active).min(total_chunks);
+    let chunks_per_sec = if start.elapsed().as_secs_f64() > 0.0 {
+        (current_completed.saturating_sub(last_completed)) as f64 / report_elapsed
+    } else {
+        0.0
+    };
+    let percent = (current_completed as f64 / total_chunks as f64) * 100.0;
+    let remaining = total_chunks.saturating_sub(current_completed);
+    let eta = if chunks_per_sec > 0.0 && remaining > 0 {
+        remaining as f64 / chunks_per_sec
+    } else {
+        0.0
+    };
+    log::info!(
+        "Progress: {current_completed}/{total_chunks} ({percent:.1}%), {chunks_per_sec:.1} chunks/s, ETA: {eta:.0}s, in-flight tasks {}/{}",
+        world.chunk_map.running_generation_task_count(),
+        world.chunk_map.generation_task_capacity(),
+    );
+    current_completed
+}
+
+fn update_unload_backpressure(
+    world: &Arc<World>,
+    unload_backpressure: &mut bool,
+    watermarks: UnloadBackpressure,
+) {
     let unloading_chunks = world.chunk_map.unloading_chunks.len();
     if *unload_backpressure {
-        if unloading_chunks <= PREGEN_UNLOAD_BACKPRESSURE_LOW {
+        if unloading_chunks <= watermarks.low {
             *unload_backpressure = false;
             log::info!(
-                "Pregen unload backpressure released: unloading_chunks={unloading_chunks}, low_watermark={PREGEN_UNLOAD_BACKPRESSURE_LOW}",
+                "Pregen unload backpressure released: unloading_chunks={unloading_chunks}, low_watermark={}",
+                watermarks.low,
             );
         }
         return;
     }
 
-    if unloading_chunks >= PREGEN_UNLOAD_BACKPRESSURE_HIGH {
+    if unloading_chunks >= watermarks.high {
         *unload_backpressure = true;
         log::info!(
-            "Pregen unload backpressure active: unloading_chunks={unloading_chunks}, high_watermark={PREGEN_UNLOAD_BACKPRESSURE_HIGH}, low_watermark={PREGEN_UNLOAD_BACKPRESSURE_LOW}",
+            "Pregen unload backpressure active: unloading_chunks={unloading_chunks}, high_watermark={}, low_watermark={}",
+            watermarks.high,
+            watermarks.low,
         );
     }
 }
@@ -511,8 +797,9 @@ fn fill_active_windows(
     world: &Arc<World>,
     pending_windows: &mut VecDeque<PregenWindow>,
     active_windows: &mut Vec<ActivePregenWindow>,
+    active_window_limit: usize,
 ) {
-    while active_windows.iter().filter(|active| !active.ready).count() < PREGEN_ACTIVE_WINDOWS {
+    while active_windows.iter().filter(|active| !active.ready).count() < active_window_limit {
         if !activate_next_window(world, pending_windows, active_windows) {
             break;
         }
@@ -615,16 +902,78 @@ mod tests {
 
     #[test]
     fn pregen_window_size_requires_a_positive_integer() {
-        assert_eq!(parse_pregen_window_size("1"), Ok(1));
-        assert_eq!(parse_pregen_window_size("64"), Ok(64));
-        assert!(parse_pregen_window_size("0").is_err());
-        assert!(parse_pregen_window_size("-1").is_err());
-        assert!(parse_pregen_window_size("wide").is_err());
+        let depth = 16;
+        let budget = UnloadBackpressure::from_high(DEFAULT_PREGEN_UNLOAD_BACKPRESSURE_HIGH);
+        assert_eq!(parse_pregen_window_size("1", depth, budget), Ok(1));
+        assert_eq!(parse_pregen_window_size("64", depth, budget), Ok(64));
+        assert!(parse_pregen_window_size("0", depth, budget).is_err());
+        assert!(parse_pregen_window_size("-1", depth, budget).is_err());
+        assert!(parse_pregen_window_size("wide", depth, budget).is_err());
     }
 
     #[test]
     fn pregen_window_size_must_fit_unload_backpressure_budget() {
-        assert!(parse_pregen_window_size("65").is_err());
-        assert!(parse_pregen_window_size(&i32::MAX.to_string()).is_err());
+        // Pinned budgets rather than the shipped constant: the rule under test is
+        // `window^2 * depth <= high`, and asserting it against whatever the default
+        // happens to be makes the test fail whenever the default is retuned.
+        let budget = UnloadBackpressure::from_high(8192);
+        assert!(parse_pregen_window_size("64", 2, budget).is_ok());
+        assert!(parse_pregen_window_size("65", 2, budget).is_err());
+        assert!(parse_pregen_window_size(&i32::MAX.to_string(), 2, budget).is_err());
+        // Depth trades against window area for the same budget.
+        assert!(parse_pregen_window_size("32", 8, budget).is_ok());
+        assert!(parse_pregen_window_size("32", 9, budget).is_err());
+        // A larger budget admits a deeper pipeline at the same window size.
+        let wide = UnloadBackpressure::from_high(32768);
+        assert!(parse_pregen_window_size("32", 9, wide).is_ok());
+        assert_eq!(wide.low, 16384);
+
+        assert!(parse_pregen_active_windows("0").is_err());
+        assert_eq!(parse_pregen_active_windows("4"), Ok(4));
+    }
+
+    #[test]
+    fn shipped_pregen_defaults_fit_their_own_budget() {
+        let budget = UnloadBackpressure::from_high(default_pregen_unload_backpressure_high(16));
+        assert!(
+            check_pregen_window_budget(
+                DEFAULT_PREGEN_WINDOW_SIZE,
+                16,
+                budget,
+            )
+            .is_ok(),
+            "default window size and pipeline depth must not trip their own backpressure budget"
+        );
+    }
+
+    #[test]
+    fn default_generation_threads_leave_one_thread_for_the_rest_of_the_server() {
+        use crate::server::default_chunk_generation_threads;
+        // Small machines keep every thread; there is nothing to spare.
+        assert_eq!(default_chunk_generation_threads(1), 1);
+        assert_eq!(default_chunk_generation_threads(4), 4);
+        // Larger ones give back a single thread. Holding back a quarter measured
+        // faster only while task creation was serialized on the scheduling
+        // thread; once that was fixed, generation kept scaling to the top of the
+        // machine.
+        assert_eq!(default_chunk_generation_threads(8), 7);
+        assert_eq!(default_chunk_generation_threads(128), 127);
+    }
+
+    #[test]
+    fn default_pipeline_depth_tracks_the_generation_pool() {
+        // Depth is what keeps the generation pool supplied, so it scales with
+        // the pool rather than being a flat count.
+        assert_eq!(get_pregen_active_windows(127), Ok(127));
+        assert_eq!(get_pregen_active_windows(8), Ok(8));
+        // And a depth that large must not trip its own backpressure budget.
+        for threads in [1, 8, 96, 127] {
+            let budget =
+                UnloadBackpressure::from_high(default_pregen_unload_backpressure_high(threads));
+            assert!(
+                check_pregen_window_budget(DEFAULT_PREGEN_WINDOW_SIZE, threads, budget).is_ok(),
+                "default depth for {threads} threads must fit its own budget"
+            );
+        }
     }
 }
