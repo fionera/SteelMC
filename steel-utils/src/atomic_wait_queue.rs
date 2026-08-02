@@ -119,13 +119,32 @@ impl<T> AtomicWaitQueue<T> {
     /// Returns the payload immediately when the status is already past it, or
     /// when the queue is cancelled.
     pub fn wait(&self, wait_for: u16, payload: T) -> WaitOutcome<T> {
+        // Answer from the status word alone where that settles it, which is the
+        // common case: a dependent usually asks about a status that is already
+        // published. Allocating first and freeing it again on the way out cost a
+        // malloc/free pair per such call, and the design this primitive exists
+        // for registers against every unmet dependency of every chunk.
+        //
+        // Racing with a publication is fine either way. Losing the race means
+        // reaching the loop below and discovering it there; the loop re-reads
+        // the status and reaches the same answer.
+        let mut current = self.head.load(Ordering::Acquire);
+        {
+            let (status, _) = Self::unpack(current);
+            if status == CANCELLED_STATUS {
+                return WaitOutcome::Cancelled(payload);
+            }
+            if status > wait_for {
+                return WaitOutcome::AlreadySatisfied(payload);
+            }
+        }
+
         let node = Box::into_raw(Box::new(Node {
             data: ManuallyDrop::new(payload),
             next: ptr::null_mut(),
             waiter_status: wait_for,
         }));
 
-        let mut current = self.head.load(Ordering::Acquire);
         loop {
             let (status, head) = Self::unpack(current);
 
@@ -367,6 +386,35 @@ mod tests {
         let queue = AtomicWaitQueue::new(5);
         let outcome = queue.wait(4, "done");
         assert!(matches!(outcome, WaitOutcome::AlreadySatisfied("done")));
+    }
+
+    #[test]
+    fn a_hand_back_leaves_nothing_registered() {
+        // The status-only fast path returns without allocating a node. If it ever
+        // published one anyway, the payload would be handed back here *and* again
+        // by the next raise.
+        let queue = AtomicWaitQueue::<&str>::new(5);
+        assert!(matches!(
+            queue.wait(3, "already past"),
+            WaitOutcome::AlreadySatisfied("already past")
+        ));
+
+        let mut released = Vec::new();
+        queue.advance_and_notify(6, |payload| released.push(payload));
+        assert!(
+            released.is_empty(),
+            "the handed-back waiter must not also be queued: {released:?}"
+        );
+    }
+
+    #[test]
+    fn a_cancelled_queue_hands_back_without_registering() {
+        let queue = AtomicWaitQueue::<&str>::new(0);
+        queue.cancel(|_| {});
+        assert!(matches!(
+            queue.wait(9, "after cancel"),
+            WaitOutcome::Cancelled("after cancel")
+        ));
     }
 
     #[test]
