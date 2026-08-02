@@ -23,6 +23,8 @@ pub mod player_chunk_view;
 pub mod full_chunk;
 pub mod paletted_container;
 pub mod section;
+/// A pre-filled square cache of chunk neighbours.
+pub mod static_cache_2d;
 pub mod status;
 
 pub use data::Chunk;
