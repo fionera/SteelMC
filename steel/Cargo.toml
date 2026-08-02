@@ -35,8 +35,7 @@ opentelemetry_sdk = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 crossterm = { version = "0.29.0", features = ["osc52"] }
-# `clock` for Local, used by the log file rotation timestamps.
-chrono = { workspace = true, features = ["clock"] }
+chrono.workspace = true
 
 # Cryptography
 text_components.workspace = true
