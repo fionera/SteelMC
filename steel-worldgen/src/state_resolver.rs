@@ -42,13 +42,15 @@ impl WorldgenStateResolver {
         data: &feature::BlockStateData,
         context: &str,
     ) -> BlockStateId {
-        Self::block_state_from_parts(
-            registry,
-            data.block,
-            &data.block.key,
-            data.properties.iter().copied(),
-            context,
-        )
+        *data.state.get_or_init(|| {
+            Self::block_state_from_parts(
+                registry,
+                data.block,
+                &data.block.key,
+                data.properties.iter().copied(),
+                context,
+            )
+        })
     }
 
     fn block_state_from_parts<'a>(

@@ -125,6 +125,7 @@ pub(super) fn generate_block_state_data(data: &BlockStateData) -> TokenStream {
         BlockStateData {
             block: #block,
             properties: #properties,
+            state: OnceLock::new(),
         }
     }
 }

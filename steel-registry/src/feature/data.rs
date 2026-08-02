@@ -9,8 +9,9 @@ use super::{ConfiguredFeatureEntryRef, PlacedFeatureEntryRef};
 use crate::blocks::BlockRef;
 use crate::fluid::FluidRef;
 use glam::IVec3;
+use std::sync::OnceLock;
 use steel_utils::{
-    Direction, Identifier, Rotation,
+    BlockStateId, Direction, Identifier, Rotation,
     value_providers::{FloatProvider, HeightProvider, IntProvider, UniformIntProvider},
 };
 
@@ -134,6 +135,13 @@ pub struct BlockStateData {
     pub block: BlockRef,
     /// Explicit state properties from the extracted feature config.
     pub properties: &'static [(&'static str, &'static str)],
+    /// Resolution of `block` under `properties`, memoized on first use.
+    ///
+    /// Feature entries are `&'static` and the block registry is fixed before
+    /// worldgen runs, so this only ever resolves to one value. Ore placement
+    /// resolves the same handful of states hundreds of millions of times per
+    /// pregeneration, and each resolution is a string-keyed property walk.
+    pub state: OnceLock<BlockStateId>,
 }
 
 /// Fluid state data emitted by the feature generator without runtime key lookup.
