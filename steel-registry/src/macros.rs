@@ -188,6 +188,19 @@ macro_rules! impl_tagged_registry {
             }
 
             fn get_tag(&self, tag: &steel_utils::Identifier) -> Option<Vec<&'static Self::Entry>> {
+                if let Some(entry_ids) = self
+                    .tags
+                    .ids(tag, !self.allows_registering, |key| {
+                        $crate::RegistryExt::id_from_key(self, key)
+                    })
+                {
+                    return Some(
+                        entry_ids
+                            .iter()
+                            .filter_map(|id| $crate::RegistryExt::by_id(self, *id))
+                            .collect(),
+                    );
+                }
                 self.tags.get(tag).map(|entry_keys| {
                     entry_keys
                         .iter()
@@ -196,15 +209,35 @@ macro_rules! impl_tagged_registry {
                 })
             }
 
+            /// Members of a tag, resolved by registry id rather than by key.
+            ///
+            /// The ids are resolved once when the tag is registered, so this is a
+            /// slice walk and a `Vec` index per member. Resolving by key instead
+            /// costs a string-keyed hash lookup per member, and the ore feature's
+            /// `RuleTest::TagMatch` runs this per vein.
             fn iter_tag(
                 &self,
                 tag: &steel_utils::Identifier,
             ) -> impl Iterator<Item = &'static Self::Entry> + '_ {
-                self.tags.get(tag).into_iter().flat_map(|entry_keys| {
-                    entry_keys
+                let resolved = self.tags.ids(tag, !self.allows_registering, |key| {
+                    $crate::RegistryExt::id_from_key(self, key)
+                });
+                let by_id = resolved.into_iter().flat_map(|entry_ids| {
+                    entry_ids
                         .iter()
-                        .filter_map(|key| $crate::RegistryExt::by_key(self, key))
-                })
+                        .filter_map(|id| $crate::RegistryExt::by_id(self, *id))
+                });
+                let by_key = resolved
+                    .is_none()
+                    .then(|| self.tags.get(tag))
+                    .flatten()
+                    .into_iter()
+                    .flat_map(|entry_keys| {
+                        entry_keys
+                            .iter()
+                            .filter_map(|key| $crate::RegistryExt::by_key(self, key))
+                    });
+                by_id.chain(by_key)
             }
 
             fn tag_keys(&self) -> impl Iterator<Item = &steel_utils::Identifier> + '_ {
