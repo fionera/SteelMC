@@ -283,23 +283,135 @@ fn noop_task(
 /// `Noise`+`Surface`+`Carvers` | `Features`+`InitializeLight` |
 /// `Light`+`Spawn`+`Full`.
 #[must_use]
-pub fn can_fuse(prev: &ChunkStep, next: &ChunkStep) -> bool {
-    if matches!(next.target_status, ChunkStatus::Empty | ChunkStatus::Light)
-        || prev.target_status == ChunkStatus::Empty
+pub const fn can_fuse(prev: &ChunkStep, next: &ChunkStep) -> bool {
+    let next_index = next.target_status.get_index();
+    if next_index == ChunkStatus::Empty.get_index()
+        || next_index == ChunkStatus::Light.get_index()
+        || prev.target_status.get_index() == ChunkStatus::Empty.get_index()
     {
         return false;
     }
 
-    let mut status = Some(ChunkStatus::Empty);
-    while let Some(current) = status {
+    let mut index = 0;
+    while index < STATUS_COUNT {
+        let Some(current) = ChunkStatus::from_index(index) else {
+            break;
+        };
         let needed = next.direct_dependencies.get_radius_of(current);
         if needed > 0 && prev.direct_dependencies.get_radius_of(current) < needed {
             return false;
         }
-        status = current.next();
+        index += 1;
     }
 
     true
+}
+
+/// Halo radius the `Light` step reads, which its dependency ring does not say.
+///
+/// `run_light_stage` sets its workset up with [`LightCacheSetupRadius::Full`],
+/// a 5x5 chunk window, while `Light`'s direct dependencies only reach radius 1.
+/// The extra ring is opportunistic -- `light.rs` fetches it with `try_get` and
+/// `setup_with_scopes` runs relaxed -- so under-sizing the halo here does not
+/// fail, it silently treats the outer ring as empty and changes the lighting
+/// result. That is why this is a named constant with its own test rather than
+/// something derived from the pyramid.
+///
+/// [`LightCacheSetupRadius::Full`]: crate::chunk::light::LightCacheSetupRadius
+pub const LIGHT_HALO_RADIUS: usize = 2;
+
+/// One fused run of generation steps, and what it needs to be able to start.
+///
+/// Indexed by the status a run *starts* at, so [`RUN_PLANS`] has one entry per
+/// status rather than one per run. That matters: a holder can legitimately sit
+/// published in the middle of a run -- loaded from disk at, say, `Surface`, or
+/// left there when a fused run published `Noise` and then had its remaining
+/// claims rolled back -- and must resume from exactly the next status. A table
+/// keyed by run would have to either miss that holder or restart it at the
+/// run's first status, and `claim_status_work` panics on the latter.
+#[derive(Clone, Copy, Debug)]
+pub struct RunPlan {
+    /// First status of the run.
+    pub first: ChunkStatus,
+    /// Last status of the run, inclusive.
+    pub last: ChunkStatus,
+    /// What the run needs of other chunks.
+    ///
+    /// This is the *first* step's direct dependencies. Property `A2` proves
+    /// that dominates every later step in the run, which is what licenses
+    /// resolving one halo and taking one dependency wait for the whole run.
+    pub ring: ChunkDependencies,
+    /// Chunks the halo must cover, as a Chebyshev radius.
+    ///
+    /// At least the ring's radius, and at least [`LIGHT_HALO_RADIUS`] for a run
+    /// containing `Light`.
+    pub halo_radius: usize,
+}
+
+impl RunPlan {
+    const PLACEHOLDER: Self = Self {
+        first: ChunkStatus::Empty,
+        last: ChunkStatus::Empty,
+        ring: ChunkDependencies::EMPTY,
+        halo_radius: 0,
+    };
+
+    /// Whether `status` falls inside this run.
+    #[must_use]
+    pub const fn contains(&self, status: ChunkStatus) -> bool {
+        let index = status.get_index();
+        self.first.get_index() <= index && index <= self.last.get_index()
+    }
+}
+
+/// The fused run starting at each status.
+pub const RUN_PLANS: [RunPlan; STATUS_COUNT] = build_run_plans();
+
+const fn build_run_plans() -> [RunPlan; STATUS_COUNT] {
+    let mut plans = [RunPlan::PLACEHOLDER; STATUS_COUNT];
+    let mut index = 0;
+
+    while index < STATUS_COUNT {
+        let Some(first) = ChunkStatus::from_index(index) else {
+            panic!("status index within STATUS_COUNT must decode")
+        };
+        let first_step = *GENERATION_PYRAMID.get_step_to(first);
+
+        // Walk forward while the next step needs nothing new from other chunks.
+        let mut last_index = index;
+        let mut previous = first_step;
+        while last_index + 1 < STATUS_COUNT {
+            let Some(next) = ChunkStatus::from_index(last_index + 1) else {
+                break;
+            };
+            let next_step = *GENERATION_PYRAMID.get_step_to(next);
+            if !can_fuse(&previous, &next_step) {
+                break;
+            }
+            last_index += 1;
+            previous = next_step;
+        }
+
+        let Some(last) = ChunkStatus::from_index(last_index) else {
+            panic!("run end index must decode")
+        };
+        let ring = first_step.direct_dependencies;
+        let mut halo_radius = ring.get_radius();
+        let light_index = ChunkStatus::Light.get_index();
+        if index <= light_index && light_index <= last_index && halo_radius < LIGHT_HALO_RADIUS {
+            halo_radius = LIGHT_HALO_RADIUS;
+        }
+
+        plans[index] = RunPlan {
+            first,
+            last,
+            ring,
+            halo_radius,
+        };
+        index += 1;
+    }
+
+    plans
 }
 
 /// Represents the hierarchy and dependencies for chunk generation or loading.
@@ -542,5 +654,229 @@ mod fusion_tests {
             GENERATION_PYRAMID.get_step_to(ChunkStatus::InitializeLight),
             GENERATION_PYRAMID.get_step_to(ChunkStatus::Light),
         ));
+    }
+}
+
+#[cfg(test)]
+mod run_plan_tests {
+    use super::{
+        ChunkStatus, GENERATION_PYRAMID, LIGHT_HALO_RADIUS, RUN_PLANS, STATUS_COUNT,
+    };
+    use crate::chunk::chunk_ticket_manager::{ChunkTicketLevel, generation_status};
+
+    fn statuses() -> impl Iterator<Item = ChunkStatus> {
+        (0..STATUS_COUNT).filter_map(ChunkStatus::from_index)
+    }
+
+    /// A1 -- waits go strictly down the status chain, so they cannot cycle.
+    ///
+    /// This is the deadlock-freedom theorem for the whole per-holder model. If
+    /// every cross-chunk requirement of a run is for a status strictly below
+    /// the one the run produces, then a wait edge always points down a
+    /// 12-element chain. `Empty` has no requirements at all, so some holder is
+    /// always dispatchable and the system cannot come to rest with work left.
+    #[test]
+    fn cross_chunk_requirements_are_strictly_below_the_run() {
+        for status in statuses() {
+            let plan = &RUN_PLANS[status.get_index()];
+            for distance in 1..=plan.ring.get_radius() {
+                let Some(required) = plan.ring.get(distance) else {
+                    continue;
+                };
+                assert!(
+                    required.get_index() < plan.first.get_index(),
+                    "{:?} needs {required:?} at distance {distance}, which is not strictly \
+                     below it -- a wait edge that does not descend can close a cycle",
+                    plan.first,
+                );
+            }
+        }
+    }
+
+    /// A2 -- the first step's ring dominates every step in its run.
+    ///
+    /// This is what licenses resolving one halo and taking one dependency wait
+    /// for a whole fused run instead of re-checking between steps.
+    #[test]
+    fn the_first_steps_ring_dominates_the_whole_run() {
+        for status in statuses() {
+            let plan = &RUN_PLANS[status.get_index()];
+            for index in plan.first.get_index()..=plan.last.get_index() {
+                let member = ChunkStatus::from_index(index).expect("run member decodes");
+                let step = GENERATION_PYRAMID.get_step_to(member);
+                for dependency in statuses() {
+                    assert!(
+                        step.direct_dependencies.get_radius_of(dependency)
+                            <= plan.ring.get_radius_of(dependency),
+                        "run starting at {:?}: {member:?} needs {dependency:?} further out \
+                         than the run's ring provides",
+                        plan.first,
+                    );
+                }
+            }
+        }
+    }
+
+    /// A3 -- a halo chunk is always allowed to reach what its neighbours need.
+    ///
+    /// Ticket level `FULL + k` allows exactly `generation_status(FULL + k)`. A
+    /// chunk at distance `d` from it sits at level `FULL + k + d`. This asserts
+    /// that what that neighbour is allowed to reach is at least what the run at
+    /// `FULL + k` requires of distance `d`.
+    ///
+    /// This was previously only an empirical claim -- instrumenting the working
+    /// scheduler over a 301x301 pregeneration counted zero violations. This
+    /// makes it a property of the tables instead of a property of one run.
+    #[test]
+    fn every_ring_cell_is_allowed_to_reach_what_the_run_needs_of_it() {
+        let span = usize::from(ChunkTicketLevel::MAX.raw() - ChunkTicketLevel::FULL_CHUNK.raw());
+        for offset in 0..=span {
+            let raw = ChunkTicketLevel::FULL_CHUNK.raw() + offset as u8;
+            let Some(level) = ChunkTicketLevel::new(raw) else {
+                continue;
+            };
+            let Some(target) = generation_status(Some(level)) else {
+                continue;
+            };
+            let plan = &RUN_PLANS[target.get_index()];
+
+            for distance in 0..=plan.ring.get_radius() {
+                let Some(required) = plan.ring.get(distance) else {
+                    continue;
+                };
+                let neighbour_raw = raw as usize + distance;
+                let allowed = u8::try_from(neighbour_raw)
+                    .ok()
+                    .and_then(ChunkTicketLevel::new)
+                    .and_then(|level| generation_status(Some(level)));
+                let Some(allowed) = allowed else {
+                    panic!(
+                        "a chunk at level {raw} running {target:?} needs distance {distance} at \
+                         {required:?}, but level {neighbour_raw} carries no generation status \
+                         at all -- that cell has no holder"
+                    );
+                };
+                assert!(
+                    allowed.get_index() >= required.get_index(),
+                    "a chunk at level {raw} running {target:?} needs distance {distance} at \
+                     {required:?}, but level {neighbour_raw} is only allowed {allowed:?}"
+                );
+            }
+        }
+    }
+
+    /// A4 -- the ticket span is exactly the pyramid's widest reach.
+    ///
+    /// The boundary rings have no slack, so this pins the two together: widen
+    /// the pyramid without widening the level span and A3 starts failing.
+    #[test]
+    fn the_ticket_level_span_matches_the_pyramids_reach() {
+        let span = usize::from(ChunkTicketLevel::MAX.raw() - ChunkTicketLevel::FULL_CHUNK.raw());
+        assert_eq!(
+            span,
+            GENERATION_PYRAMID
+                .get_step_to(ChunkStatus::Full)
+                .accumulated_dependencies
+                .get_radius_of(ChunkStatus::Empty),
+        );
+    }
+
+    /// A5 -- the halo covers every chunk a run actually reads.
+    ///
+    /// The `Light` assertion is separate and separately messaged because it is
+    /// the one case that fails *silently*: `run_light_stage` fetches its outer
+    /// ring with `try_get` and runs its workset relaxed, so a halo that is one
+    /// short does not panic, it lights the chunk differently.
+    #[test]
+    fn the_halo_covers_every_chunk_a_run_reads() {
+        for status in statuses() {
+            let plan = &RUN_PLANS[status.get_index()];
+            for index in plan.first.get_index()..=plan.last.get_index() {
+                let member = ChunkStatus::from_index(index).expect("run member decodes");
+                let step = GENERATION_PYRAMID.get_step_to(member);
+                assert!(
+                    plan.halo_radius >= step.direct_dependencies.get_radius(),
+                    "run starting at {:?} resolves a halo of radius {}, but {member:?} reads \
+                     out to {}",
+                    plan.first,
+                    plan.halo_radius,
+                    step.direct_dependencies.get_radius(),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_light_run_keeps_its_five_by_five_window() {
+        let plan = &RUN_PLANS[ChunkStatus::Light.get_index()];
+        assert_eq!(
+            plan.halo_radius, LIGHT_HALO_RADIUS,
+            "the light stage reads a 5x5 chunk window opportunistically with try_get; a smaller \
+             halo does not fail, it silently treats the outer ring as empty and changes the \
+             lighting output",
+        );
+        assert!(plan.contains(ChunkStatus::Light));
+    }
+
+    /// A6 -- every status a ticket level can allow is the END of a run.
+    ///
+    /// This is what makes truncating a run at the allowed status dead code in
+    /// production: a holder is never allowed to stop half way through a run.
+    #[test]
+    fn every_allowed_status_is_a_run_terminal() {
+        let span = usize::from(ChunkTicketLevel::MAX.raw() - ChunkTicketLevel::FULL_CHUNK.raw());
+        for offset in 0..=span {
+            let raw = ChunkTicketLevel::FULL_CHUNK.raw() + offset as u8;
+            let Some(level) = ChunkTicketLevel::new(raw) else {
+                continue;
+            };
+            let Some(allowed) = generation_status(Some(level)) else {
+                continue;
+            };
+            let plan = &RUN_PLANS[allowed.get_index()];
+            assert_eq!(
+                plan.last, allowed,
+                "level {raw} allows {allowed:?}, which is not the last status of its run \
+                 (run is {:?}..={:?}) -- a holder would have to stop mid-run",
+                plan.first, plan.last,
+            );
+        }
+    }
+
+    /// A7 -- `RUN_PLANS` reproduces the fused run list.
+    #[test]
+    fn run_plans_agree_with_the_pinned_fusion_list() {
+        let mut runs: Vec<Vec<ChunkStatus>> = Vec::new();
+        let mut index = 0;
+        while index < STATUS_COUNT {
+            let status = ChunkStatus::from_index(index).expect("status decodes");
+            let plan = &RUN_PLANS[index];
+            assert_eq!(plan.first, status);
+            let members: Vec<ChunkStatus> = (plan.first.get_index()..=plan.last.get_index())
+                .filter_map(ChunkStatus::from_index)
+                .collect();
+            runs.push(members);
+            index = plan.last.get_index() + 1;
+        }
+
+        assert_eq!(
+            runs,
+            vec![
+                vec![ChunkStatus::Empty],
+                vec![ChunkStatus::StructureStarts],
+                vec![ChunkStatus::StructureReferences, ChunkStatus::Biomes],
+                vec![
+                    ChunkStatus::Noise,
+                    ChunkStatus::Surface,
+                    ChunkStatus::Carvers
+                ],
+                vec![ChunkStatus::Features, ChunkStatus::InitializeLight],
+                vec![
+                    ChunkStatus::Light,
+                    ChunkStatus::Spawn,
+                    ChunkStatus::Full
+                ],
+            ],
+        );
     }
 }
