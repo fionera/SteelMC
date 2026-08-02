@@ -221,18 +221,36 @@ Headless pregeneration benchmark.
     );
 }
 
-/// Peak resident set size in MiB, as the kernel has tracked it since startup.
+/// Reads a MiB value out of `/proc/self/status`.
 ///
-/// Reported because a scheduler change's failure mode is often memory, not
-/// speed: a model that lets blocked chunks accumulate live state shows up here
-/// long before it shows up in chunks/s. One such attempt reached 13.6 GiB
-/// against a normal 8.4 GiB peak, and the throughput number simply never
-/// arrived because no repetition finished.
-fn peak_rss_mib() -> Option<u64> {
+/// Memory is reported because a scheduler change's failure mode is often memory
+/// rather than speed: a model that lets blocked chunks accumulate live state
+/// shows up here long before it shows up in chunks/s. One such attempt reached
+/// 13.6 GiB against a normal 8.4 GiB peak, and the throughput number never
+/// arrived at all because no repetition finished.
+///
+/// **`peak` is process-lifetime and does not reset between repetitions**, and
+/// with the allocator's purge disabled ([`tune_for_throughput`]) freed memory is
+/// never returned to the OS, so it climbs across repetitions as each world is
+/// built and torn down -- 8.5 GiB to 17 GiB over five, against a flat 7.9 GiB
+/// with purging left on. That is the allocator holding pages, not a leak. Use
+/// `--reps 1` when comparing peak memory between builds, and read `now` for
+/// whether a repetition actually released what it allocated.
+fn proc_status_mib(field: &str) -> Option<u64> {
     let status = fs::read_to_string("/proc/self/status").ok()?;
-    let line = status.lines().find(|line| line.starts_with("VmHWM:"))?;
+    let line = status.lines().find(|line| line.starts_with(field))?;
     let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
     Some(kib / 1024)
+}
+
+/// Peak resident set size in MiB, as the kernel has tracked it since startup.
+fn peak_rss_mib() -> Option<u64> {
+    proc_status_mib("VmHWM:")
+}
+
+/// Resident set size right now, in MiB.
+fn current_rss_mib() -> Option<u64> {
+    proc_status_mib("VmRSS:")
 }
 
 fn ensure_globals() {
@@ -502,8 +520,11 @@ fn main() {
 
         let rate = total_chunks / elapsed.as_secs_f64();
         rates.push(rate);
-        let peak = peak_rss_mib()
-            .map_or_else(String::new, |mib| format!("  peak RSS {mib} MiB"));
+        let peak = match (peak_rss_mib(), current_rss_mib()) {
+            (Some(peak), Some(now)) => format!("  RSS {now} MiB (peak {peak})"),
+            (Some(peak), None) => format!("  peak RSS {peak} MiB"),
+            _ => String::new(),
+        };
         println!(
             "  rep {}: {:.2}s  {rate:.1} chunks/s{peak}",
             rep + 1,
