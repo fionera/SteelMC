@@ -79,8 +79,13 @@ trait BenchmarkChunkGeneratorExt: ChunkGenerator {
         generation_benchmark_support::fill_from_noise(self, chunk, beardifier);
     }
 
-    fn benchmark_build_surface(&self, chunk: &Chunk, neighbor_biomes: &dyn Fn(IVec3) -> u16) {
-        generation_benchmark_support::build_surface(self, chunk, neighbor_biomes);
+    fn benchmark_build_surface(
+        &self,
+        chunk: &Chunk,
+        neighbor_biomes: &dyn Fn(IVec3) -> u16,
+        ring_contains_any: &dyn Fn(&[u16]) -> bool,
+    ) {
+        generation_benchmark_support::build_surface(self, chunk, neighbor_biomes, ring_contains_any);
     }
 
     fn benchmark_apply_carvers(&self, chunk: &Chunk) {
@@ -146,6 +151,30 @@ fn self_neighbor_biomes(chunk: &Chunk) -> impl Fn(IVec3) -> u16 + '_ {
             .read()
             .biomes
             .get(local_qx, local_qy, local_qz)
+    }
+}
+
+/// Answers the surface stage's neighbourhood biome probe from the bench chunk.
+///
+/// Real generation asks whether any biome in `wanted` appears anywhere in the
+/// ring of neighbours, which lets the surface rules drop to a specialized band.
+/// Single-chunk benchmarks have no neighbours, so -- exactly as
+/// [`self_neighbor_biomes`] does -- the question is answered from the center
+/// chunk itself. Answering `true` unconditionally would be the other option,
+/// but that pins the stage to the general rule and would stop the benchmark
+/// from measuring the specialization at all.
+fn self_ring_contains_any(chunk: &Chunk) -> impl Fn(&[u16]) -> bool + '_ {
+    let sections = chunk.sections();
+
+    move |wanted: &[u16]| -> bool {
+        sections.sections.iter().any(|section| {
+            let guard = section.read();
+            (0..4).any(|qx| {
+                (0..4).any(|qy| {
+                    (0..4).any(|qz| wanted.contains(&guard.biomes.get(qx, qy, qz)))
+                })
+            })
+        })
     }
 }
 
@@ -290,7 +319,11 @@ fn bench_overworld_surface(c: &mut Criterion) {
             },
             |chunk| {
                 let neighbor_biomes = self_neighbor_biomes(&chunk);
-                generator.benchmark_build_surface(black_box(&chunk), &neighbor_biomes);
+                generator.benchmark_build_surface(
+                    black_box(&chunk),
+                    &neighbor_biomes,
+                    &self_ring_contains_any(&chunk),
+                );
             },
             criterion::BatchSize::SmallInput,
         );
@@ -313,7 +346,11 @@ fn bench_nether_surface(c: &mut Criterion) {
             },
             |chunk| {
                 let neighbor_biomes = self_neighbor_biomes(&chunk);
-                generator.benchmark_build_surface(black_box(&chunk), &neighbor_biomes);
+                generator.benchmark_build_surface(
+                    black_box(&chunk),
+                    &neighbor_biomes,
+                    &self_ring_contains_any(&chunk),
+                );
             },
             criterion::BatchSize::SmallInput,
         );
@@ -336,7 +373,11 @@ fn bench_end_surface(c: &mut Criterion) {
             },
             |chunk| {
                 let neighbor_biomes = self_neighbor_biomes(&chunk);
-                generator.benchmark_build_surface(black_box(&chunk), &neighbor_biomes);
+                generator.benchmark_build_surface(
+                    black_box(&chunk),
+                    &neighbor_biomes,
+                    &self_ring_contains_any(&chunk),
+                );
             },
             criterion::BatchSize::SmallInput,
         );
@@ -388,7 +429,11 @@ fn bench_overworld_carvers(c: &mut Criterion) {
                 generator.benchmark_fill_from_noise(&chunk, None);
                 {
                     let neighbor_biomes = self_neighbor_biomes(&chunk);
-                    generator.benchmark_build_surface(&chunk, &neighbor_biomes);
+                    generator.benchmark_build_surface(
+                    &chunk,
+                    &neighbor_biomes,
+                    &self_ring_contains_any(&chunk),
+                );
                 }
                 chunk
             },
@@ -414,7 +459,11 @@ fn bench_nether_carvers(c: &mut Criterion) {
                 generator.benchmark_fill_from_noise(&chunk, None);
                 {
                     let neighbor_biomes = self_neighbor_biomes(&chunk);
-                    generator.benchmark_build_surface(&chunk, &neighbor_biomes);
+                    generator.benchmark_build_surface(
+                    &chunk,
+                    &neighbor_biomes,
+                    &self_ring_contains_any(&chunk),
+                );
                 }
                 chunk
             },
@@ -440,7 +489,11 @@ fn bench_end_carvers(c: &mut Criterion) {
                 generator.benchmark_fill_from_noise(&chunk, None);
                 {
                     let neighbor_biomes = self_neighbor_biomes(&chunk);
-                    generator.benchmark_build_surface(&chunk, &neighbor_biomes);
+                    generator.benchmark_build_surface(
+                    &chunk,
+                    &neighbor_biomes,
+                    &self_ring_contains_any(&chunk),
+                );
                 }
                 chunk
             },
@@ -466,7 +519,11 @@ fn make_chunk_through_carvers(
     generator.benchmark_fill_from_noise(&chunk, None);
     {
         let neighbor_biomes = self_neighbor_biomes(&chunk);
-        generator.benchmark_build_surface(&chunk, &neighbor_biomes);
+        generator.benchmark_build_surface(
+                    &chunk,
+                    &neighbor_biomes,
+                    &self_ring_contains_any(&chunk),
+                );
     }
     generator.benchmark_apply_carvers(&chunk);
     chunk
@@ -1763,7 +1820,11 @@ fn bench_overworld_full(c: &mut Criterion) {
             generator.benchmark_fill_from_noise(&chunk, None);
             {
                 let neighbor_biomes = self_neighbor_biomes(&chunk);
-                generator.benchmark_build_surface(&chunk, &neighbor_biomes);
+                generator.benchmark_build_surface(
+                    &chunk,
+                    &neighbor_biomes,
+                    &self_ring_contains_any(&chunk),
+                );
             }
             generator.benchmark_apply_carvers(&chunk);
         });
@@ -1783,7 +1844,11 @@ fn bench_nether_full(c: &mut Criterion) {
             generator.benchmark_fill_from_noise(&chunk, None);
             {
                 let neighbor_biomes = self_neighbor_biomes(&chunk);
-                generator.benchmark_build_surface(&chunk, &neighbor_biomes);
+                generator.benchmark_build_surface(
+                    &chunk,
+                    &neighbor_biomes,
+                    &self_ring_contains_any(&chunk),
+                );
             }
             generator.benchmark_apply_carvers(&chunk);
         });
@@ -1803,7 +1868,11 @@ fn bench_end_full(c: &mut Criterion) {
             generator.benchmark_fill_from_noise(&chunk, None);
             {
                 let neighbor_biomes = self_neighbor_biomes(&chunk);
-                generator.benchmark_build_surface(&chunk, &neighbor_biomes);
+                generator.benchmark_build_surface(
+                    &chunk,
+                    &neighbor_biomes,
+                    &self_ring_contains_any(&chunk),
+                );
             }
             generator.benchmark_apply_carvers(&chunk);
         });
