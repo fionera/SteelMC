@@ -130,18 +130,35 @@ struct EpochCost {
     process_unloads: Duration,
     readiness_reconcile: Duration,
     lifecycle_commit: Duration,
+    readiness_demotions: Duration,
+    block_entity_unloads: Duration,
+    ticking_snapshot_rebuild: Duration,
     worst_epoch: Duration,
+    /// Worst single occurrence of each phase, in the same order as the log.
+    /// The mean epoch is far below the pool's drain time, so it is the tail that
+    /// starves the generation pool and the tail that has to be attributed.
+    worst_phases: [Duration; 9],
     scheduled: usize,
+    /// Largest single epoch's scheduling batch, which is what the tail measures.
+    worst_scheduled_batch: usize,
+    ticking_chunks: usize,
 }
 
 impl EpochCost {
     fn record(&mut self, timings: &ChunkMapSchedulingTimings) {
+        // Every phase, not a subset. Three of these used to be left out, which
+        // made both the per-phase shares and `worst_epoch` undercounts -- and
+        // hid the snapshot rebuild entirely, which is a full scan of the holder
+        // map on every boundary.
         let total = timings.ticket_updates
             + timings.schedule_generation
             + timings.run_generation
             + timings.process_unloads
             + timings.readiness_reconcile
-            + timings.lifecycle_commit;
+            + timings.lifecycle_commit
+            + timings.readiness_demotions
+            + timings.block_entity_unloads
+            + timings.ticking_snapshot_rebuild;
         if total.is_zero() {
             return;
         }
@@ -152,25 +169,89 @@ impl EpochCost {
         self.process_unloads += timings.process_unloads;
         self.readiness_reconcile += timings.readiness_reconcile;
         self.lifecycle_commit += timings.lifecycle_commit;
+        self.readiness_demotions += timings.readiness_demotions;
+        self.block_entity_unloads += timings.block_entity_unloads;
+        self.ticking_snapshot_rebuild += timings.ticking_snapshot_rebuild;
         self.scheduled += timings.scheduled_count;
+        self.worst_scheduled_batch = self.worst_scheduled_batch.max(timings.scheduled_count);
+        self.ticking_chunks = self.ticking_chunks.max(timings.rebuilt_ticking_chunk_count);
+        for (worst, phase) in self.worst_phases.iter_mut().zip([
+            timings.ticket_updates,
+            timings.schedule_generation,
+            timings.run_generation,
+            timings.process_unloads,
+            timings.readiness_reconcile,
+            timings.lifecycle_commit,
+            timings.readiness_demotions,
+            timings.block_entity_unloads,
+            timings.ticking_snapshot_rebuild,
+        ]) {
+            *worst = (*worst).max(phase);
+        }
         self.worst_epoch = self.worst_epoch.max(total);
     }
 
     fn log(&self, elapsed: Duration) {
         let pct = |part: Duration| part.as_secs_f64() / elapsed.as_secs_f64() * 100.0;
+        let total = self.ticket_updates
+            + self.schedule_generation
+            + self.run_generation
+            + self.process_unloads
+            + self.readiness_reconcile
+            + self.lifecycle_commit
+            + self.readiness_demotions
+            + self.block_entity_unloads
+            + self.ticking_snapshot_rebuild;
         log::info!(
-            "Scheduling epochs: {} epochs, {} chunks scheduled, worst epoch {:.1}ms | \
-             share of wall clock: tickets {:.1}%, schedule {:.1}%, refill {:.1}%, unloads {:.1}%, \
-             readiness {:.1}%, lifecycle {:.1}%",
+            "Scheduling epochs: {} epochs, {} chunks scheduled, peak {} ticking chunks, \
+             worst epoch {:.1}ms, all phases {:.1}% of wall clock | \
+             tickets {:.1}%, schedule {:.1}%, refill {:.1}%, unloads {:.1}%, \
+             readiness {:.1}%, lifecycle {:.1}%, demotions {:.1}%, block-entities {:.1}%, \
+             ticking-snapshot {:.1}%",
             self.epochs,
             self.scheduled,
+            self.ticking_chunks,
             self.worst_epoch.as_secs_f64() * 1000.0,
+            pct(total),
             pct(self.ticket_updates),
             pct(self.schedule_generation),
             pct(self.run_generation),
             pct(self.process_unloads),
             pct(self.readiness_reconcile),
             pct(self.lifecycle_commit),
+            pct(self.readiness_demotions),
+            pct(self.block_entity_unloads),
+            pct(self.ticking_snapshot_rebuild),
+        );
+        let names = [
+            "tickets",
+            "schedule",
+            "refill",
+            "unloads",
+            "readiness",
+            "lifecycle",
+            "demotions",
+            "block-entities",
+            "ticking-snapshot",
+        ];
+        let mut worst: Vec<String> = names
+            .iter()
+            .zip(self.worst_phases)
+            .map(|(name, phase)| format!("{name} {:.1}ms", phase.as_secs_f64() * 1000.0))
+            .collect();
+        worst.sort_by(|left, right| right.len().cmp(&left.len()));
+        log::info!(
+            "Scheduling epochs: mean epoch {:.2}ms, mean batch {} holders, worst batch {} holders \
+             | worst single phase: {}",
+            total.as_secs_f64() * 1000.0 / self.epochs.max(1) as f64,
+            self.scheduled / self.epochs.max(1) as usize,
+            self.worst_scheduled_batch,
+            names
+                .iter()
+                .zip(self.worst_phases)
+                .map(|(name, phase)| format!("{name} {:.1}ms", phase.as_secs_f64() * 1000.0))
+                .collect::<Vec<_>>()
+                .join(", "),
         );
     }
 }

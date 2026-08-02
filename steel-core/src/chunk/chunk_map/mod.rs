@@ -256,6 +256,12 @@ pub struct ChunkMap {
     ticking_chunks: ArcSwap<TickingChunkSnapshot>,
     /// Final-unload callbacks waiting for the serialized lifecycle boundary.
     finalized_block_entity_unloads: SyncMutex<Vec<FinalizedBlockEntityUnload>>,
+    /// Holders admitted but not yet turned into generation tasks.
+    ///
+    /// Scheduling is bounded per epoch, so a large admission batch is spread over
+    /// several epochs instead of being done in one serialized phase. See
+    /// `SCHEDULE_GENERATION_BUDGET`.
+    pending_schedule_backlog: SyncMutex<Vec<Arc<ChunkHolder>>>,
     /// Timed gameplay ticket owners that expire through the game tick.
     timed_chunk_tickets: SyncMutex<TimedChunkTickets>,
     /// The world generation context.
@@ -396,6 +402,7 @@ impl ChunkMap {
             full_neighborhood: SyncMutex::new(FullNeighborhoodIndex::default()),
             ticking_chunks: ArcSwap::from_pointee(TickingChunkSnapshot::default()),
             finalized_block_entity_unloads: SyncMutex::new(Vec::new()),
+            pending_schedule_backlog: SyncMutex::new(Vec::new()),
             timed_chunk_tickets: SyncMutex::new(timed_chunk_tickets),
             world_gen_context: Arc::new(WorldGenContext::new(
                 generator,
@@ -1131,6 +1138,64 @@ impl ChunkMap {
         ));
     }
 
+    /// Turns admitted holders into generation tasks, bounded by a time budget.
+    ///
+    /// Admission arrives in bursts: a pregeneration window activating admits tens
+    /// of thousands of holders at once, and turning all of them into tasks in one
+    /// serialized phase is what produces the epoch tail. Measured over a 601x601
+    /// pregeneration, the mean batch is 167 holders but the worst is 23,908, and
+    /// that one batch took 124 ms against a 5 ms mean epoch -- while the
+    /// generation pool drains in about 18 ms, so the pool sat empty behind it.
+    ///
+    /// A budget rather than a fixed count, because the thing being bounded is
+    /// latency, and the right count depends on the machine. Whatever does not fit
+    /// is carried to the next epoch; epochs run continuously, and the pending
+    /// task queue is thousands deep, so deferring costs nothing that the pool
+    /// notices.
+    ///
+    /// The level is re-read from the holder rather than carried with it. It is
+    /// authoritative -- `update_chunk_level` has already applied it -- and a
+    /// holder that was unloaded while waiting reads `None` and is skipped.
+    fn schedule_admitted_holders(
+        self: &Arc<Self>,
+        admitted: Vec<(Arc<ChunkHolder>, ChunkTicketLevel)>,
+        start: Instant,
+    ) -> usize {
+        /// How long one epoch may spend creating generation tasks.
+        const SCHEDULE_GENERATION_BUDGET: Duration = Duration::from_millis(2);
+        /// Holders scheduled between deadline checks.
+        const BUDGET_CHECK_INTERVAL: usize = 64;
+
+        let mut queue = mem::take(&mut *self.pending_schedule_backlog.lock());
+        // Carried-over holders first, so nothing is starved by a steady arrival
+        // of new admissions.
+        queue.extend(admitted.into_iter().map(|(holder, _)| holder));
+
+        let mut scheduled = 0;
+        let mut processed = 0;
+        for holder in &queue {
+            if processed % BUDGET_CHECK_INTERVAL == 0
+                && processed != 0
+                && start.elapsed() >= SCHEDULE_GENERATION_BUDGET
+            {
+                break;
+            }
+            processed += 1;
+            if let Some(status) = generation_status(holder.load_level())
+                && holder.schedule_chunk_generation_task_b(status, self)
+            {
+                scheduled += 1;
+            }
+        }
+
+        if processed < queue.len() {
+            queue.drain(..processed);
+            *self.pending_schedule_backlog.lock() = queue;
+        }
+
+        scheduled
+    }
+
     #[instrument(level = "trace", skip(self, ticket_manager, holders_to_schedule))]
     fn prepare_scheduling_epoch(
         self: &Arc<Self>,
@@ -1155,15 +1220,7 @@ impl ChunkMap {
         {
             let _span = tracing::trace_span!("schedule_generation").entered();
             let start = Instant::now();
-            timings.scheduled_count = holders_to_schedule
-                .iter()
-                .filter(|(holder, level)| {
-                    let Some(status) = generation_status(Some(*level)) else {
-                        return false;
-                    };
-                    holder.schedule_chunk_generation_task_b(status, self)
-                })
-                .count();
+            timings.scheduled_count = self.schedule_admitted_holders(holders_to_schedule, start);
             timings.schedule_generation = start.elapsed();
         }
 
