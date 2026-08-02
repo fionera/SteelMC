@@ -3,7 +3,10 @@ mod broadcasting;
 /// Tick-polled server jobs.
 pub mod jobs;
 mod packet_processor;
+#[cfg(not(feature = "benchmark-support"))]
 mod pregen;
+#[cfg(feature = "benchmark-support")]
+pub mod pregen;
 /// The registry cache for the server.
 pub mod registry_cache;
 mod run_loop;
@@ -196,7 +199,19 @@ fn configured_chunk_generation_threads(configured_threads: Option<usize>) -> usi
 /// Only the large end is measured. A small machine's other pools have fixed
 /// floors rather than fractions, so it ends up more oversubscribed than this
 /// ratio suggests; the cutoff below keeps the very small cases out of it.
+#[cfg(not(feature = "benchmark-support"))]
 pub(crate) fn default_chunk_generation_threads(available_threads: usize) -> usize {
+    default_chunk_generation_threads_impl(available_threads)
+}
+
+/// Exposed for the pregeneration benchmark, which has to size its pool exactly
+/// as the server would or its numbers are not comparable.
+#[cfg(feature = "benchmark-support")]
+pub fn default_chunk_generation_threads(available_threads: usize) -> usize {
+    default_chunk_generation_threads_impl(available_threads)
+}
+
+fn default_chunk_generation_threads_impl(available_threads: usize) -> usize {
     let available = available_threads.max(1);
     if available <= 4 {
         available

@@ -453,6 +453,60 @@ impl Server {
     }
 }
 
+/// Runs one pregeneration pass with every parameter supplied explicitly.
+///
+/// The server path takes its parameters from the `PREGEN_*` environment
+/// variables and needs a fully built [`Server`], which binds a listener as soon
+/// as it starts. This entry point takes a bare world instead, so a benchmark can
+/// drive the real scheduler -- tickets, epochs, generation, unload and save --
+/// without a network port to contend for or a shared save directory to collide
+/// over. Everything below it is the production path, unchanged.
+///
+/// `window_size` and `active_window_limit` default to the server's values when
+/// `None`. Returns the wall time of the pass, or `None` if it was cancelled.
+///
+/// # Errors
+/// Returns an error if `side_length` is not a positive odd integer, or if the
+/// window size and pipeline depth exceed the unload-backpressure budget.
+#[cfg(feature = "benchmark-support")]
+pub async fn pregen_area_for_benchmark(
+    world: &Arc<World>,
+    center_chunk: ChunkPos,
+    side_length: i32,
+    window_size: Option<i32>,
+    active_window_limit: Option<usize>,
+    cancel_token: &CancellationToken,
+) -> Result<Option<Duration>, String> {
+    let Some(pregen_size) = PregenSize::from_side_length(side_length)? else {
+        return Ok(Some(Duration::ZERO));
+    };
+    let active_windows = active_window_limit.unwrap_or(DEFAULT_PREGEN_ACTIVE_WINDOWS);
+    if active_windows == 0 {
+        return Err("active window limit must be a positive integer".to_owned());
+    }
+    let backpressure =
+        UnloadBackpressure::from_high(default_pregen_unload_backpressure_high(active_windows));
+    let window_size = check_pregen_window_budget(
+        window_size.unwrap_or(DEFAULT_PREGEN_WINDOW_SIZE),
+        active_windows,
+        backpressure,
+    )?;
+
+    let start = Instant::now();
+    let completed = generate_pregen(
+        world,
+        center_chunk,
+        pregen_size,
+        window_size,
+        active_windows,
+        backpressure,
+        cancel_token,
+    )
+    .await;
+
+    Ok(completed.then(|| start.elapsed()))
+}
+
 fn get_pregen_size() -> Result<Option<PregenSize>, String> {
     let side_length = match env::var(PREGEN_SIZE_ENV) {
         Ok(value) => value
