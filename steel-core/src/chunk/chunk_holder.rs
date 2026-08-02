@@ -2295,6 +2295,11 @@ mod tests {
     /// entry that counted would pin the holder in `unloading_chunks` forever.
     #[test]
     fn a_queued_holder_is_not_kept_alive_by_the_inbox() {
+        // Holds the counter lock despite asserting on no gauge: it builds a
+        // `DependencyWaiter`, which moves the process-wide live-registration
+        // count, and that count straddles the sampling windows of the delta
+        // tests above. Without this those three fail intermittently.
+        let _lock = COUNTER_LOCK.lock();
         init_chunk_test_registry();
         let inbox = Arc::new(GenerationInbox::default());
         let parent = Arc::new(ChunkHolder::new_with_map_sinks(
