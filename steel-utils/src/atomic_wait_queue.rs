@@ -164,8 +164,9 @@ impl<T> AtomicWaitQueue<T> {
 
     /// Raises the status and hands every newly satisfied payload to `notify`.
     ///
-    /// Waiters that need a later status are put back. Panics in debug builds if
-    /// the status would move backwards, which the callers rely on.
+    /// Waiters that need a later status are put back. A raise that does not
+    /// exceed the current status does nothing, so racing raisers are safe in
+    /// either order.
     pub fn advance_and_notify<F>(&self, new_status: u16, notify: F)
     where
         F: FnMut(T),
@@ -206,17 +207,22 @@ impl<T> AtomicWaitQueue<T> {
     }
 
     /// Atomically publishes `new_status` and takes the whole waiter list.
+    ///
+    /// A raise to a status at or below the current one takes nothing and
+    /// publishes nothing. Everything such a raise would satisfy was already
+    /// satisfied by the status that is there -- a waiter needing less than the
+    /// current status never joins the list, because `wait` hands it straight
+    /// back -- and waiters needing more are still queued for whoever gets there.
+    ///
+    /// This is what lets concurrent raisers disagree about order. Callers guard
+    /// with a load-then-raise that two threads can pass at once, so the raises
+    /// can arrive in either order; without this the lower one would publish its
+    /// status over the higher one's and the queue would go backwards.
     fn swap_in_status(&self, new_status: u16) -> *mut Node<T> {
         let mut current = self.head.load(Ordering::Acquire);
         loop {
             let (status, head) = Self::unpack(current);
-            debug_assert!(
-                status == CANCELLED_STATUS
-                    || new_status == CANCELLED_STATUS
-                    || new_status >= status,
-                "status must not move backwards: {status} -> {new_status}"
-            );
-            if status == CANCELLED_STATUS {
+            if status == CANCELLED_STATUS || new_status <= status {
                 return ptr::null_mut();
             }
 
