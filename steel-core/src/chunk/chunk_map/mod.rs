@@ -103,8 +103,29 @@ static GENERATION_THREAD_MULTIPLE: LazyLock<usize> = LazyLock::new(|| {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|&multiple| multiple > 0)
-        .unwrap_or(2)
+        .unwrap_or_else(default_generation_thread_multiple)
 });
+
+/// In-flight generation units per generation thread, when unset.
+///
+/// The two dispatchers need very different values because the unit a permit
+/// buys is not the same. Under the task model a permit covers a whole chunk's
+/// halo walk, which stays admitted from `Empty` to `Full`; two per thread is its
+/// measured optimum and raising it does not help (601x601: 9,867 at 2 against
+/// 9,663 at 8).
+///
+/// Under the per-holder drive a permit covers only the runs a chunk can make
+/// *right now*: a holder that parks on its dependencies returns its permit and
+/// takes a fresh one when it wakes. The same number therefore buys far less
+/// in-flight work, and the pool runs dry -- which is exactly what the first
+/// measurements of the drive showed, with rayon workers stealing and parking
+/// more. Re-swept at 601x601: 2 -> 9,316, 8 -> 10,127, 12 -> 10,146,
+/// **24 -> 10,389**, 32 -> 10,245, 48 -> 10,047. Flat either side of the peak,
+/// and 24 is chosen over 32 because it holds less in flight for the same
+/// throughput.
+fn default_generation_thread_multiple() -> usize {
+    if *STAGE1 { 24 } else { 2 }
+}
 
 /// Selects the per-holder generation drive over the per-chunk task scheduler.
 ///
