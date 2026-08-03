@@ -3,7 +3,10 @@ use futures::Future;
 use rustc_hash::FxHashSet;
 use std::fmt::Debug;
 use std::mem;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::ptr;
+use std::sync::atomic::{
+    AtomicBool, AtomicI64, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+};
 use std::sync::{Arc, OnceLock, Weak};
 use steel_utils::atomic_wait_queue::{AtomicWaitQueue, WaitOutcome};
 use steel_utils::{BlockPos, ChunkPos, PackedSectionBlockPos, SectionPos, locks::SyncMutex};
@@ -20,12 +23,12 @@ use std::time::Duration;
 pub static SLOW_CHUNK_GEN: AtomicBool = AtomicBool::new(false);
 
 use crate::chunk::chunk_generation_task::{NeighborReady, StaticCache2D};
-use crate::chunk::chunk_map::GenerationInbox;
+use crate::chunk::chunk_map::{GenerationInbox, STAGE1};
 use crate::chunk::chunk_ticket_manager::{
     ChunkTicketLevel, generation_status, is_entity_ticking, is_full,
 };
 use crate::chunk::full_chunk_readiness::FullPublicationQueue;
-use crate::chunk::generation_drive::{DecOutcome, GenerationDrive};
+use crate::chunk::generation_drive::{DecOutcome, DrivePhase, GenerationDrive};
 use crate::chunk::light::{
     LightLayer, LightSectionRange, LightWorkWindowGate, LightWorkWindowReservation,
 };
@@ -44,6 +47,10 @@ use crate::{
 };
 
 const STATUS_NONE: u8 = u8::MAX;
+/// Values of [`ChunkHolder::drive_gauge`].
+const DRIVE_GAUGE_NONE: u8 = 0;
+const DRIVE_GAUGE_PARKED: u8 = 1;
+const DRIVE_GAUGE_STALLED: u8 = 2;
 const UNPUBLISHED_STATUS: u8 = 0;
 const NO_TICKET_LEVEL: u8 = u8::MAX;
 const SAVE_LIFECYCLE_ACTIVE: u8 = 0;
@@ -159,22 +166,14 @@ pub(crate) static GENERATION_DRIVE_COUNTERS: GenerationDriveCounters =
 
 /// The counters behind [`GENERATION_DRIVE_COUNTERS`].
 ///
-/// The two gauges are signed: they are raised and lowered from different
-/// threads, and an unmatched decrement has to read as `-1` rather than as
-/// `u64::MAX`, which is the difference between "we have a bug" and "the counter
-/// is meaningless".
+/// The gauges are signed: they are raised and lowered from different threads,
+/// and an unmatched decrement has to read as `-1` rather than as `u64::MAX`,
+/// which is the difference between "we have a bug" and "the counter is
+/// meaningless".
 pub(crate) struct GenerationDriveCounters {
     /// Holders currently parked on at least one dependency.
-    #[expect(
-        dead_code,
-        reason = "moved by the drive's park and stall transitions in a follow-up change"
-    )]
     pub(crate) parked_holders: AtomicI64,
     /// Holders currently stalled, i.e. unable to progress until re-armed.
-    #[expect(
-        dead_code,
-        reason = "moved by the drive's park and stall transitions in a follow-up change"
-    )]
     pub(crate) stalled_holders: AtomicI64,
     /// [`DependencyWaiter`]s created and not yet released.
     pub(crate) live_dependency_registrations: AtomicI64,
@@ -185,7 +184,34 @@ pub(crate) struct GenerationDriveCounters {
     /// Parks whose last registration resolved, handing the holder back for
     /// admission.
     pub(crate) drive_wakes: AtomicU64,
+    /// Drive futures dropped before they retired their holder.
+    ///
+    /// Expected to stay at zero outside shutdown: a dropped drive leaves the
+    /// holder's phase at `Running` with nobody inside it, and any work claim it
+    /// held rolls back under a holder nothing will re-admit. That is how the
+    /// first attempt at this scheduler corrupted claims.
+    pub(crate) drive_futures_dropped: AtomicU64,
+    /// Work claims lost to another claimant.
+    ///
+    /// Only counted under the per-holder drive, where it must stay at zero: a
+    /// holder has exactly one driver, so a lost claim means two dispatchers ran
+    /// against the same holder and `claim_status_work` is one step away from
+    /// panicking the server.
+    pub(crate) contended_status_claims: AtomicU64,
+    /// Admission permits currently blocked on the light work-window gate.
+    ///
+    /// See [`ChunkHolder::await_light_work_window_and_apply_step`]: the drive
+    /// deliberately holds its permit across that wait, and this is the gauge
+    /// that says how much admission capacity it costs.
+    pub(crate) permits_waiting_on_light_window: AtomicI64,
+    /// Stalls, indexed by the drive's stall reason.
+    pub(crate) stalls_by_reason: [AtomicU64; STALL_REASON_COUNT],
 }
+
+/// Number of stall reasons the drive distinguishes.
+///
+/// [`StallReason`]: crate::chunk::chunk_map::generation_drive_dispatch::StallReason
+pub(crate) const STALL_REASON_COUNT: usize = 3;
 
 impl GenerationDriveCounters {
     const fn new() -> Self {
@@ -195,6 +221,10 @@ impl GenerationDriveCounters {
             live_dependency_registrations: AtomicI64::new(0),
             dependency_waiters_dropped_unfired: AtomicU64::new(0),
             drive_wakes: AtomicU64::new(0),
+            drive_futures_dropped: AtomicU64::new(0),
+            contended_status_claims: AtomicU64::new(0),
+            permits_waiting_on_light_window: AtomicI64::new(0),
+            stalls_by_reason: [const { AtomicU64::new(0) }; STALL_REASON_COUNT],
         }
     }
 }
@@ -205,13 +235,6 @@ pub(crate) enum StatusWaiter {
     /// An `await_status_with` future.
     Oneshot(oneshot::Sender<()>),
     /// Another holder's parked generation drive.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "registered by the per-holder generation drive in a follow-up change"
-        )
-    )]
     Dependency(DependencyWaiter),
 }
 
@@ -226,10 +249,11 @@ pub(crate) struct DependencyWaiter {
     /// exactly that count to decide a holder is unreferenced -- an earlier
     /// attempt at this scheduler leaked every holder it generated that way.
     parent: Weak<ChunkHolder>,
-    #[expect(
-        dead_code,
-        reason = "read by the drive's park pass in a follow-up change"
-    )]
+    /// Never read: the wait queue itself decides when this fires, from the
+    /// encoded status the registration was filed under. Kept because a waiter
+    /// pulled out of a core dump or a debugger is otherwise anonymous, and the
+    /// question asked of a stuck park is always "waiting for what".
+    #[expect(dead_code, reason = "diagnostic only; see the field comment")]
     required: ChunkStatus,
     /// The park epoch of `parent` this registration belongs to. A release
     /// carrying any other epoch is refused by the drive, so a registration can
@@ -238,13 +262,6 @@ pub(crate) struct DependencyWaiter {
 }
 
 impl DependencyWaiter {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "registered by the per-holder generation drive in a follow-up change"
-        )
-    )]
     pub(crate) fn new(parent: &Arc<ChunkHolder>, required: ChunkStatus, epoch: u64) -> Self {
         GENERATION_DRIVE_COUNTERS
             .live_dependency_registrations
@@ -330,9 +347,21 @@ pub struct ChunkHolder {
     /// added here may either -- a payload drop that took a map lock would do so
     /// while every chunk waiting on the status being published is blocked.
     status: AtomicWaitQueue<StatusWaiter>,
-    /// The per-holder generation state machine. Nothing arms it yet; the
-    /// scheduler that drives it lands separately.
+    /// The per-holder generation state machine. Armed only when
+    /// [`STAGE1`](crate::chunk::chunk_map::STAGE1) selects the per-holder
+    /// dispatcher.
     drive: GenerationDrive,
+    /// Which of the drive gauges this holder is currently counted in.
+    ///
+    /// The gauges have to be exact to be worth anything, and "how many holders
+    /// are parked" cannot be recovered by sampling: the transitions out of
+    /// `Parked` happen on rayon workers that hold no map. So the holder carries
+    /// its own membership and every transition swaps it, which makes the
+    /// increment and the decrement a single owner's business.
+    drive_gauge: AtomicU8,
+    /// Consecutive stalls, for the revival backoff. Reset by a run that
+    /// dispatched work.
+    stall_attempts: AtomicU32,
     status_changed: Notify,
     generation_task: SyncMutex<Option<Arc<ChunkGenerationTask>>>,
     generation_task_target: AtomicU8,
@@ -388,6 +417,27 @@ impl StatusWorkClaim {
 impl Drop for StatusWorkClaim {
     fn drop(&mut self) {
         self.holder.release_status_work_claim(self.status);
+    }
+}
+
+/// Raises [`GenerationDriveCounters::permits_waiting_on_light_window`] for as
+/// long as it is held.
+struct LightWindowWaitGauge;
+
+impl LightWindowWaitGauge {
+    fn new() -> Self {
+        GENERATION_DRIVE_COUNTERS
+            .permits_waiting_on_light_window
+            .fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for LightWindowWaitGauge {
+    fn drop(&mut self) {
+        GENERATION_DRIVE_COUNTERS
+            .permits_waiting_on_light_window
+            .fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -484,6 +534,8 @@ impl ChunkHolder {
             data: OnceLock::new(),
             status: AtomicWaitQueue::new(u16::from(UNPUBLISHED_STATUS)),
             drive: GenerationDrive::new(),
+            drive_gauge: AtomicU8::new(DRIVE_GAUGE_NONE),
+            stall_attempts: AtomicU32::new(0),
             status_changed: Notify::new(),
             generation_task: SyncMutex::new(None),
             generation_task_target: AtomicU8::new(STATUS_NONE),
@@ -1045,8 +1097,23 @@ impl ChunkHolder {
         light_work_window_gate: Arc<LightWorkWindowGate>,
     ) -> NeighborReady {
         Box::pin(async move {
-            let light_work_window_reservation =
-                light_work_window_gate.reserve_centered(holder.pos).await;
+            // The per-holder drive awaits this inline, holding its admission
+            // permit, and that is accepted cost rather than an oversight. It is
+            // deadlock-safe because the gate is only ever released by a job that
+            // is *running* -- it already holds a permit and is making progress
+            // -- never by something waiting to be admitted. Turning the wait
+            // into a park is not available: `reserve_centered_with` grants
+            // inline on the releasing thread, the gate has no deregistration
+            // path, and a grant handed to a holder that has moved on re-enters
+            // `Drop` -> `grant_unblocked` recursively. This gauge is what says
+            // how much admission capacity the choice costs.
+            let light_work_window_reservation = {
+                // Scoped through a guard, not a bare pair of bumps: the task
+                // model drops these futures on cancellation, and a decrement
+                // skipped that way would drift the gauge permanently.
+                let _waiting = LightWindowWaitGauge::new();
+                light_work_window_gate.reserve_centered(holder.pos).await
+            };
             let ready = holder.apply_step_with_light_work_window_reservation(
                 step,
                 &chunk_map,
@@ -1080,6 +1147,17 @@ impl ChunkHolder {
             // just wait for it. Parent cancellation is handled by the owning
             // task's run loop dropping this future; a failed dependency returns
             // `None` from `await_claimed_chunk_status`.
+            //
+            // Under the per-holder drive this branch is unreachable: a holder
+            // has exactly one driver, and it is inside this call. Counted, not
+            // asserted, because the same holder is one `claim_status_work` away
+            // from the panic that aborts the server, and the counter says
+            // whether the invariant held before that happens.
+            if *STAGE1 {
+                GENERATION_DRIVE_COUNTERS
+                    .contended_status_claims
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             let self_clone = self.clone();
             return Some(Box::pin(async move {
                 self_clone
@@ -1441,7 +1519,7 @@ impl ChunkHolder {
         }
     }
 
-    fn release_status_work_claim(&self, status: ChunkStatus) {
+    fn release_status_work_claim(self: &Arc<Self>, status: ChunkStatus) {
         let status_index = status.get_index();
         let rollback_index = self
             .published_status()
@@ -1462,6 +1540,30 @@ impl ChunkHolder {
             .is_ok()
         {
             self.wake_all_watchers();
+
+            // Deliberately no re-arm here under the per-holder drive, however
+            // much a rollback looks like the place for one.
+            //
+            // A claim only ever lives inside the tokio task
+            // `apply_step_with_light_work_window_reservation` spawns, and the
+            // drive is parked on that task's `JoinHandle`. Tokio drops a task's
+            // future -- and with it these claims -- before it resolves the
+            // handle, so a rollback is always observed while the drive that
+            // dispatched the run is still `Running`. `GenerationDrive::arm` on a
+            // running drive queues nothing and *bumps the epoch*, which spends
+            // the run ticket the drive is about to stall on: `to_stalled` then
+            // refuses, the `JobFailed` stall is skipped along with its backoff,
+            // and the drive loops straight back into re-dispatching the step
+            // that just failed -- a hot retry pinning an admission permit,
+            // measured as ticket 1 -> 2 and `to_stalled == false` on a holder
+            // whose `Empty` claim was dropped unpublished.
+            //
+            // Nothing is lost by staying quiet: the drive is still inside the
+            // loop, and it either re-evaluates or stalls with backoff. The one
+            // case where nobody is left to look at the holder is a drive future
+            // dropped mid-run, and an `arm` cannot rescue that either -- the
+            // drive is stranded `Running`, so `arm` returns `false` there too.
+            // `DriveDropGuard` reports it instead.
         }
     }
 
@@ -1623,44 +1725,273 @@ impl ChunkHolder {
         if encoded <= self.encoded_status() {
             return;
         }
+        // Stack-local, and published in one go below. This runs on the rayon
+        // generation worker that just did the work, once per status of a fused
+        // run, with every chunk waiting on this status blocked behind it:
+        // pushing each holder into the map's inbox as it comes off the queue
+        // would take and drop that lock once per waiter, and a wide ring can
+        // release hundreds at once. Nothing here may `tokio::spawn` either --
+        // a rayon worker has no ambient runtime.
+        let mut woken: Vec<Arc<Self>> = Vec::new();
         self.status
             .advance_and_notify(u16::from(encoded), |waiter| match waiter {
                 // A dropped receiver just means the waiter went away.
                 StatusWaiter::Oneshot(sender) => {
                     let _ = sender.send(());
                 }
-                // Runs on the generation worker that just did the work, once per
-                // status of a fused run, with every chunk waiting on this status
-                // blocked behind it: a handful of atomic bumps, and for the one
-                // waiter per park that ends it, a push onto a vector. Nothing
-                // here allocates per waiter.
                 StatusWaiter::Dependency(dependency) => {
                     if let Some(parent) = dependency.fire() {
-                        parent.requeue_for_generation();
+                        woken.push(parent);
                     }
                 }
             });
+
+        if woken.is_empty() {
+            return;
+        }
+        GENERATION_DRIVE_COUNTERS
+            .drive_wakes
+            .fetch_add(woken.len() as u64, Ordering::Relaxed);
+        Self::publish_woken_dependents(&woken);
+    }
+
+    /// Hands a batch of woken dependents back to their maps.
+    ///
+    /// Each holder publishes to *its own* sink, not to the publisher's: they
+    /// coincide for every holder of one map, but a holder built without a map --
+    /// tests, benches, worldgen fixtures -- publishes nowhere, and using the
+    /// publisher's sink would queue it into a map that does not own it.
+    ///
+    /// Consecutive holders sharing a sink go in under one lock hold, which in
+    /// production is the whole batch: the wake path runs on the rayon worker
+    /// that just published, with every chunk waiting on that status blocked
+    /// behind it.
+    fn publish_woken_dependents(woken: &[Arc<Self>]) {
+        let mut index = 0;
+        while index < woken.len() {
+            let Some(inbox) = woken[index].generation_inbox.upgrade() else {
+                index += 1;
+                continue;
+            };
+            let mut end = index + 1;
+            while end < woken.len()
+                && ptr::eq(woken[end].generation_inbox.as_ptr(), Arc::as_ptr(&inbox))
+            {
+                end += 1;
+            }
+            inbox.push_all(&woken[index..end]);
+            index = end;
+        }
     }
 
     /// Releases one dependency registration taken against `epoch` of this
     /// holder's park.
-    fn finish_dependency(&self, epoch: u64) -> DecOutcome {
-        self.drive.finish_dependency(epoch)
+    pub(crate) fn finish_dependency(&self, epoch: u64) -> DecOutcome {
+        let outcome = self.drive.finish_dependency(epoch);
+        if outcome == DecOutcome::Requeue {
+            // The only release per park that is told the park is over, so the
+            // only one that can take the holder back out of the parked gauge.
+            self.set_drive_gauge(DRIVE_GAUGE_NONE);
+        }
+        outcome
     }
 
     /// Hands this holder back to the map for admission, after the park it was
     /// waiting in ended.
     ///
     /// Exactly one release per park observes [`DecOutcome::Requeue`], so this
-    /// cannot queue the same park twice. A missing inbox means the map is gone
-    /// and nothing is going to admit anything again.
+    /// cannot queue the same park twice.
     fn requeue_for_generation(self: &Arc<Self>) {
         GENERATION_DRIVE_COUNTERS
             .drive_wakes
             .fetch_add(1, Ordering::Relaxed);
+        self.queue_for_generation();
+    }
+
+    /// Publishes this holder to the map's admission inbox.
+    ///
+    /// A missing inbox means the map is gone and nothing is going to admit
+    /// anything again.
+    pub(crate) fn queue_for_generation(self: &Arc<Self>) {
         if let Some(inbox) = self.generation_inbox.upgrade() {
             inbox.push(self);
         }
+    }
+
+    /// Moves this holder between the drive gauges.
+    ///
+    /// One swap rather than a load and a store: `abandon` runs from the unload
+    /// path while the drive's own transitions run on the drive task, and two
+    /// read-modify-writes could otherwise interleave into a gauge that never
+    /// comes back down.
+    fn set_drive_gauge(&self, next: u8) {
+        let previous = self.drive_gauge.swap(next, Ordering::AcqRel);
+        if previous == next {
+            return;
+        }
+        let counters = &GENERATION_DRIVE_COUNTERS;
+        match previous {
+            DRIVE_GAUGE_PARKED => {
+                counters.parked_holders.fetch_sub(1, Ordering::Relaxed);
+            }
+            DRIVE_GAUGE_STALLED => {
+                counters.stalled_holders.fetch_sub(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+        match next {
+            DRIVE_GAUGE_PARKED => {
+                counters.parked_holders.fetch_add(1, Ordering::Relaxed);
+            }
+            DRIVE_GAUGE_STALLED => {
+                counters.stalled_holders.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
+
+    /// Marks this holder as needing a generation run.
+    ///
+    /// `true` means the caller now owns a queue entry and must publish it with
+    /// [`Self::queue_for_generation`]; see [`GenerationDrive::arm`] for why an
+    /// already-running holder answers `false` without queueing anything.
+    pub(crate) fn arm(&self) -> bool {
+        let queued = self.drive.arm();
+        if queued {
+            // Only a transition out of `Idle`, `Parked` or `Stalled` returns
+            // `true`, so this is where a park or a stall ends by re-arming.
+            self.set_drive_gauge(DRIVE_GAUGE_NONE);
+        }
+        queued
+    }
+
+    /// Claims this holder's queue entry, returning the run ticket.
+    pub(crate) fn begin_generation_run(&self) -> Option<u64> {
+        let ticket = self.drive.begin_run();
+        if ticket.is_some() {
+            self.set_drive_gauge(DRIVE_GAUGE_NONE);
+        }
+        ticket
+    }
+
+    /// Opens a dependency-registration pass, returning the park epoch.
+    pub(crate) fn park_begin(&self, ticket: u64) -> Option<u64> {
+        let epoch = self.drive.park_begin(ticket);
+        if epoch.is_some() {
+            self.set_drive_gauge(DRIVE_GAUGE_PARKED);
+        }
+        epoch
+    }
+
+    /// Registers this parked holder as waiting for `dependency` to publish
+    /// `required`.
+    ///
+    /// The slot is armed *before* the waiter is registered, never after:
+    /// `AtomicWaitQueue::wait` links the node before it returns, so the
+    /// dependency can publish and fire the waiter while this call is still
+    /// running. Arming afterwards would let that release run against a count
+    /// that has not been raised yet, and the raise would then strand a phantom
+    /// registration nothing will ever release.
+    ///
+    /// The registration is filed one below the encoded status because the queue
+    /// releases a waiter when the status *exceeds* what it waited for.
+    ///
+    /// `false` means the park is already over and the caller must stop
+    /// registering.
+    pub(crate) fn park_on(
+        self: &Arc<Self>,
+        dependency: &Arc<Self>,
+        required: ChunkStatus,
+        epoch: u64,
+    ) -> bool {
+        if !self.drive.arm_dependency(epoch) {
+            return false;
+        }
+        let wait_for = u16::from(encoded_published_status(required)) - 1;
+        let waiter = StatusWaiter::Dependency(DependencyWaiter::new(self, required, epoch));
+        match dependency.status.wait(wait_for, waiter) {
+            WaitOutcome::Registered => {}
+            // Satisfied while this registration was being filed, or the
+            // dependency's queue is gone. The slot has to go back, and it has to
+            // go back exactly once: releasing it here and then letting the
+            // returned waiter drop releases it *twice*, which takes the park
+            // below the count it armed and hands the requeue to a pass that is
+            // still registering. `fire` is the one release that consumes the
+            // waiter, so the `Drop` that follows finds nothing left to give
+            // back.
+            WaitOutcome::AlreadySatisfied(returned) | WaitOutcome::Cancelled(returned) => {
+                let StatusWaiter::Dependency(waiter) = returned else {
+                    unreachable!("the queue hands back exactly the payload it was given");
+                };
+                if let Some(parent) = waiter.fire() {
+                    // Only reachable if something ended the park underneath this
+                    // pass; the bias otherwise keeps the count above zero until
+                    // the pass releases it.
+                    parent.queue_for_generation();
+                }
+            }
+        }
+        true
+    }
+
+    /// Ends a run with nothing left to do.
+    pub(crate) fn to_idle(&self, ticket: u64) -> bool {
+        self.drive.to_idle(ticket)
+    }
+
+    /// Ends a run that cannot progress until something re-arms it.
+    pub(crate) fn to_stalled(&self, ticket: u64) -> bool {
+        let stalled = self.drive.to_stalled(ticket);
+        if stalled {
+            self.set_drive_gauge(DRIVE_GAUGE_STALLED);
+        }
+        stalled
+    }
+
+    /// The drive's current epoch, i.e. the ticket a run must act on.
+    pub(crate) fn generation_run_ticket(&self) -> u64 {
+        self.drive.epoch()
+    }
+
+    /// Whether this holder still holds the queue entry it was pushed with.
+    ///
+    /// The selection queue's entries are only ever dropped by the pass that
+    /// reads this, so an entry whose holder has been withdrawn since (a level
+    /// drop, an unload) has to be recognisable here.
+    pub(crate) fn is_queued_for_generation(&self) -> bool {
+        self.drive.phase() == DrivePhase::Queued
+    }
+
+    /// Withdraws this holder from generation, e.g. because its ticket is gone.
+    pub(crate) fn abandon_generation_drive(&self) {
+        if self.drive.abandon() {
+            self.set_drive_gauge(DRIVE_GAUGE_NONE);
+        }
+    }
+
+    /// Records a stall and returns how many consecutive stalls this holder has
+    /// now had, saturating so the backoff cannot wrap back to zero.
+    pub(crate) fn record_stall(&self) -> u32 {
+        let previous = self
+            .stall_attempts
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |attempts| {
+                Some(attempts.saturating_add(1))
+            })
+            .unwrap_or(0);
+        previous.saturating_add(1)
+    }
+
+    /// Clears the stall backoff after a run that dispatched work.
+    pub(crate) fn clear_stall_backoff(&self) {
+        self.stall_attempts.store(0, Ordering::Release);
+    }
+
+    /// Whether this holder is still in the active half of its save lifecycle.
+    ///
+    /// A holder that has begun unloading must not start new generation work:
+    /// its data is about to be snapshotted for saving.
+    pub(crate) fn is_save_lifecycle_active(&self) -> bool {
+        self.save_lifecycle.load(Ordering::Acquire) == SAVE_LIFECYCLE_ACTIVE
     }
 
     /// Registers tick queues before Full status becomes observable to watchers.
@@ -2052,6 +2383,44 @@ mod tests {
             .claim_status_work(ChunkStatus::StructureReferences)
             .expect("next status should be claimable from loaded status");
         drop(next_claim);
+    }
+
+    /// A failed run rolls its claim back from inside the tokio task that held
+    /// it, and tokio drops that task's locals before it resolves the
+    /// `JoinHandle` -- so the rollback is always observed while the drive that
+    /// dispatched the run is still `Running` and still holding its ticket. If
+    /// the rollback re-arms, `GenerationDrive::arm` queues nothing and bumps the
+    /// epoch, the drive's `to_stalled` is refused, and the `JobFailed` stall and
+    /// its backoff are skipped: the drive loops back and re-dispatches the step
+    /// that just failed, forever, holding an admission permit.
+    ///
+    /// Only the `STEEL_STAGE1=1` run of this suite exercises the dispatcher this
+    /// protects, but the rollback path itself is shared, so the assertion holds
+    /// in both.
+    #[test]
+    fn a_rolled_back_claim_leaves_the_running_drive_able_to_stall() {
+        let holder = test_holder();
+        assert!(holder.arm());
+        let ticket = holder
+            .begin_generation_run()
+            .expect("an armed drive can run");
+        let claim = holder
+            .claim_status_work(ChunkStatus::Empty)
+            .expect("empty status should be claimable");
+
+        // The failing job's claim going away without publishing anything.
+        drop(claim);
+
+        assert_eq!(
+            holder.generation_run_ticket(),
+            ticket,
+            "a claim rollback must not spend the run ticket of the drive that dispatched it",
+        );
+        assert!(
+            holder.to_stalled(ticket),
+            "the drive must still be able to take its JobFailed stall, or it hot-retries the \
+             failed step while holding an admission permit",
+        );
     }
 
     #[tokio::test]

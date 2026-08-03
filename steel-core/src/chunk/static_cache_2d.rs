@@ -76,6 +76,31 @@ impl<T> StaticCache2D<T> {
         })
     }
 
+    /// Wraps an already-filled row-major square.
+    ///
+    /// The resolvers that feed the per-holder generation drive cannot use
+    /// [`Self::try_create`]: they walk the square in descending Chebyshev
+    /// distance so the cells that gate the run are visited before the ones that
+    /// merely have to be present, which is not the order the backing vector is
+    /// stored in. They fill the vector by index instead and hand it over here.
+    ///
+    /// # Panics
+    /// Panics if `cache` is not exactly `size * size` elements, which would make
+    /// every subsequent lookup read the wrong cell.
+    pub(crate) fn from_row_major(min_x: i32, min_z: i32, size: i32, cache: Vec<T>) -> Self {
+        assert_eq!(
+            cache.len(),
+            (size * size) as usize,
+            "a row-major square must be filled completely before it is published"
+        );
+        Self {
+            min_x,
+            min_z,
+            size,
+            cache,
+        }
+    }
+
     /// Gets a reference to an element by world coordinates.
     ///
     /// # Panics

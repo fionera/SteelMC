@@ -3,7 +3,7 @@ use crossbeam::utils::CachePadded;
 use rayon::ThreadPool;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use std::{
-    io, mem,
+    env, io, mem,
     sync::{
         Arc, LazyLock, Weak,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -73,6 +73,7 @@ use crate::world::tick_scheduler::{BlockTick, FluidTick, ScheduledTickRunBatch};
 use crate::worldgen::{ChunkGeneratorType, WorldGenContext};
 use crate::{entity::Entity, player::Player};
 
+mod generation_drive_dispatch;
 mod generation_readiness;
 mod light_update_state;
 mod light_updates;
@@ -80,6 +81,7 @@ mod persistence;
 mod player_tracking;
 mod scheduled_ticks;
 
+use generation_drive_dispatch::StallReason;
 #[cfg(test)]
 use light_update_state::PendingLightUpdates;
 use light_update_state::{InFlightLightUpdates, LightUpdateState, PendingChunkLightUpdates};
@@ -97,11 +99,42 @@ use light_update_state::{InFlightLightUpdates, LightUpdateState, PendingChunkLig
 /// scheduling-epoch thread. Raise this only alongside evidence that admission,
 /// rather than task creation, is what starves the pool.
 static GENERATION_THREAD_MULTIPLE: LazyLock<usize> = LazyLock::new(|| {
-    std::env::var("STEEL_GENERATION_TASK_MULTIPLE")
+    env::var("STEEL_GENERATION_TASK_MULTIPLE")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|&multiple| multiple > 0)
         .unwrap_or(2)
+});
+
+/// Selects the per-holder generation drive over the per-chunk task scheduler.
+///
+/// Process-wide and read once, never per chunk and never per map. The two
+/// dispatchers cannot coexist over one holder for a reason that is fatal rather
+/// than untidy: `claim_status_work` compare-exchanges `parent_index ->
+/// status_index` and *panics* when it finds anything else, so a holder driven by
+/// both a task and a drive aborts the server. A per-map or per-chunk switch
+/// would make that reachable through a config reload or a mid-run flip; a
+/// `LazyLock` read from the environment cannot change after the first holder is
+/// armed.
+pub(crate) static STAGE1: LazyLock<bool> = LazyLock::new(|| {
+    env::var("STEEL_STAGE1")
+        .is_ok_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "True" | "yes" | "on"))
+});
+
+/// Dependencies one parked holder may register waiters with, per park.
+///
+/// A run's ring reaches radius 8, so the unmet set can be the whole 17x17 halo
+/// minus what is already published -- up to 288 registrations for one chunk, and
+/// at 601x601 that was costed at 2-5 GB of wait-queue nodes. Registering a
+/// prefix instead is not a correctness question: published status is monotone,
+/// so a park woken by its 64 dependencies re-scans and either dispatches or
+/// parks on what is still behind. It only costs an extra admission per round.
+static GENERATION_FANOUT: LazyLock<usize> = LazyLock::new(|| {
+    env::var("STEEL_GENERATION_FANOUT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&fanout| fanout > 0)
+        .unwrap_or(64)
 });
 // Vanilla applies this limit independently to block ticks and fluid ticks.
 const MAX_SCHEDULED_TICKS_PER_TICK: usize = 65_536;
@@ -260,24 +293,94 @@ struct ReadinessReconcileResult {
 #[derive(Default)]
 pub(crate) struct GenerationInbox {
     pending: SyncMutex<Vec<Weak<ChunkHolder>>>,
+    /// The refill loop's notify, shared with the map that owns this inbox.
+    ///
+    /// The pushes come from rayon generation workers, which hold no map and
+    /// could not reach `ChunkMap::notify_generation_refill` at all. Without a
+    /// wake here a woken holder waits for the next scheduling epoch to notice
+    /// it, which turns every dependency wake into up to one epoch of latency.
+    refill_notify: Arc<Notify>,
 }
 
 impl GenerationInbox {
-    pub(crate) fn push(&self, holder: &Arc<ChunkHolder>) {
-        self.pending.lock().push(Arc::downgrade(holder));
+    const fn new(refill_notify: Arc<Notify>) -> Self {
+        Self {
+            pending: SyncMutex::new(Vec::new()),
+            refill_notify,
+        }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "drained by the chunk scheduler in a follow-up change"
-        )
-    )]
+    pub(crate) fn push(&self, holder: &Arc<ChunkHolder>) {
+        self.pending.lock().push(Arc::downgrade(holder));
+        self.refill_notify.notify_one();
+    }
+
+    /// Publishes a whole batch under one lock hold.
+    ///
+    /// The publish path releases every waiter a status raise satisfies before it
+    /// returns, and a wide ring can end hundreds of parks at once; taking the
+    /// lock per holder would convoy the generation workers behind each other
+    /// while every chunk waiting on that status is blocked.
+    pub(crate) fn push_all(&self, holders: &[Arc<ChunkHolder>]) {
+        let mut pending = self.pending.lock();
+        pending.extend(holders.iter().map(Arc::downgrade));
+        drop(pending);
+        self.refill_notify.notify_one();
+    }
+
     pub(crate) fn take_all(&self) -> Vec<Arc<ChunkHolder>> {
         let pending = mem::take(&mut *self.pending.lock());
         pending.iter().filter_map(Weak::upgrade).collect()
     }
+}
+
+/// One entry of the generation selection queue.
+///
+/// Which variant occurs is decided once per process by [`STAGE1`]; the two never
+/// mix over one holder. The priority key is *not* stored alongside: it is
+/// derived from the holder's live ticket levels at selection time, so a holder
+/// whose level changed while it waited is ordered by what it is now rather than
+/// by what it was when it was queued.
+pub(crate) enum PendingUnit {
+    /// A per-chunk generation task, driving one chunk to a target status.
+    Task(Arc<ChunkGenerationTask>),
+    /// A holder advancing itself, one fused run per admission.
+    Holder(Arc<ChunkHolder>),
+}
+
+impl PendingUnit {
+    /// Whether this entry is still worth admitting.
+    fn is_live(&self) -> bool {
+        match self {
+            Self::Task(task) => !task.is_cancelled(),
+            // `abandon` leaves `Queued -> Idle`, which cannot reach into this
+            // queue to remove the entry it invalidated. This is where such an
+            // entry is dropped, and it has to stay an unconditional pass over
+            // the whole queue: `for_levels(None, None)` is the *largest*
+            // priority key while `select_nth_unstable` selects the smallest, so
+            // a withdrawn holder sorts permanently to the tail and would never
+            // reach the drained prefix.
+            Self::Holder(holder) => holder.is_queued_for_generation(),
+        }
+    }
+
+    fn priority(&self) -> GenerationTaskPriority {
+        let holder = match self {
+            Self::Task(task) => task.center_holder(),
+            Self::Holder(holder) => holder,
+        };
+        GenerationTaskPriority::for_levels(holder.load_level(), holder.simulation_level())
+    }
+}
+
+/// A holder whose drive gave up, and the earliest it may be tried again.
+struct StalledGeneration {
+    /// Weak for the same reason as [`GenerationInbox`]'s entries: a strong one
+    /// left here would make an unloading holder look referenced and pin it in
+    /// `unloading_chunks` for the rest of the process.
+    holder: Weak<ChunkHolder>,
+    reason: StallReason,
+    retry_after: Instant,
 }
 
 /// A map of chunks managing their state, loading, and generation.
@@ -304,13 +407,16 @@ pub struct ChunkMap {
     /// Lock ordering: never take this lock while holding
     /// `pending_generation_tasks`. Only the reverse, and only long enough to
     /// `mem::take` the batch out.
-    incoming_generation_tasks: SyncMutex<Vec<Arc<ChunkGenerationTask>>>,
+    incoming_generation_tasks: SyncMutex<Vec<PendingUnit>>,
     /// Generation tasks competing for admission, ordered by the refill pass.
     ///
     /// Appended to, never replaced, so entries that lost a previous selection
     /// round stay ahead of the arrivals moved over from
     /// `incoming_generation_tasks`.
-    pub pending_generation_tasks: SyncMutex<Vec<Arc<ChunkGenerationTask>>>,
+    pub(crate) pending_generation_tasks: SyncMutex<Vec<PendingUnit>>,
+    /// Holders whose drive stalled, with the backoff that keeps a rescan storm
+    /// from turning into a CPU livelock. See `ChunkMap::record_generation_stall`.
+    stalled_generation_drives: SyncMutex<Vec<StalledGeneration>>,
     /// Tracker for background scheduling, generation, save, and unload tasks.
     pub task_tracker: TaskTracker,
     /// Ordered ticket ingress and background scheduling epoch handoff.
@@ -360,7 +466,10 @@ pub struct ChunkMap {
     /// `ChunkMap` field shares its line across every generation thread.
     running_generation_tasks: CachePadded<AtomicUsize>,
     /// Wakes the generation refill loop when pending/running task state changes.
-    generation_refill_notify: Notify,
+    ///
+    /// Shared with `generation_inbox` so a rayon generation worker that ends a
+    /// park can wake the loop without reaching the map.
+    generation_refill_notify: Arc<Notify>,
     /// Cancels the generation refill loop without cancelling active generation tasks.
     generation_refill_cancel_token: CancellationToken,
     /// Fast shutdown flag for the generation refill loop.
@@ -481,6 +590,7 @@ impl ChunkMap {
         let mut chunk_tickets = ChunkTicketManager::new();
         timed_chunk_tickets.activate_all(&mut chunk_tickets);
         let full_publications = Arc::new(FullPublicationQueue::default());
+        let generation_refill_notify = Arc::new(Notify::new());
 
         Self {
             chunks: scc::HashMap::default(),
@@ -488,10 +598,11 @@ impl ChunkMap {
             deferred_revivals: SyncMutex::new(FxHashMap::default()),
             incoming_generation_tasks: SyncMutex::new(Vec::new()),
             pending_generation_tasks: SyncMutex::new(Vec::new()),
+            stalled_generation_drives: SyncMutex::new(Vec::new()),
             task_tracker: TaskTracker::new(),
             scheduling: ChunkSchedulingCoordinator::new(chunk_tickets),
             full_publications,
-            generation_inbox: Arc::new(GenerationInbox::default()),
+            generation_inbox: Arc::new(GenerationInbox::new(Arc::clone(&generation_refill_notify))),
             full_neighborhood: SyncMutex::new(FullNeighborhoodIndex::default()),
             ticking_chunks: ArcSwap::from_pointee(TickingChunkSnapshot::default()),
             finalized_block_entity_unloads: SyncMutex::new(Vec::new()),
@@ -513,7 +624,7 @@ impl ChunkMap {
             light_updates_progress_notify: Notify::new(),
             light_work_window_gate: Arc::new(LightWorkWindowGate::new()),
             running_generation_tasks: CachePadded::new(AtomicUsize::new(0)),
-            generation_refill_notify: Notify::new(),
+            generation_refill_notify,
             generation_refill_cancel_token: CancellationToken::new(),
             generation_refill_stopped: AtomicBool::new(false),
             generation_refill_started: AtomicBool::new(false),
@@ -571,13 +682,18 @@ impl ChunkMap {
         let pending = mem::take(&mut *self.pending_generation_tasks.lock());
         drop(incoming);
         drop(pending);
+        // The inbox and the stall list hold only `Weak`s, so they pin nothing;
+        // they are emptied here so a stop followed by a restart does not admit
+        // holders whose drives were abandoned in between.
+        drop(self.generation_inbox.take_all());
+        drop(mem::take(&mut *self.stalled_generation_drives.lock()));
     }
 
     pub(crate) fn notify_generation_refill(&self) {
         self.generation_refill_notify.notify_one();
     }
 
-    fn run_or_notify_generation_refill(&self) {
+    fn run_or_notify_generation_refill(self: &Arc<Self>) {
         if self.generation_refill_started.load(Ordering::Acquire) {
             self.notify_generation_refill();
         } else {
@@ -1292,7 +1408,17 @@ impl ChunkMap {
                 break;
             }
             processed += 1;
-            if let Some(status) = generation_status(holder.load_level())
+            if *STAGE1 {
+                // `update_chunk_level` has already stored the new allowance, and
+                // this arm reads it back through `needs_generation`. That order
+                // is the Store-Load half of the drive's Dekker pairing: a holder
+                // whose run is still in flight answers `false` here and is
+                // re-evaluated by that run instead of being queued twice.
+                if holder.needs_generation() && holder.arm() {
+                    holder.queue_for_generation();
+                    scheduled += 1;
+                }
+            } else if let Some(status) = generation_status(holder.load_level())
                 && holder.schedule_chunk_generation_task_b(status, self)
             {
                 scheduled += 1;
@@ -1338,6 +1464,11 @@ impl ChunkMap {
         {
             let _span = tracing::trace_span!("run_generation").entered();
             let start = Instant::now();
+            // Folded into this phase's timing rather than given its own field:
+            // it feeds the same admission queue this phase runs, and off the
+            // per-holder drive the list is always empty, so it costs one
+            // uncontended lock test.
+            self.revive_stalled_generation_drives(start);
             self.run_or_notify_generation_refill();
             timings.run_generation = start.elapsed();
         }

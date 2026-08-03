@@ -2,10 +2,10 @@ use super::{
     Arc, ChunkGenerationTask, ChunkHolder, ChunkMap, ChunkPos, ChunkStatus, ChunkTicketLevel,
     DeferredChunkRevival, FullNeighborhoodCounts, FullNeighborhoodError, FullNeighborhoodIndex,
     FullPublication, FxHashMap, FxHashSet, GENERATION_THREAD_MULTIPLE, GenerationRunPermit,
-    GenerationTaskPriority, Instant, LevelChange, Ordering, PackedChunkPos,
-    PostProcessGenerationError, ReadinessReconcileResult, TickableChunk, TickingChunkSnapshot,
-    TickingReadiness, TickingReadinessCandidate, instrument, is_block_ticking, is_entity_ticking,
-    is_full, mem,
+    Instant, LevelChange, Ordering, PackedChunkPos, PendingUnit, PostProcessGenerationError,
+    ReadinessReconcileResult, STAGE1, TickableChunk, TickingChunkSnapshot, TickingReadiness,
+    TickingReadinessCandidate, generation_drive_dispatch::drive_holder_generation, instrument,
+    is_block_ticking, is_entity_ticking, is_full, mem,
 };
 
 impl ChunkMap {
@@ -33,7 +33,7 @@ impl ChunkMap {
         // them afterwards, and a queued task pins its centre holder in
         // `unloading_chunks` for the rest of the process.
         if !self.generation_refill_stopped.load(Ordering::Acquire) {
-            incoming.push(Arc::clone(&task));
+            incoming.push(PendingUnit::Task(Arc::clone(&task)));
         }
         drop(incoming);
         task
@@ -41,10 +41,21 @@ impl ChunkMap {
 
     /// Runs queued generation tasks.
     #[instrument(level = "trace", skip(self))]
-    pub fn run_generation_tasks_b(&self) {
+    pub fn run_generation_tasks_b(self: &Arc<Self>) {
         // Taken before the selection lock, and only with `mem::take`, so a
         // producer never blocks behind the selection work below.
-        let arrivals = mem::take(&mut *self.incoming_generation_tasks.lock());
+        let mut arrivals = mem::take(&mut *self.incoming_generation_tasks.lock());
+        if *STAGE1 {
+            // The drive's producers are rayon generation workers publishing a
+            // status, so they get their own queue rather than the task inbox:
+            // `GenerationInbox` holds `Weak`s and takes its lock for one push.
+            arrivals.extend(
+                self.generation_inbox
+                    .take_all()
+                    .into_iter()
+                    .map(PendingUnit::Holder),
+            );
+        }
 
         let mut pending = self.pending_generation_tasks.lock();
         // The stop is tested here and not at entry because the take above moves
@@ -67,7 +78,9 @@ impl ChunkMap {
             return;
         }
 
-        pending.retain(|task| !task.is_cancelled());
+        // Unconditional, over the whole queue, and deliberately not narrowed to
+        // the prefix about to be drained: see `PendingUnit::is_live`.
+        pending.retain(PendingUnit::is_live);
         if pending.is_empty() {
             return;
         }
@@ -95,9 +108,7 @@ impl ChunkMap {
             // per freed slot -- a full sort there costs more than the admission
             // it is gating, and it grows with the backlog rather than with the
             // number of tasks being admitted.
-            pending.select_nth_unstable_by_key(task_count - 1, |task| {
-                Self::generation_task_priority(task)
-            });
+            pending.select_nth_unstable_by_key(task_count - 1, PendingUnit::priority);
         }
 
         tracing::trace!(
@@ -121,20 +132,37 @@ impl ChunkMap {
         }
 
         let mut unadmitted = Vec::new();
-        for task in tasks {
+        for unit in tasks {
             // `available_slots` was read before the lock was released, so a slot
             // can be gone by now; the permit, not that count, is what decides.
-            let Some(permit) = GenerationRunPermit::acquire(&task.chunk_map) else {
-                unadmitted.push(task);
+            let Some(permit) = GenerationRunPermit::acquire(self) else {
+                unadmitted.push(unit);
                 continue;
             };
-            self.task_tracker.spawn_on(
-                async move {
-                    let _permit = permit;
-                    task.run().await;
-                },
-                self.chunk_runtime.handle(),
-            );
+            match unit {
+                PendingUnit::Task(task) => {
+                    self.task_tracker.spawn_on(
+                        async move {
+                            let _permit = permit;
+                            task.run().await;
+                        },
+                        self.chunk_runtime.handle(),
+                    );
+                }
+                PendingUnit::Holder(holder) => {
+                    let chunk_map = Arc::clone(self);
+                    self.task_tracker.spawn_on(
+                        async move {
+                            // The permit is dropped by returning, which for a
+                            // parked holder happens long before the thing it
+                            // waits for is published.
+                            let _permit = permit;
+                            drive_holder_generation(holder, chunk_map).await;
+                        },
+                        self.chunk_runtime.handle(),
+                    );
+                }
+            }
         }
 
         if !unadmitted.is_empty() {
@@ -175,11 +203,6 @@ impl ChunkMap {
 
     pub(super) fn max_running_generation_tasks(&self) -> usize {
         self.generation_pool.current_num_threads().max(1) * *GENERATION_THREAD_MULTIPLE
-    }
-
-    pub(super) fn generation_task_priority(task: &ChunkGenerationTask) -> GenerationTaskPriority {
-        let holder = task.center_holder();
-        GenerationTaskPriority::for_levels(holder.load_level(), holder.simulation_level())
     }
 
     /// Updates scheduling for a chunk based on its new level.
@@ -255,7 +278,17 @@ impl ChunkMap {
         } else {
             //log::info!("Unloading chunk at {pos:?}");
             chunk_holder.begin_unloading();
-            chunk_holder.cancel_generation_task();
+            if *STAGE1 {
+                // Withdraws the queue entry rather than cancelling a task there
+                // is none of. A `Queued -> Idle` transition cannot reach into
+                // the selection queue, so the entry it invalidates is dropped by
+                // the retain at the top of `run_generation_tasks_b`; a *running*
+                // drive is only bumped, and retires itself at its next
+                // evaluation.
+                chunk_holder.abandon_generation_drive();
+            } else {
+                chunk_holder.cancel_generation_task();
+            }
             chunk_holder.clear_load_level();
             chunk_holder.set_simulation_level(None);
             chunk_holder.update_highest_allowed_status(None);

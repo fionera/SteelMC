@@ -220,7 +220,7 @@ fn a_refill_pass_after_the_stop_drops_what_it_takes() {
         .chunk_map
         .incoming_generation_tasks
         .lock()
-        .push(Arc::clone(&task));
+        .push(PendingUnit::Task(Arc::clone(&task)));
     world.chunk_map.run_generation_tasks_b();
 
     assert!(world.chunk_map.incoming_generation_tasks.lock().is_empty());

@@ -806,6 +806,38 @@ mod run_plan_tests {
         }
     }
 
+    /// A run's ring never asks *more* of a farther neighbour than of a nearer
+    /// one.
+    ///
+    /// `resolve_and_check` walks the halo outwards-in, so this is what makes the
+    /// unmet set it returns ordered from the lowest requirement to the highest,
+    /// and that ordering is the whole basis of `fanout_selection`: it takes the
+    /// tail because the tail is the most constraining end. If a table change
+    /// ever made a ring rise with radius, the park would silently start
+    /// registering on cells that clear first and every blocked chunk would need
+    /// several more admissions to make one run's progress.
+    #[test]
+    fn a_runs_ring_never_rises_with_radius() {
+        for status in statuses() {
+            let plan = &RUN_PLANS[status.get_index()];
+            for distance in 1..=plan.ring.get_radius() {
+                let (Some(nearer), Some(farther)) =
+                    (plan.ring.get(distance - 1), plan.ring.get(distance))
+                else {
+                    continue;
+                };
+                assert!(
+                    farther.get_index() <= nearer.get_index(),
+                    "the run starting at {:?} needs {farther:?} at distance {distance} but only \
+                     {nearer:?} at {}; the park selects the most constraining dependencies by \
+                     taking the outermost-first walk from its tail, which that inverts",
+                    plan.first,
+                    distance - 1,
+                );
+            }
+        }
+    }
+
     #[test]
     fn the_light_run_keeps_its_five_by_five_window() {
         let plan = &RUN_PLANS[ChunkStatus::Light.get_index()];
