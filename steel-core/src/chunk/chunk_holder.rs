@@ -3,6 +3,7 @@ use futures::Future;
 use rustc_hash::FxHashSet;
 use std::fmt::Debug;
 use std::mem;
+use std::pin::Pin;
 use std::ptr;
 use std::sync::atomic::{
     AtomicBool, AtomicI64, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
@@ -22,8 +23,7 @@ use std::time::Duration;
 #[cfg(feature = "slow_chunk_gen")]
 pub static SLOW_CHUNK_GEN: AtomicBool = AtomicBool::new(false);
 
-use crate::chunk::chunk_generation_task::{NeighborReady, StaticCache2D};
-use crate::chunk::chunk_map::{GenerationInbox, STAGE1};
+use crate::chunk::chunk_map::GenerationInbox;
 use crate::chunk::chunk_ticket_manager::{
     ChunkTicketLevel, generation_status, is_entity_ticking, is_full,
 };
@@ -32,6 +32,7 @@ use crate::chunk::generation_drive::{DecOutcome, DrivePhase, DriveState, Generat
 use crate::chunk::light::{
     LightLayer, LightSectionRange, LightWorkWindowGate, LightWorkWindowReservation,
 };
+use crate::chunk::static_cache_2d::StaticCache2D;
 use crate::chunk_saver::ChunkStorage;
 use crate::entity::EntityVisibility;
 use crate::worldgen::WorldGenContext;
@@ -39,12 +40,14 @@ use crate::{
     ChunkMap,
     chunk::{
         Chunk,
-        chunk_generation_task::ChunkGenerationTask,
         chunk_pyramid::{ChunkStep, GENERATION_PYRAMID, can_fuse},
         full_chunk::{FullChunkPromotion, FullChunkRef},
         status::ChunkStatus,
     },
 };
+
+/// A pinned future representing a neighbour's readiness.
+pub type NeighborReady = Pin<Box<dyn Future<Output = Option<()>> + Send + Sync>>;
 
 const STATUS_NONE: u8 = u8::MAX;
 /// Values of [`ChunkHolder::drive_gauge`].
@@ -347,9 +350,7 @@ pub struct ChunkHolder {
     /// added here may either -- a payload drop that took a map lock would do so
     /// while every chunk waiting on the status being published is blocked.
     status: AtomicWaitQueue<StatusWaiter>,
-    /// The per-holder generation state machine. Armed only when
-    /// [`STAGE1`](crate::chunk::chunk_map::STAGE1) selects the per-holder
-    /// dispatcher.
+    /// The per-holder generation state machine.
     drive: GenerationDrive,
     /// Which of the drive gauges this holder is currently counted in.
     ///
@@ -363,8 +364,6 @@ pub struct ChunkHolder {
     /// dispatched work.
     stall_attempts: AtomicU32,
     status_changed: Notify,
-    generation_task: SyncMutex<Option<Arc<ChunkGenerationTask>>>,
-    generation_task_target: AtomicU8,
     pos: ChunkPos,
     /// The current loading ticket level of the chunk.
     load_level: AtomicU8,
@@ -537,8 +536,6 @@ impl ChunkHolder {
             drive_gauge: AtomicU8::new(DRIVE_GAUGE_NONE),
             stall_attempts: AtomicU32::new(0),
             status_changed: Notify::new(),
-            generation_task: SyncMutex::new(None),
-            generation_task_target: AtomicU8::new(STATUS_NONE),
             pos,
             load_level: AtomicU8::new(load_level.raw()),
             simulation_level: AtomicU8::new(optional_ticket_level_raw(simulation_level)),
@@ -833,62 +830,6 @@ impl ChunkHolder {
             .is_none_or(|allowed| status > allowed)
     }
 
-    /// Schedules a generation task for this chunk if needed.
-    ///
-    /// Returns `true` if a new task was actually scheduled, `false` if the chunk
-    /// already has a suitable task or is already at the target status.
-    #[inline]
-    pub(crate) fn schedule_chunk_generation_task_b(
-        &self,
-        status: ChunkStatus,
-        chunk_map: &Arc<ChunkMap>,
-    ) -> bool {
-        if self.is_status_disallowed(status) {
-            return false;
-        }
-
-        if self.try_chunk(status).is_some() {
-            return false;
-        }
-
-        let status_index = status.get_index() as u8;
-        let current_target = self.generation_task_target.load(Ordering::Acquire);
-        if current_target != STATUS_NONE && status_index <= current_target {
-            return false;
-        }
-
-        let task = self.generation_task.lock();
-
-        if task
-            .as_ref()
-            .is_some_and(|task| status <= task.target_status)
-        {
-            return false;
-        }
-
-        drop(task);
-        self.reschedule_chunk_task_b(status, chunk_map);
-        true
-    }
-
-    /// Reschedules the chunk task to the given status.
-    #[inline]
-    pub(crate) fn reschedule_chunk_task_b(&self, status: ChunkStatus, chunk_map: &Arc<ChunkMap>) {
-        let new_task = chunk_map.schedule_generation_task_b(status, self.pos);
-        let mut old_task_guard = self.generation_task.lock();
-
-        let old_task = old_task_guard.replace(new_task);
-        self.generation_task_target
-            .store(status.get_index() as u8, Ordering::Release);
-        drop(old_task_guard);
-
-        if let Some(old_task) = old_task {
-            old_task.cancel();
-        }
-
-        chunk_map.notify_generation_refill();
-    }
-
     /// Gets access to the chunk if it has reached the given status.
     #[inline]
     pub fn try_chunk(&self, status: ChunkStatus) -> Option<&Chunk> {
@@ -904,7 +845,6 @@ impl ChunkHolder {
         self.try_chunk(ChunkStatus::Full)
             .map(FullChunkRef::from_full_context)
     }
-
 
     /// Waits until the chunk has reached the given status without reading chunk data.
     /// Retained with no production caller on purpose: its two tests
@@ -1033,12 +973,6 @@ impl ChunkHolder {
 
     /// Applies a step to the chunk.
     ///
-    /// Cancellation is handled structurally by the owning generation task: its
-    /// `run` loop races the whole `join_all` of dependency-wait futures against
-    /// its cancel token and drops them on cancellation, so the returned futures
-    /// don't each re-check it. A failed dependency surfaces as
-    /// `await_chunk_status` returning `None`.
-    ///
     /// # Panics
     /// Panics if the target status is not Empty and has no parent, or if the
     /// chunk status is invalid during generation.
@@ -1108,9 +1042,10 @@ impl ChunkHolder {
             // `Drop` -> `grant_unblocked` recursively. This gauge is what says
             // how much admission capacity the choice costs.
             let light_work_window_reservation = {
-                // Scoped through a guard, not a bare pair of bumps: the task
-                // model drops these futures on cancellation, and a decrement
-                // skipped that way would drift the gauge permanently.
+                // Scoped through a guard, not a bare pair of bumps: shutdown
+                // aborts the task tracker and drops this future where it stands,
+                // and a decrement skipped that way would drift the gauge
+                // permanently.
                 let _waiting = LightWindowWaitGauge::new();
                 light_work_window_gate.reserve_centered(holder.pos).await
             };
@@ -1143,21 +1078,16 @@ impl ChunkHolder {
         }
 
         let Some(status_claim) = self.claim_status_work(target_status) else {
-            // Another task is already generating this chunk to `target_status`;
-            // just wait for it. Parent cancellation is handled by the owning
-            // task's run loop dropping this future; a failed dependency returns
-            // `None` from `await_claimed_chunk_status`.
-            //
-            // Under the per-holder drive this branch is unreachable: a holder
-            // has exactly one driver, and it is inside this call. Counted, not
-            // asserted, because the same holder is one `claim_status_work` away
-            // from the panic that aborts the server, and the counter says
-            // whether the invariant held before that happens.
-            if *STAGE1 {
-                GENERATION_DRIVE_COUNTERS
-                    .contended_status_claims
-                    .fetch_add(1, Ordering::Relaxed);
-            }
+            // Unreachable with one dispatcher: a holder has exactly one driver,
+            // and it is inside this call. Counted, not asserted, because the same
+            // holder is one `claim_status_work` away from the panic that aborts
+            // the server, and the counter says whether the invariant held before
+            // that happens. Waiting the claim out is what this does if it ever
+            // does happen; a claim abandoned without publishing returns `None`
+            // from `await_claimed_chunk_status`.
+            GENERATION_DRIVE_COUNTERS
+                .contended_status_claims
+                .fetch_add(1, Ordering::Relaxed);
             let self_clone = self.clone();
             return Some(Box::pin(async move {
                 self_clone
@@ -2054,29 +1984,6 @@ impl ChunkHolder {
     pub fn wake_all_watchers(&self) {
         self.status_changed.notify_waiters();
     }
-
-    /// Cancels the current generation task.
-    pub fn cancel_generation_task(&self) {
-        let mut task_guard = self.generation_task.lock();
-        self.generation_task_target
-            .store(STATUS_NONE, Ordering::Release);
-        if let Some(task) = task_guard.take() {
-            task.cancel();
-        }
-    }
-
-    /// Clears the current generation task if it is still the supplied task.
-    pub(crate) fn clear_generation_task_if_current(&self, task: &Arc<ChunkGenerationTask>) {
-        let mut task_guard = self.generation_task.lock();
-        if task_guard
-            .as_ref()
-            .is_some_and(|current_task| Arc::ptr_eq(current_task, task))
-        {
-            task_guard.take();
-            self.generation_task_target
-                .store(STATUS_NONE, Ordering::Release);
-        }
-    }
 }
 
 fn rayon_spawn<F, R>(thread_pool: &rayon::ThreadPool, func: F) -> impl Future<Output = R>
@@ -2405,10 +2312,6 @@ mod tests {
     /// epoch, the drive's `to_stalled` is refused, and the `JobFailed` stall and
     /// its backoff are skipped: the drive loops back and re-dispatches the step
     /// that just failed, forever, holding an admission permit.
-    ///
-    /// Only the `STEEL_STAGE1=1` run of this suite exercises the dispatcher this
-    /// protects, but the rollback path itself is shared, so the assertion holds
-    /// in both.
     #[test]
     fn a_rolled_back_claim_leaves_the_running_drive_able_to_stall() {
         let holder = test_holder();

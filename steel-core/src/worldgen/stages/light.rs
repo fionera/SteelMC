@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use crate::chunk::{
-    chunk_generation_task::StaticCache2D,
     chunk_holder::ChunkHolder,
     chunk_pyramid::ChunkStep,
     light::{
@@ -10,6 +9,7 @@ use crate::chunk::{
         check_sky_light_chunk_edges, force_load_block_light_chunk, force_load_sky_light_chunk,
         propagate_block_light_chunk, propagate_sky_light_chunk,
     },
+    static_cache_2d::StaticCache2D,
     status::ChunkStatus,
 };
 use crate::worldgen::generator::context::WorldGenContext;

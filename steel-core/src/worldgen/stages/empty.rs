@@ -2,10 +2,10 @@ use std::sync::Arc;
 
 use crate::chunk::{
     Chunk,
-    chunk_generation_task::StaticCache2D,
     chunk_holder::ChunkHolder,
     chunk_pyramid::ChunkStep,
     section::{ChunkSection, Sections},
+    static_cache_2d::StaticCache2D,
 };
 use crate::worldgen::generator::context::WorldGenContext;
 

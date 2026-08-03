@@ -1,7 +1,6 @@
 //! This module contains all the chunk related structures and logic.
 
 mod block_entity_listener;
-pub mod chunk_generation_task;
 pub mod chunk_holder;
 /// The chunk map manages chunk loading, generation, and lifecycle.
 pub mod chunk_map;

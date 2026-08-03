@@ -43,38 +43,18 @@ const MAX_ITERATIONS: usize = 10_000_000;
 /// With one admission slot and a dependency fan-out in the hundreds, every
 /// requested chunk must still reach `Full`.
 ///
-/// Ignored rather than switched on per test, because it cannot be switched on
-/// per test: `STAGE1` is a `LazyLock` over the environment, read once per
-/// process and deliberately so -- `claim_status_work` panics if a holder is ever
-/// driven by both dispatchers, so a per-map or per-test switch would make an
-/// abort reachable through a mid-run flip. A test-only override of the *cap* is
-/// enough to make the budget tight (see `set_max_running_generation_tasks_for_test`);
-/// a test-only override of the dispatcher would not be. Run it with
-///
-/// Runs in the ordinary suite now that the drive is the default dispatcher. The
-/// assertion below is what keeps it honest: under `STEEL_STAGE1=0` it fails
-/// rather than quietly exercising the task model, which cannot pass this test at
-/// all -- a task holds its permit across the halo walk that schedules its
-/// dependencies, and at one slot that is the deadlock itself.
+/// The budget is narrowed through a test-only override of the *cap* (see
+/// `set_max_running_generation_tasks_for_test`), because the production cap's
+/// two factors -- a generation pool shared by every test world in the binary and
+/// a `LazyLock` over an environment variable -- cannot be narrowed for one test
+/// from inside a test process.
 ///
 /// It costs about nine seconds, which is more than the rest of the suite put
 /// together. Kept anyway: it pins the single property that three previous
 /// attempts at this rewrite died on, and it is the only test that does.
 #[test]
 fn a_single_admission_slot_still_generates_a_square() {
-    if !*STAGE1 {
-        // `STEEL_STAGE1=0` is a deliberate opt-out to the task model, and the
-        // task model cannot pass this test by construction. Skip loudly rather
-        // than fail: the escape hatch should leave a green suite, and the
-        // property is guarded on every default run.
-        eprintln!(
-            "skipping a_single_admission_slot_still_generates_a_square: \
-             the per-holder drive is switched off"
-        );
-        return;
-    }
-
-    let world = fresh_test_world("stage1_single_slot_admission");
+    let world = fresh_test_world("single_slot_admission");
     let chunk_map = &world.chunk_map;
     // One generation unit in flight at a time -- strictly fewer than the halo any
     // run of any chunk here waits on, which is the only budget that can prove the

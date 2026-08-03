@@ -4,8 +4,8 @@
 use std::sync::Arc;
 
 use crate::chunk::{
-    chunk_generation_task::StaticCache2D, chunk_holder::ChunkHolder,
-    chunk_status_tasks::ChunkStatusTasks, status::ChunkStatus,
+    chunk_holder::ChunkHolder, chunk_status_tasks::ChunkStatusTasks,
+    static_cache_2d::StaticCache2D, status::ChunkStatus,
 };
 use crate::worldgen::context::WorldGenContext;
 

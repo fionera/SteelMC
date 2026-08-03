@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use crate::chunk::{
-    chunk_generation_task::StaticCache2D, chunk_holder::ChunkHolder, chunk_pyramid::ChunkStep,
+    chunk_holder::ChunkHolder, chunk_pyramid::ChunkStep, static_cache_2d::StaticCache2D,
 };
 use crate::worldgen::{context::WorldGenContext, stages};
 

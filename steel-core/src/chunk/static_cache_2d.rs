@@ -1,15 +1,7 @@
-//! A pre-filled square cache of chunk neighbours, and the resolver that fills it.
+//! A pre-filled square cache of chunk neighbours.
 //!
-//! Extracted from `chunk_generation_task` so that halo resolution has a home
-//! that does not depend on the generation-task model: a per-holder drive
-//! resolves a halo per fused run rather than one per task, and needs the same
-//! machinery without the task around it.
-
-use std::sync::Arc;
-
-use steel_utils::ChunkPos;
-
-use crate::chunk::{chunk_holder::ChunkHolder, chunk_map::ChunkMap};
+//! The per-holder generation drive resolves one of these per fused run and
+//! hands it to the step it dispatches.
 
 /// A pre-filled 2D cache of elements, efficient for async creation.
 pub struct StaticCache2D<T> {
@@ -132,25 +124,4 @@ impl<T> StaticCache2D<T> {
             None
         }
     }
-}
-
-
-/// Resolves the square of holders centred on `center` out to `radius`.
-///
-/// Returns `None` if any cell has no holder, which is the caller's signal that
-/// the neighbourhood is not ready to be worked on rather than an error: a
-/// position can legitimately carry a ticket level while its holder is still
-/// being created, or has been taken out for unloading.
-pub(crate) fn resolve_halo_at(
-    chunk_map: &Arc<ChunkMap>,
-    center: ChunkPos,
-    radius: i32,
-) -> Option<Arc<StaticCache2D<Arc<ChunkHolder>>>> {
-    let chunk_map = Arc::clone(chunk_map);
-    StaticCache2D::try_create(center.0.x, center.0.y, radius, move |x, y| {
-        chunk_map
-            .chunks
-            .read_sync(&ChunkPos::new(x, y), |_, chunk_holder| chunk_holder.clone())
-    })
-    .map(Arc::new)
 }

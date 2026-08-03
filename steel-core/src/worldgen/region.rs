@@ -27,12 +27,12 @@ use crate::behavior::{BLOCK_BEHAVIORS, FLUID_BEHAVIORS};
 use crate::block_entity::{BLOCK_ENTITIES, SharedBlockEntity};
 use crate::chunk::{
     Chunk,
-    chunk_generation_task::StaticCache2D,
     chunk_holder::ChunkHolder,
     chunk_pyramid::ChunkStep,
     full_chunk::FullChunkRef,
     heightmap::{Heightmap, HeightmapType},
     section::{ChunkSection, SectionHolder, SectionWriteGuard, Sections},
+    static_cache_2d::StaticCache2D,
     status::ChunkStatus,
 };
 use crate::entity::SharedEntity;

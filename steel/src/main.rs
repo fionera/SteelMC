@@ -14,7 +14,6 @@ use futures::FutureExt;
 use steel::config::{self, LogConfig};
 use steel::logger::CommandLogger;
 use steel::{SERVER, SteelServer, logger::LoggerLayer};
-use steel_core::chunk::chunk_map::generation_drive_enabled;
 use steel_core::player::player_data::PersistentPlayerData;
 use steel_core::player::player_data_storage::GlobalPlayerData;
 use steel_core::player::player_inventory::MenuRemovalStatus;
@@ -208,34 +207,34 @@ fn worker_threads_for_available(
         return configured_threads.min(available_threads);
     }
 
-    if generation_drive_enabled() {
-        // Measured at 601x601 under the drive: 16 -> 10,301 chunks/s, 32 ->
-        // 10,208, 64 -> 10,152. Under the task model the same sweep was flat, so
-        // half the machine was as good as anything; it is not any more.
-        return (available_threads / 8).clamp(4, 16).min(available_threads);
-    }
-
-    ((available_threads / 2).max(2)).min(available_threads)
+    // Measured at 601x601: 16 -> 10,301 chunks/s, 32 -> 10,208, 64 -> 10,152.
+    // Half the machine used to be as good as anything here; it is not any more.
+    (available_threads / 8).clamp(4, 16).min(available_threads)
 }
 
 /// Worker threads for the chunk runtime.
 ///
-/// Much smaller than the main runtime's half-the-machine, because the two do
-/// different work. The chunk runtime does not generate chunks; it orchestrates.
-/// Its tasks claim a status, hand the actual work to the generation pool, and
-/// await a result, so it needs enough workers to keep that pipeline fed and no
-/// more. Measured over a 201x201 pregeneration on 128 threads it used 29.6 CPU
-/// seconds against the generation pool's 407 -- about 5% occupancy across the 64
-/// workers half-the-machine gave it.
+/// Capped rather than scaled with the machine, because the chunk runtime does
+/// not generate chunks; it orchestrates. Its tasks claim a status, hand the
+/// actual work to the generation pool, and await a result, so it needs enough
+/// workers to keep that pipeline fed and no more. Measured over a 201x201
+/// pregeneration on 128 threads it used 29.6 CPU seconds against the generation
+/// pool's 407 -- about 5% occupancy across the 64 workers half the machine gave
+/// it at the time.
 ///
-/// Those idle workers were expensive. They are 64 more runnable threads for the
-/// kernel to place against a generation pool that wants every core it can get,
-/// and cutting them to 16 was the single largest configuration win measured:
-/// 6,114 -> 8,086 chunks/s at 301x301 (+32%) and 6,388 -> 7,124 at 601x601
-/// (+11.5%). Below the plateau it does start to bind -- 8 workers gave 7,905 at
-/// 201x201 against 8,124 at 12 and 8,130 at 16 -- and 24 is slightly worse
-/// again, so an eighth of the machine with a floor of 4 sits in the middle of
-/// what was measured.
+/// Those idle workers were expensive: 64 more runnable threads for the kernel to
+/// place against a generation pool that wants every core it can get. Cutting
+/// them to 16 was the single largest configuration win measured -- 6,114 ->
+/// 8,086 chunks/s at 301x301 (+32%) and 6,388 -> 7,124 at 601x601 (+11.5%) --
+/// and too few does bind: 8 workers gave 7,905 at 201x201 against 8,124 at 12
+/// and 8,130 at 16.
+///
+/// Those sweeps predate the generation drive, and it moved where the cap
+/// belongs. The drive's sweep below peaks at 24 rather than running flat from 16
+/// to 32 and falling off after, so a fifth of the machine with a floor of 4 and
+/// a cap of 24 sits on that peak. That leaves this runtime larger than the main
+/// one: the drive re-admits a parked holder as a new task, so the chunk runtime
+/// sees many more, much shorter tasks than it used to.
 fn chunk_worker_threads_for_available(
     configured_threads: Option<usize>,
     available_threads: usize,
@@ -245,15 +244,11 @@ fn chunk_worker_threads_for_available(
         return configured_threads.min(available_threads);
     }
 
-    if generation_drive_enabled() {
-        // 601x601 under the drive: 12 -> 10,045, 16 -> 10,108, 20 -> 10,313,
-        // 24 -> 10,333, 28 -> 10,177, 32 -> 10,027. The task model measured a
-        // flat plateau from 16 to 32 here; the drive has a peak instead, because
-        // a parked holder returns its permit and is re-admitted as a new task.
-        return (available_threads / 5).clamp(4, 24).min(available_threads);
-    }
-
-    (available_threads / 8).clamp(4, 16).min(available_threads)
+    // 601x601: 12 -> 10,045, 16 -> 10,108, 20 -> 10,313, 24 -> 10,333,
+    // 28 -> 10,177, 32 -> 10,027. A peak rather than the flat plateau this used
+    // to show, because a parked holder returns its permit and is re-admitted as
+    // a new task.
+    (available_threads / 5).clamp(4, 24).min(available_threads)
 }
 
 async fn main_async(chunk_runtime: Arc<Runtime>, steel_config: config::SteelConfig) {
@@ -545,13 +540,17 @@ mod tests {
 
     #[test]
     fn chunk_runtime_stays_small_on_large_machines() {
-        // The chunk runtime orchestrates generation rather than performing it,
-        // so it must not scale with the machine the way the main runtime does.
-        // Half of a 128-thread box measured 32% slower at 301x301 than an
-        // eighth, purely from the idle workers competing for placement.
-        assert_eq!(chunk_worker_threads_for_available(None, 128), 16);
-        assert_eq!(chunk_worker_threads_for_available(None, 256), 16);
-        assert!(chunk_worker_threads_for_available(None, 128) < worker_threads_for_available(None, 128));
+        // Neither runtime generates chunks -- the rayon generation pool does --
+        // so neither may scale with the machine. Half of a 128-thread box
+        // measured 32% slower at 301x301 than an eighth, purely from the idle
+        // workers competing for placement. Both are capped rather than only the
+        // chunk runtime, and the chunk runtime's cap is the larger of the two
+        // because a parked holder hands its permit back and is re-admitted as a
+        // new task, so it sees many more, much shorter tasks.
+        assert_eq!(chunk_worker_threads_for_available(None, 128), 24);
+        assert_eq!(chunk_worker_threads_for_available(None, 256), 24);
+        assert_eq!(worker_threads_for_available(None, 128), 16);
+        assert_eq!(worker_threads_for_available(None, 256), 16);
         // Small machines still get a workable floor, never more than they have.
         assert_eq!(chunk_worker_threads_for_available(None, 16), 4);
         assert_eq!(chunk_worker_threads_for_available(None, 8), 4);

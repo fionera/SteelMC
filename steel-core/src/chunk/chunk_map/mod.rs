@@ -40,8 +40,8 @@ use crate::chunk::chunk_scheduler::{
 };
 use crate::chunk::chunk_ticket_manager::{
     ChunkTicket, ChunkTicketLevel, ChunkTicketManager, ENDER_PEARL_TICKET_TIMEOUT_TICKS,
-    LevelChange, PersistentChunkTickets, TimedChunkTickets, generation_status, is_block_ticking,
-    is_entity_ticking, is_full,
+    LevelChange, PersistentChunkTickets, TimedChunkTickets, is_block_ticking, is_entity_ticking,
+    is_full,
 };
 use crate::chunk::full_chunk_readiness::{
     FullNeighborhoodCounts, FullNeighborhoodError, FullNeighborhoodIndex, FullPublication,
@@ -61,7 +61,6 @@ use crate::chunk::light::{
 use crate::chunk::player_chunk_view::PlayerChunkView;
 use crate::chunk::{
     Chunk,
-    chunk_generation_task::ChunkGenerationTask,
     full_chunk::{BlockRandomPositionGenerator, FullChunkRef},
     section::RandomTickSectionBits,
     status::ChunkStatus,
@@ -86,75 +85,21 @@ use generation_drive_dispatch::StallReason;
 use light_update_state::PendingLightUpdates;
 use light_update_state::{InFlightLightUpdates, LightUpdateState, PendingChunkLightUpdates};
 
-/// In-flight generation tasks allowed per generation thread.
+/// In-flight generation units allowed per generation thread.
 ///
-/// A task holds a slot for its whole life but spends most of it parked, waiting
-/// on neighbour statuses, a light work window or a step handoff, so this cap is
-/// reached long before the generation pool is saturated. That makes it look like
-/// the throughput limit, and it is not: sweeping it over a 90,601-chunk
-/// pregeneration (7 interleaved runs each) left generation-pool occupancy flat
-/// at 0.72 for every value -- 2, 4 and 6 all measured 0.718-0.721, and 8 was
-/// worse. Tasks are not waiting to be admitted; the pool idles because runnable
-/// work is not produced fast enough, which happens upstream in the single
-/// scheduling-epoch thread. Raise this only alongside evidence that admission,
-/// rather than task creation, is what starves the pool.
+/// A permit covers only the runs a chunk can make *right now*: a holder that
+/// parks on its dependencies returns its permit and takes a fresh one when it
+/// wakes, so one permit buys far less in-flight work than a whole chunk's walk
+/// to `Full` and the pool runs dry if this is set low. Swept at 601x601:
+/// 2 -> 9,316, 8 -> 10,127, 12 -> 10,146, **24 -> 10,389**, 32 -> 10,245,
+/// 48 -> 10,047. Flat either side of the peak, and 24 is chosen over 32 because
+/// it holds less in flight for the same throughput.
 static GENERATION_THREAD_MULTIPLE: LazyLock<usize> = LazyLock::new(|| {
     env::var("STEEL_GENERATION_TASK_MULTIPLE")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|&multiple| multiple > 0)
-        .unwrap_or_else(default_generation_thread_multiple)
-});
-
-/// In-flight generation units per generation thread, when unset.
-///
-/// The two dispatchers need very different values because the unit a permit
-/// buys is not the same. Under the task model a permit covers a whole chunk's
-/// halo walk, which stays admitted from `Empty` to `Full`; two per thread is its
-/// measured optimum and raising it does not help (601x601: 9,867 at 2 against
-/// 9,663 at 8).
-///
-/// Under the per-holder drive a permit covers only the runs a chunk can make
-/// *right now*: a holder that parks on its dependencies returns its permit and
-/// takes a fresh one when it wakes. The same number therefore buys far less
-/// in-flight work, and the pool runs dry -- which is exactly what the first
-/// measurements of the drive showed, with rayon workers stealing and parking
-/// more. Re-swept at 601x601: 2 -> 9,316, 8 -> 10,127, 12 -> 10,146,
-/// **24 -> 10,389**, 32 -> 10,245, 48 -> 10,047. Flat either side of the peak,
-/// and 24 is chosen over 32 because it holds less in flight for the same
-/// throughput.
-fn default_generation_thread_multiple() -> usize {
-    if *STAGE1 { 24 } else { 2 }
-}
-
-/// Selects the per-holder generation drive over the per-chunk task scheduler.
-///
-/// Process-wide and read once, never per chunk and never per map. The two
-/// dispatchers cannot coexist over one holder for a reason that is fatal rather
-/// than untidy: `claim_status_work` compare-exchanges `parent_index ->
-/// status_index` and *panics* when it finds anything else, so a holder driven by
-/// both a task and a drive aborts the server. A per-map or per-chunk switch
-/// would make that reachable through a config reload or a mid-run flip; a
-/// `LazyLock` read from the environment cannot change after the first holder is
-/// armed.
-/// Whether chunk generation runs on the per-holder drive.
-///
-/// Exposed because the binary crate sizes its two tokio runtimes, and the right
-/// sizes differ per dispatcher: the drive hands a holder's permit back when it
-/// parks and takes a fresh one when it wakes, so the orchestration runtimes see
-/// many more, much shorter tasks than the task model's long-lived per-chunk
-/// ones. Anything sized against the old traffic pattern is mis-sized.
-#[must_use]
-pub fn generation_drive_enabled() -> bool {
-    *STAGE1
-}
-
-pub(crate) static STAGE1: LazyLock<bool> = LazyLock::new(|| {
-    // On by default. `STEEL_STAGE1=0` returns to the layer-walking task model,
-    // which stays in the tree until the drive has run in anger for a while.
-    env::var("STEEL_STAGE1").map_or(true, |value| {
-        !matches!(value.trim(), "0" | "false" | "FALSE" | "False" | "no" | "off")
-    })
+        .unwrap_or(24)
 });
 
 /// Dependencies one parked holder may register waiters with, per park.
@@ -325,7 +270,16 @@ struct ReadinessReconcileResult {
 /// Both operations hold the lock for O(1) work -- `take_all` swaps the vector
 /// out and upgrades outside the lock -- because the pushes come from rayon
 /// generation workers inside the status-publish path, where every chunk waiting
-/// on the status being published is blocked behind the push.
+/// on the status being published is blocked behind the push. It is split from
+/// `pending_generation_tasks` for the same reason: the selection pass runs
+/// `retain`/`select_nth_unstable`/`drain` over a queue that reaches tens of
+/// thousands of entries during a pregeneration, and one shared lock would convoy
+/// 16+ generation workers behind a 20k partial sort. `light::work_gate` records
+/// what that shape cost last time it was built: 27% of the whole machine.
+///
+/// Lock ordering: never take this lock while holding
+/// `pending_generation_tasks`. Only the reverse, and only long enough to take
+/// the batch out.
 #[derive(Default)]
 pub(crate) struct GenerationInbox {
     pending: SyncMutex<Vec<Weak<ChunkHolder>>>,
@@ -379,43 +333,25 @@ impl GenerationInbox {
     }
 }
 
-/// One entry of the generation selection queue.
+/// Whether a queued holder is still worth admitting.
 ///
-/// Which variant occurs is decided once per process by [`STAGE1`]; the two never
-/// mix over one holder. The priority key is *not* stored alongside: it is
-/// derived from the holder's live ticket levels at selection time, so a holder
-/// whose level changed while it waited is ordered by what it is now rather than
-/// by what it was when it was queued.
-pub(crate) enum PendingUnit {
-    /// A per-chunk generation task, driving one chunk to a target status.
-    Task(Arc<ChunkGenerationTask>),
-    /// A holder advancing itself, one fused run per admission.
-    Holder(Arc<ChunkHolder>),
+/// `abandon` leaves `Queued -> Idle`, which cannot reach into the selection
+/// queue to remove the entry it invalidated. That entry is dropped here, and
+/// this has to stay an unconditional pass over the whole queue:
+/// `for_levels(None, None)` is the *largest* priority key while
+/// `select_nth_unstable` selects the smallest, so a withdrawn holder sorts
+/// permanently to the tail and would never reach the drained prefix.
+fn is_live_generation_unit(holder: &Arc<ChunkHolder>) -> bool {
+    holder.is_queued_for_generation()
 }
 
-impl PendingUnit {
-    /// Whether this entry is still worth admitting.
-    fn is_live(&self) -> bool {
-        match self {
-            Self::Task(task) => !task.is_cancelled(),
-            // `abandon` leaves `Queued -> Idle`, which cannot reach into this
-            // queue to remove the entry it invalidated. This is where such an
-            // entry is dropped, and it has to stay an unconditional pass over
-            // the whole queue: `for_levels(None, None)` is the *largest*
-            // priority key while `select_nth_unstable` selects the smallest, so
-            // a withdrawn holder sorts permanently to the tail and would never
-            // reach the drained prefix.
-            Self::Holder(holder) => holder.is_queued_for_generation(),
-        }
-    }
-
-    fn priority(&self) -> GenerationTaskPriority {
-        let holder = match self {
-            Self::Task(task) => task.center_holder(),
-            Self::Holder(holder) => holder,
-        };
-        GenerationTaskPriority::for_levels(holder.load_level(), holder.simulation_level())
-    }
+/// The selection key of a queued holder.
+///
+/// Not stored alongside the entry: it is derived from the holder's live ticket
+/// levels at selection time, so a holder whose level changed while it waited is
+/// ordered by what it is now rather than by what it was when it was queued.
+fn generation_unit_priority(holder: &Arc<ChunkHolder>) -> GenerationTaskPriority {
+    GenerationTaskPriority::for_levels(holder.load_level(), holder.simulation_level())
 }
 
 /// A holder whose drive gave up, and the earliest it may be tried again.
@@ -436,29 +372,11 @@ pub struct ChunkMap {
     pub(crate) unloading_chunks: scc::HashMap<ChunkPos, Arc<ChunkHolder>, FxBuildHasher>,
     /// Ticket states waiting for an unloading holder's save preparation to finish.
     deferred_revivals: SyncMutex<FxHashMap<ChunkPos, DeferredChunkRevival>>,
-    /// Producer handoff for newly scheduled generation tasks.
-    ///
-    /// Split from `pending_generation_tasks` so a producer never waits on the
-    /// selection work: the refill pass holds this lock only for a `mem::take`,
-    /// while the `retain`/`select_nth_unstable`/`drain` pass runs under the
-    /// selection lock over a queue that reaches tens of thousands of entries
-    /// during a pregeneration. Under the per-holder generation drive the pushes
-    /// come from rayon generation workers inside the status-publish path, with
-    /// every chunk waiting on that status blocked behind the push, so one shared
-    /// lock would convoy 16+ generation workers behind a 20k partial sort.
-    /// `light::work_gate` records what that shape cost last time it was built:
-    /// 27% of the whole machine.
-    ///
-    /// Lock ordering: never take this lock while holding
-    /// `pending_generation_tasks`. Only the reverse, and only long enough to
-    /// `mem::take` the batch out.
-    incoming_generation_tasks: SyncMutex<Vec<PendingUnit>>,
-    /// Generation tasks competing for admission, ordered by the refill pass.
+    /// Holders competing for admission, ordered by the refill pass.
     ///
     /// Appended to, never replaced, so entries that lost a previous selection
-    /// round stay ahead of the arrivals moved over from
-    /// `incoming_generation_tasks`.
-    pub(crate) pending_generation_tasks: SyncMutex<Vec<PendingUnit>>,
+    /// round stay ahead of the arrivals moved over from `generation_inbox`.
+    pub(crate) pending_generation_tasks: SyncMutex<Vec<Arc<ChunkHolder>>>,
     /// Holders whose drive stalled, with the backoff that keeps a rescan storm
     /// from turning into a CPU livelock. See `ChunkMap::record_generation_stall`.
     stalled_generation_drives: SyncMutex<Vec<StalledGeneration>>,
@@ -659,7 +577,6 @@ impl ChunkMap {
             chunks: scc::HashMap::default(),
             unloading_chunks: scc::HashMap::default(),
             deferred_revivals: SyncMutex::new(FxHashMap::default()),
-            incoming_generation_tasks: SyncMutex::new(Vec::new()),
             pending_generation_tasks: SyncMutex::new(Vec::new()),
             stalled_generation_drives: SyncMutex::new(Vec::new()),
             generation_stall_epochs: AtomicU32::new(0),
@@ -736,27 +653,23 @@ impl ChunkMap {
 
     /// Stops the generation refill loop. Active generation tasks are left alone.
     pub fn stop_generation_refill_loop(&self) {
-        // Stored before either queue lock is taken, which is what makes a single
-        // drain sufficient: `schedule_generation_task_b` tests this flag under
-        // the inbox lock and `run_generation_tasks_b` tests it under the
-        // selection lock, so anyone who acquires a lock after this store adds
+        // Stored before the queue lock is taken, which is what makes a single
+        // drain sufficient: `run_generation_tasks_b` tests this flag under the
+        // selection lock, so anyone who acquires it after this store adds
         // nothing, and anyone who acquired it before is drained below. Without
-        // that pairing an in-flight refill pass or a scheduling epoch still
-        // running on `task_tracker` refills behind the drain.
+        // that pairing an in-flight refill pass refills behind the drain.
         self.generation_refill_stopped
             .store(true, Ordering::Release);
         self.generation_refill_cancel_token.cancel();
         self.generation_refill_notify.notify_waiters();
 
-        // Both queues must be emptied here because nothing else will:
+        // The selection queue must be emptied here because nothing else will:
         // `run_generation_tasks_b` returns on the stop flag before its only
-        // prune. A queued task holds its centre `Arc<ChunkHolder>`, and
+        // prune. Its entries are strong `Arc<ChunkHolder>`s, and
         // `process_unloads` frees a holder only at `strong_count == 1`, so
         // anything left queued keeps its holder pinned in `unloading_chunks`
         // for the rest of the process -- never saved, never finalized.
-        let incoming = mem::take(&mut *self.incoming_generation_tasks.lock());
         let pending = mem::take(&mut *self.pending_generation_tasks.lock());
-        drop(incoming);
         drop(pending);
         // The inbox and the stall list hold only `Weak`s, so they pin nothing;
         // they are emptied here so a stop followed by a restart does not admit
@@ -1484,19 +1397,13 @@ impl ChunkMap {
                 break;
             }
             processed += 1;
-            if *STAGE1 {
-                // `update_chunk_level` has already stored the new allowance, and
-                // this arm reads it back through `needs_generation`. That order
-                // is the Store-Load half of the drive's Dekker pairing: a holder
-                // whose run is still in flight answers `false` here and is
-                // re-evaluated by that run instead of being queued twice.
-                if holder.needs_generation() && holder.arm() {
-                    holder.queue_for_generation();
-                    scheduled += 1;
-                }
-            } else if let Some(status) = generation_status(holder.load_level())
-                && holder.schedule_chunk_generation_task_b(status, self)
-            {
+            // `update_chunk_level` has already stored the new allowance, and
+            // this reads it back through `needs_generation`. That order is the
+            // Store-Load half of the drive's Dekker pairing: a holder whose run
+            // is still in flight answers `false` here and is re-evaluated by
+            // that run instead of being queued twice.
+            if holder.needs_generation() && holder.arm() {
+                holder.queue_for_generation();
                 scheduled += 1;
             }
         }
@@ -1541,9 +1448,8 @@ impl ChunkMap {
             let _span = tracing::trace_span!("run_generation").entered();
             let start = Instant::now();
             // Folded into this phase's timing rather than given its own field:
-            // it feeds the same admission queue this phase runs, and off the
-            // per-holder drive the list is always empty, so it costs one
-            // uncontended lock test.
+            // it feeds the same admission queue this phase runs, and with
+            // nothing stalled it costs one uncontended lock test.
             self.revive_stalled_generation_drives(start);
             self.run_or_notify_generation_refill();
             timings.run_generation = start.elapsed();

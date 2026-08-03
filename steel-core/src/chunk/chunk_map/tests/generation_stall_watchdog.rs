@@ -54,9 +54,7 @@ fn a_park_nothing_can_wake_is_reported_after_the_full_epoch_count() {
     chunk_map
         .pending_generation_tasks
         .lock()
-        .push(PendingUnit::Holder(unloaded_full_holder(ChunkPos::new(
-            5, -9,
-        ))));
+        .push(unloaded_full_holder(ChunkPos::new(5, -9)));
     assert!(!run_watchdog_epochs(&chunk_map, 1));
     chunk_map.pending_generation_tasks.lock().clear();
     assert!(
@@ -77,10 +75,7 @@ fn queued_work_keeps_the_watchdog_quiet() {
     // whose dependency has just published: parked gauge non-zero, nothing
     // running, and a wake already on its way.
     let waiting = unloaded_full_holder(ChunkPos::new(-3, 6));
-    chunk_map
-        .pending_generation_tasks
-        .lock()
-        .push(PendingUnit::Holder(waiting));
+    chunk_map.pending_generation_tasks.lock().push(waiting);
 
     assert!(!run_watchdog_epochs(&chunk_map, STALL_WATCHDOG_EPOCHS * 2));
 

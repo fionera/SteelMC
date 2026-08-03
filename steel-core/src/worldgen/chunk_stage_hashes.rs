@@ -15,7 +15,6 @@ use std::mem;
 use std::sync::{Arc, Weak};
 
 use crate::chunk::Chunk;
-use crate::chunk::chunk_generation_task::StaticCache2D;
 use crate::chunk::chunk_holder::ChunkHolder;
 use crate::chunk::chunk_pyramid::{ChunkStep, GENERATION_PYRAMID};
 use crate::chunk::chunk_ticket_manager::ChunkTicketLevel;
@@ -25,6 +24,7 @@ use crate::chunk::light::{
     propagate_block_light_chunk, propagate_sky_light_chunk,
 };
 use crate::chunk::section::{ChunkSection, Sections};
+use crate::chunk::static_cache_2d::StaticCache2D;
 use crate::chunk::status::ChunkStatus;
 use crate::level_data::WorldGenerationSettings;
 use crate::world::{World, WorldConfig, WorldStorageConfig};

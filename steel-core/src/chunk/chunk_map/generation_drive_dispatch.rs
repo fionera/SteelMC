@@ -696,8 +696,8 @@ impl ChunkMap {
     /// output for fifteen minutes and had to be diagnosed by rebuilding with
     /// extra logging.
     ///
-    /// Called once per scheduling epoch. Off the per-holder drive nothing ever
-    /// parks, so the gauge read below is the whole cost.
+    /// Called once per scheduling epoch, and the gauge read below is almost
+    /// always the whole cost: nothing is parked in a healthy pipeline.
     pub(super) fn check_generation_stall_watchdog(&self) {
         let parked = GENERATION_DRIVE_COUNTERS
             .parked_holders
@@ -744,12 +744,9 @@ impl ChunkMap {
     /// Each lock is taken and released on its own line rather than across one
     /// `&&` chain, whose temporaries would live to the end of the statement and
     /// hold the admission inbox while taking the selection queue -- the nesting
-    /// `incoming_generation_tasks` documents as forbidden.
+    /// `GenerationInbox` documents as forbidden.
     fn generation_pipeline_is_idle(&self) -> bool {
         if self.running_generation_tasks.load(Ordering::Acquire) != 0 {
-            return false;
-        }
-        if !self.incoming_generation_tasks.lock().is_empty() {
             return false;
         }
         if !self.pending_generation_tasks.lock().is_empty() {
