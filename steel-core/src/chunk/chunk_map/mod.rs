@@ -6,7 +6,7 @@ use std::{
     env, io, mem,
     sync::{
         Arc, LazyLock, Weak,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -353,6 +353,15 @@ impl GenerationInbox {
         let pending = mem::take(&mut *self.pending.lock());
         pending.iter().filter_map(Weak::upgrade).collect()
     }
+
+    /// Whether anything is queued for admission.
+    ///
+    /// Entries whose holder is already gone still count as pending here. They
+    /// are dropped by the next `take_all`, and the stall watchdog that asks this
+    /// only needs to know whether a drain is still owed.
+    fn is_empty(&self) -> bool {
+        self.pending.lock().is_empty()
+    }
 }
 
 /// One entry of the generation selection queue.
@@ -438,6 +447,12 @@ pub struct ChunkMap {
     /// Holders whose drive stalled, with the backoff that keeps a rescan storm
     /// from turning into a CPU livelock. See `ChunkMap::record_generation_stall`.
     stalled_generation_drives: SyncMutex<Vec<StalledGeneration>>,
+    /// Consecutive scheduling epochs that found the generation pipeline idle
+    /// with holders still parked. See `ChunkMap::check_generation_stall_watchdog`.
+    generation_stall_epochs: AtomicU32,
+    /// Whether the current stall episode has already been dumped, so a
+    /// permanent stall costs one report rather than one per epoch.
+    generation_stall_reported: AtomicBool,
     /// Tracker for background scheduling, generation, save, and unload tasks.
     pub task_tracker: TaskTracker,
     /// Ordered ticket ingress and background scheduling epoch handoff.
@@ -500,6 +515,18 @@ pub struct ChunkMap {
     /// Parent cancellation token for all generation tasks.
     /// Child tokens are created per-task; cancelling this cancels everything.
     pub cancel_token: CancellationToken,
+    /// Test-only replacement for [`Self::max_running_generation_tasks`], zero
+    /// when unset.
+    ///
+    /// The production cap is `generation threads * GENERATION_THREAD_MULTIPLE`,
+    /// and neither factor can be narrowed from inside a test process: the pool
+    /// is shared by every test world in the binary, and the multiple is a
+    /// `LazyLock` over an environment variable, so it is read once and its value
+    /// belongs to whichever test forced it first. A per-map cell is the only way
+    /// to give one test a budget smaller than the dependency fan-out without
+    /// deciding the budget for every other test in the binary.
+    #[cfg(test)]
+    generation_task_cap_override: AtomicUsize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -620,6 +647,8 @@ impl ChunkMap {
             incoming_generation_tasks: SyncMutex::new(Vec::new()),
             pending_generation_tasks: SyncMutex::new(Vec::new()),
             stalled_generation_drives: SyncMutex::new(Vec::new()),
+            generation_stall_epochs: AtomicU32::new(0),
+            generation_stall_reported: AtomicBool::new(false),
             task_tracker: TaskTracker::new(),
             scheduling: ChunkSchedulingCoordinator::new(chunk_tickets),
             full_publications,
@@ -650,7 +679,18 @@ impl ChunkMap {
             generation_refill_stopped: AtomicBool::new(false),
             generation_refill_started: AtomicBool::new(false),
             cancel_token: CancellationToken::new(),
+            #[cfg(test)]
+            generation_task_cap_override: AtomicUsize::new(0),
         }
+    }
+
+    /// Pins the admission cap for one map, for tests that need a budget smaller
+    /// than a chunk's dependency fan-out. See `generation_task_cap_override`.
+    #[cfg(test)]
+    pub(crate) fn set_max_running_generation_tasks_for_test(&self, cap: usize) {
+        assert!(cap > 0, "an admission cap of zero admits nothing at all");
+        self.generation_task_cap_override
+            .store(cap, Ordering::Release);
     }
 
     pub(crate) fn light_work_window_gate(&self) -> Arc<LightWorkWindowGate> {
@@ -1507,6 +1547,16 @@ impl ChunkMap {
                 .collect::<FxHashSet<_>>();
             self.process_unloads(&staged_revivals);
             timings.process_unloads = start.elapsed();
+        }
+
+        // Last in the epoch, and after `process_unloads` rather than before it:
+        // the check reads the same admission state the phases above just left
+        // behind, and its report holds strong references to the holders it names
+        // -- brief, on this thread, and only ever after the pass that frees a
+        // holder at `strong_count == 1` has finished for this epoch.
+        {
+            let _span = tracing::trace_span!("generation_stall_watchdog").entered();
+            self.check_generation_stall_watchdog();
         }
 
         PreparedChunkSchedulingEpoch {

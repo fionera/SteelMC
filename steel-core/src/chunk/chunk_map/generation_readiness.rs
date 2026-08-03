@@ -202,6 +202,13 @@ impl ChunkMap {
     }
 
     pub(super) fn max_running_generation_tasks(&self) -> usize {
+        #[cfg(test)]
+        {
+            let pinned = self.generation_task_cap_override.load(Ordering::Acquire);
+            if pinned != 0 {
+                return pinned;
+            }
+        }
         self.generation_pool.current_num_threads().max(1) * *GENERATION_THREAD_MULTIPLE
     }
 

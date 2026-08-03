@@ -275,6 +275,8 @@ fn unloaded_full_holder(pos: ChunkPos) -> Arc<ChunkHolder> {
     holder
 }
 
+mod generation_drive_admission;
+mod generation_stall_watchdog;
 mod light_updates;
 mod persistence_unloads;
 mod player_tracking;

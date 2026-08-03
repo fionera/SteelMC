@@ -28,7 +28,7 @@ use crate::chunk::chunk_ticket_manager::{
     ChunkTicketLevel, generation_status, is_entity_ticking, is_full,
 };
 use crate::chunk::full_chunk_readiness::FullPublicationQueue;
-use crate::chunk::generation_drive::{DecOutcome, DrivePhase, GenerationDrive};
+use crate::chunk::generation_drive::{DecOutcome, DrivePhase, DriveState, GenerationDrive};
 use crate::chunk::light::{
     LightLayer, LightSectionRange, LightWorkWindowGate, LightWorkWindowReservation,
 };
@@ -1951,6 +1951,18 @@ impl ChunkHolder {
     /// The drive's current epoch, i.e. the ticket a run must act on.
     pub(crate) fn generation_run_ticket(&self) -> u64 {
         self.drive.epoch()
+    }
+
+    /// This holder's drive state if it is parked on dependencies, `None` in
+    /// every other phase.
+    ///
+    /// Answering with the whole state rather than with a bool is what makes the
+    /// answer usable: the stall watchdog reports the outstanding count and the
+    /// park epoch alongside the phase, and reading them through three accessors
+    /// would let a park end between them and print a state that never existed.
+    pub(crate) fn parked_generation_state(&self) -> Option<DriveState> {
+        let state = self.drive.snapshot();
+        (state.phase == DrivePhase::Parked).then_some(state)
     }
 
     /// Whether this holder still holds the queue entry it was pushed with.

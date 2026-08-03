@@ -75,6 +75,30 @@ impl StallReason {
     }
 }
 
+/// Consecutive idle epochs before a parked backlog is reported as a stall.
+///
+/// The idleness test is a sample, not a synchronisation: `run_generation_tasks_b`
+/// moves the arrivals into a local before it takes the selection lock, so a
+/// sample landing in that window sees an empty inbox, an empty queue and no runs
+/// while a whole batch is in flight. One idle epoch therefore proves nothing,
+/// and the bound has to be large enough that hitting that window on every epoch
+/// in a row is not a thing that happens.
+///
+/// 64 is about 0.3 s at the 5 ms mean epoch measured over a 601x601
+/// pregeneration, against a stall that never resolves -- the run this exists for
+/// produced no output for fifteen minutes. The only legitimately quiet window
+/// that is anywhere near that long is the stalled-drive backoff, which reaches
+/// 640 ms and is excluded outright by `generation_pipeline_is_idle`.
+pub(super) const STALL_WATCHDOG_EPOCHS: u32 = 64;
+
+/// Parked holders one report names.
+///
+/// A stall takes out whole regions at once -- every chunk whose halo contains
+/// the stuck one -- so the list is a sample and not an inventory. Thirty-two
+/// entries at one line each is what fits in a terminal alongside the count of
+/// how many there really are.
+const STALL_WATCHDOG_DUMP: usize = 32;
+
 /// First revival delay after a stall.
 const STALL_BACKOFF_BASE: Duration = Duration::from_millis(5);
 /// Doublings the backoff may take, i.e. a ceiling of `BASE << CAP`.
@@ -334,11 +358,7 @@ struct UnmetDependency {
 /// An `Unmet` answer retains *nothing*. Holding the halo across a park is what
 /// made the third attempt cost 13.6 GB: a parked holder would pin up to 529
 /// neighbours against unloading for as long as it waited.
-fn resolve_and_check(
-    chunk_map: &Arc<ChunkMap>,
-    center: ChunkPos,
-    plan: &RunPlan,
-) -> HaloResolution {
+fn resolve_and_check(chunk_map: &ChunkMap, center: ChunkPos, plan: &RunPlan) -> HaloResolution {
     let radius = plan.halo_radius as i32;
     let size = radius * 2 + 1;
     let min_x = center.0.x - radius;
@@ -665,6 +685,213 @@ impl ChunkMap {
         next.append(&mut queue);
         *queue = next;
     }
+
+    /// Turns "the pregeneration hangs" into a list of which chunks are stuck and
+    /// on what.
+    ///
+    /// The failure this exists for is silent by construction: a holder parked
+    /// with nothing left that will ever wake it holds no task, no permit and no
+    /// halo, so there is nothing to see in a thread dump, a profile or the task
+    /// counters. It presented once as a 601x601 repetition that produced no
+    /// output for fifteen minutes and had to be diagnosed by rebuilding with
+    /// extra logging.
+    ///
+    /// Called once per scheduling epoch. Off the per-holder drive nothing ever
+    /// parks, so the gauge read below is the whole cost.
+    pub(super) fn check_generation_stall_watchdog(&self) {
+        let parked = GENERATION_DRIVE_COUNTERS
+            .parked_holders
+            .load(Ordering::Relaxed);
+        if parked <= 0 || !self.generation_pipeline_is_idle() {
+            self.generation_stall_epochs.store(0, Ordering::Relaxed);
+            self.generation_stall_reported
+                .store(false, Ordering::Relaxed);
+            return;
+        }
+
+        let epochs = self
+            .generation_stall_epochs
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        if epochs < STALL_WATCHDOG_EPOCHS || self.generation_stall_reported.load(Ordering::Relaxed)
+        {
+            return;
+        }
+
+        // The gauge is process-wide -- `DependencyWaiter::drop` runs on rayon
+        // workers that hold no map -- while every condition above is this map's
+        // own. An idle Nether therefore reaches here on the Overworld's parks
+        // with nothing wrong, so the report is only made once this map's own
+        // holders confirm it, and the count restarts from zero if they do not.
+        if self.report_parked_holders(parked) {
+            self.generation_stall_reported
+                .store(true, Ordering::Relaxed);
+        } else {
+            // Not ours. Resetting to zero would rescan a whole `chunks` map --
+            // 361k entries at 601x601 -- every `STALL_WATCHDOG_EPOCHS`, forever,
+            // on the epoch thread, where every neighbouring pass is deadline
+            // bounded. Back the next attempt off instead: another map's parks do
+            // not become ours by being looked at again sooner.
+            self.generation_stall_epochs.store(
+                STALL_WATCHDOG_EPOCHS.saturating_sub(STALL_WATCHDOG_EPOCHS / 8),
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    /// Whether nothing is running and nothing is queued to run.
+    ///
+    /// Each lock is taken and released on its own line rather than across one
+    /// `&&` chain, whose temporaries would live to the end of the statement and
+    /// hold the admission inbox while taking the selection queue -- the nesting
+    /// `incoming_generation_tasks` documents as forbidden.
+    fn generation_pipeline_is_idle(&self) -> bool {
+        if self.running_generation_tasks.load(Ordering::Acquire) != 0 {
+            return false;
+        }
+        if !self.incoming_generation_tasks.lock().is_empty() {
+            return false;
+        }
+        if !self.pending_generation_tasks.lock().is_empty() {
+            return false;
+        }
+        if !self.generation_inbox.is_empty() {
+            return false;
+        }
+        // Neither of these is in the watchdog's brief, and both have to be here
+        // anyway: a backlogged holder is one this map has admitted but not yet
+        // armed, and a stalled one is re-armed by `revive_stalled_generation_drives`
+        // after a backoff that reaches `STALL_BACKOFF_BASE << STALL_BACKOFF_DOUBLINGS`
+        // -- 640 ms, which is over a hundred epochs at the 5 ms mean measured
+        // over a 601x601 pregeneration. Without them every deep backoff would
+        // report a stall that resolves itself.
+        if !self.pending_schedule_backlog.lock().is_empty() {
+            return false;
+        }
+        // KNOWN BLIND SPOT. Excluding the stall list stops a deep backoff being
+        // reported as a stall, but it also means a drive that *re-stalls
+        // forever* keeps this list permanently non-empty and so silences the
+        // watchdog -- and a permanently re-stalling drive produces exactly the
+        // symptom the watchdog exists for, a run that emits nothing for minutes.
+        // Distinguishing the two needs the entries' due times, not just
+        // emptiness: legitimately-waiting entries are in backoff, a wedged one is
+        // permanently overdue. Left as-is rather than guessed at, because a
+        // watchdog that cries wolf during normal backoff is worse than one with a
+        // documented gap.
+        self.stalled_generation_drives.lock().is_empty()
+    }
+
+    /// Dumps the parked holders of *this* map. `false` means it has none, i.e.
+    /// the gauge was raised by another map.
+    fn report_parked_holders(&self, gauge: i64) -> bool {
+        let mut sample: Vec<Arc<ChunkHolder>> = Vec::new();
+        let mut parked = 0usize;
+        // Collected first and inspected afterwards: reading a holder's blocker
+        // resolves a halo, which takes `chunks` read guards, and taking one
+        // inside `iter_sync` would reenter the map mid-iteration.
+        self.chunks.iter_sync(|_, holder| {
+            if holder.parked_generation_state().is_some() {
+                parked += 1;
+                if sample.len() < STALL_WATCHDOG_DUMP {
+                    sample.push(Arc::clone(holder));
+                }
+            }
+            true
+        });
+        if parked == 0 {
+            return false;
+        }
+
+        tracing::error!(
+            parked,
+            gauge,
+            listed = sample.len(),
+            epochs = STALL_WATCHDOG_EPOCHS,
+            "Chunk generation has stopped with holders still parked: no generation run is in \
+             flight, the admission inbox and the selection queue are empty, and nothing is left \
+             that will wake them",
+        );
+        for holder in sample {
+            // Re-read rather than carried from the scan: the states below must
+            // agree with the blocker resolved from the same pass, and a park
+            // that ended in between is worth reporting as exactly that.
+            let Some(state) = holder.parked_generation_state() else {
+                tracing::error!(
+                    chunk = ?holder.get_pos(),
+                    "Parked generation drive left its park while the stall was being reported",
+                );
+                continue;
+            };
+            let published = holder.published_status();
+            let next = match published {
+                None => Some(ChunkStatus::Empty),
+                Some(published) => published.next(),
+            };
+            let blocker = next.map_or(ParkBlocker::NoRunLeft, |next| {
+                self.park_blocker(holder.get_pos(), next)
+            });
+            tracing::error!(
+                chunk = ?holder.get_pos(),
+                ?published,
+                ?next,
+                allowed = ?holder.highest_allowed_status(),
+                outstanding = state.outstanding,
+                epoch = state.epoch,
+                ?blocker,
+                "Parked chunk generation drive",
+            );
+        }
+        true
+    }
+
+    /// What the run this holder would make next is still waiting for.
+    pub(super) fn park_blocker(&self, pos: ChunkPos, next: ChunkStatus) -> ParkBlocker {
+        match resolve_and_check(self, pos, &RUN_PLANS[next.get_index()]) {
+            // The most constraining one, i.e. the dependency `fanout_selection`
+            // would have registered first, because that is the one the park is
+            // actually waiting on -- the easier ones publish long before it.
+            HaloResolution::Unmet(unmet) => {
+                fanout_selection(&unmet)
+                    .next()
+                    .map_or(ParkBlocker::NothingUnmet, |dependency| {
+                        ParkBlocker::Dependency {
+                            chunk: dependency.holder.get_pos(),
+                            required: dependency.required,
+                        }
+                    })
+            }
+            HaloResolution::Missing(chunk) => ParkBlocker::MissingHolder(chunk),
+            HaloResolution::Ready(_) => ParkBlocker::NothingUnmet,
+        }
+    }
+}
+
+/// What one parked holder is waiting for, as of the moment the watchdog looked.
+///
+/// Every payload is read through the `Debug` rendering the log line carries and
+/// through nothing else, which dead-code analysis deliberately does not count.
+#[derive(Debug)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "rendered into the stall report by Debug")
+)]
+pub(super) enum ParkBlocker {
+    /// The dependency the park is really waiting on.
+    Dependency {
+        chunk: ChunkPos,
+        required: ChunkStatus,
+    },
+    /// A halo cell with no holder. Nothing there can publish a status, so the
+    /// park cannot end on one -- the drive should have stalled instead, and the
+    /// backoff revival should have re-armed it.
+    MissingHolder(ChunkPos),
+    /// Every dependency of the next run is met, so this park has outlived its
+    /// cause: a registration was lost, or the requeue it produced never reached
+    /// the admission inbox.
+    NothingUnmet,
+    /// Parked with no run left to make. The holder is at its last status and
+    /// should not have parked at all.
+    NoRunLeft,
 }
 
 #[cfg(test)]
