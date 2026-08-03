@@ -133,8 +133,11 @@ impl Options {
             // The server's own defaults, so a bench number and a real run number
             // describe the same configuration.
             generation_threads: default_chunk_generation_threads(available),
-            chunk_workers: (available / 8).clamp(4, 16),
-            main_workers: (available / 2).max(2),
+            // Mirrors the server's drive-aware sizing in `steel/src/main.rs`;
+            // the two must agree or a benchmark number does not describe a
+            // server run.
+            chunk_workers: (available / 5).clamp(4, 24),
+            main_workers: (available / 8).clamp(4, 16),
             encoding_threads: (available / 8).clamp(2, 12),
             window_size: None,
             active_windows: None,

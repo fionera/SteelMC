@@ -137,6 +137,18 @@ fn default_generation_thread_multiple() -> usize {
 /// would make that reachable through a config reload or a mid-run flip; a
 /// `LazyLock` read from the environment cannot change after the first holder is
 /// armed.
+/// Whether chunk generation runs on the per-holder drive.
+///
+/// Exposed because the binary crate sizes its two tokio runtimes, and the right
+/// sizes differ per dispatcher: the drive hands a holder's permit back when it
+/// parks and takes a fresh one when it wakes, so the orchestration runtimes see
+/// many more, much shorter tasks than the task model's long-lived per-chunk
+/// ones. Anything sized against the old traffic pattern is mis-sized.
+#[must_use]
+pub fn generation_drive_enabled() -> bool {
+    *STAGE1
+}
+
 pub(crate) static STAGE1: LazyLock<bool> = LazyLock::new(|| {
     // On by default. `STEEL_STAGE1=0` returns to the layer-walking task model,
     // which stays in the tree until the drive has run in anger for a while.

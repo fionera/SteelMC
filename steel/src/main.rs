@@ -14,6 +14,7 @@ use futures::FutureExt;
 use steel::config::{self, LogConfig};
 use steel::logger::CommandLogger;
 use steel::{SERVER, SteelServer, logger::LoggerLayer};
+use steel_core::chunk::chunk_map::generation_drive_enabled;
 use steel_core::player::player_data::PersistentPlayerData;
 use steel_core::player::player_data_storage::GlobalPlayerData;
 use steel_core::player::player_inventory::MenuRemovalStatus;
@@ -207,6 +208,13 @@ fn worker_threads_for_available(
         return configured_threads.min(available_threads);
     }
 
+    if generation_drive_enabled() {
+        // Measured at 601x601 under the drive: 16 -> 10,301 chunks/s, 32 ->
+        // 10,208, 64 -> 10,152. Under the task model the same sweep was flat, so
+        // half the machine was as good as anything; it is not any more.
+        return (available_threads / 8).clamp(4, 16).min(available_threads);
+    }
+
     ((available_threads / 2).max(2)).min(available_threads)
 }
 
@@ -235,6 +243,14 @@ fn chunk_worker_threads_for_available(
     let available_threads = available_threads.max(1);
     if let Some(configured_threads) = configured_threads.filter(|&threads| threads > 0) {
         return configured_threads.min(available_threads);
+    }
+
+    if generation_drive_enabled() {
+        // 601x601 under the drive: 12 -> 10,045, 16 -> 10,108, 20 -> 10,313,
+        // 24 -> 10,333, 28 -> 10,177, 32 -> 10,027. The task model measured a
+        // flat plateau from 16 to 32 here; the drive has a peak instead, because
+        // a parked holder returns its permit and is re-admitted as a new task.
+        return (available_threads / 5).clamp(4, 24).min(available_threads);
     }
 
     (available_threads / 8).clamp(4, 16).min(available_threads)
