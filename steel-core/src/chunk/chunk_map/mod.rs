@@ -138,8 +138,11 @@ fn default_generation_thread_multiple() -> usize {
 /// `LazyLock` read from the environment cannot change after the first holder is
 /// armed.
 pub(crate) static STAGE1: LazyLock<bool> = LazyLock::new(|| {
-    env::var("STEEL_STAGE1")
-        .is_ok_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "True" | "yes" | "on"))
+    // On by default. `STEEL_STAGE1=0` returns to the layer-walking task model,
+    // which stays in the tree until the drive has run in anger for a while.
+    env::var("STEEL_STAGE1").map_or(true, |value| {
+        !matches!(value.trim(), "0" | "false" | "FALSE" | "False" | "no" | "off")
+    })
 });
 
 /// Dependencies one parked holder may register waiters with, per park.
