@@ -367,6 +367,53 @@ impl RunPlan {
 /// The fused run starting at each status.
 pub const RUN_PLANS: [RunPlan; STATUS_COUNT] = build_run_plans();
 
+/// The most any run's ring asks of a neighbour at each Chebyshev distance.
+///
+/// This is what lets the generation drive stop re-reading a halo cell. A drive
+/// re-checks its cached halo once per run, and published status is monotone, so
+/// a cell seen at or past *every* requirement any plan can put on its distance
+/// can never gate any of that drive's remaining runs and is dropped from the
+/// walk for good. Against the current pyramid the entry is `StructureStarts`
+/// from distance 2 outwards, which is exactly what a radius-8 halo has to
+/// satisfy to resolve at all -- so the 289-cell re-check collapses to the nine
+/// innermost cells after the first successful resolve.
+///
+/// Folded over every plan rather than over the ones a drive has left to run. A
+/// drive's plan sequence only moves forward, so a per-plan suffix would be
+/// tighter, but the only distances where the two differ are 0 and 1 -- nine
+/// cells of the square -- and this table cannot go stale against a drive
+/// resuming mid-pyramid off a disk load.
+const MAX_RING_REQUIREMENT: [Option<ChunkStatus>; MAX_RADIUS] = build_max_ring_requirement();
+
+const fn build_max_ring_requirement() -> [Option<ChunkStatus>; MAX_RADIUS] {
+    let mut table = [None; MAX_RADIUS];
+    let mut distance = 0;
+    while distance < MAX_RADIUS {
+        let mut index = 0;
+        while index < STATUS_COUNT {
+            table[distance] =
+                const_max_status(table[distance], RUN_PLANS[index].ring.get(distance));
+            index += 1;
+        }
+        distance += 1;
+    }
+    table
+}
+
+/// The most any run's ring asks of a neighbour at `distance`.
+///
+/// `None` means no ring names that distance at all: cells out there are
+/// halo-only -- present so the step can read them, gating nothing -- so they are
+/// settled the moment they are resolved.
+#[must_use]
+pub const fn max_ring_requirement(distance: usize) -> Option<ChunkStatus> {
+    if distance < MAX_RADIUS {
+        MAX_RING_REQUIREMENT[distance]
+    } else {
+        None
+    }
+}
+
 const fn build_run_plans() -> [RunPlan; STATUS_COUNT] {
     let mut plans = [RunPlan::PLACEHOLDER; STATUS_COUNT];
     let mut index = 0;
@@ -660,7 +707,8 @@ mod fusion_tests {
 #[cfg(test)]
 mod run_plan_tests {
     use super::{
-        ChunkStatus, GENERATION_PYRAMID, LIGHT_HALO_RADIUS, RUN_PLANS, STATUS_COUNT,
+        ChunkStatus, GENERATION_PYRAMID, LIGHT_HALO_RADIUS, MAX_RADIUS, RUN_PLANS, STATUS_COUNT,
+        max_ring_requirement,
     };
     use crate::chunk::chunk_ticket_manager::{ChunkTicketLevel, generation_status};
 
@@ -835,6 +883,54 @@ mod run_plan_tests {
                     distance - 1,
                 );
             }
+        }
+    }
+
+    /// A8 -- the retirement table dominates every ring.
+    ///
+    /// The drive's halo re-check drops a cell as soon as it has been seen at
+    /// `max_ring_requirement` for its distance. If the table ever understated a
+    /// plan's ring, the cell that plan gates on would be dropped before it was
+    /// checked, and the run would dispatch against a neighbour that has not
+    /// reached the status it reads -- `claim_status_work`'s compare-exchange
+    /// panic, or the `has_parent` assertion in `apply_generated_steps`.
+    #[test]
+    fn the_retirement_table_dominates_every_runs_ring() {
+        for status in statuses() {
+            let plan = &RUN_PLANS[status.get_index()];
+            for distance in 0..=plan.halo_radius {
+                assert!(
+                    max_ring_requirement(distance) >= plan.ring.get(distance),
+                    "the run starting at {:?} needs {:?} at distance {distance}, but a re-check \
+                     retires that distance at {:?}",
+                    plan.first,
+                    plan.ring.get(distance),
+                    max_ring_requirement(distance),
+                );
+            }
+        }
+        // Distances the table does not cover must read as "nothing is ever asked
+        // here", not index out of bounds.
+        assert_eq!(max_ring_requirement(MAX_RADIUS), None);
+        assert_eq!(max_ring_requirement(usize::MAX), None);
+    }
+
+    /// What makes the re-check cheap rather than merely correct.
+    ///
+    /// A radius-8 halo only resolves once every cell is at `StructureStarts`,
+    /// and from distance 2 outwards that is also the most any ring asks -- so
+    /// the 280 outer cells retire on the resolve that produced them and the
+    /// three remaining re-checks of that halo walk nine cells. A pyramid change
+    /// that raised any outer entry would put those 280 cells back into every
+    /// re-check without breaking a thing, so it is pinned here.
+    #[test]
+    fn the_outer_rings_retire_at_the_status_a_wide_halo_already_needs() {
+        for distance in 2..=RUN_PLANS[ChunkStatus::Noise.get_index()].halo_radius {
+            assert_eq!(
+                max_ring_requirement(distance),
+                Some(ChunkStatus::StructureStarts),
+                "distance {distance} no longer retires at the status a radius-8 resolve proves",
+            );
         }
     }
 

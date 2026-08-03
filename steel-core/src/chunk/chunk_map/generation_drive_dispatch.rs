@@ -41,7 +41,7 @@ use steel_utils::ChunkPos;
 use crate::chunk::{
     chunk_holder::{ChunkHolder, GENERATION_DRIVE_COUNTERS},
     chunk_map::{ChunkMap, GENERATION_FANOUT, StalledGeneration},
-    chunk_pyramid::{GENERATION_PYRAMID, RUN_PLANS, RunPlan},
+    chunk_pyramid::{GENERATION_PYRAMID, RUN_PLANS, RunPlan, max_ring_requirement},
     generation_drive::DecOutcome,
     static_cache_2d::StaticCache2D,
     status::ChunkStatus,
@@ -178,17 +178,14 @@ async fn drive_runs(holder: &Arc<ChunkHolder>, chunk_map: &Arc<ChunkMap>) {
         // panics on.
         let plan = &RUN_PLANS[next.get_index()];
 
-        let resolution = match cached_halo.as_ref() {
+        let resolution = match cached_halo.as_mut() {
             Some(cached) if cached.radius >= plan.halo_radius as i32 => {
-                recheck_cached(&cached.cache, holder.get_pos(), plan)
+                recheck_cached(cached, plan)
             }
             _ => {
                 let resolved = resolve_and_check(chunk_map, holder.get_pos(), plan);
                 if let HaloResolution::Ready(ref cache) = resolved {
-                    cached_halo = Some(CachedHalo {
-                        radius: plan.halo_radius as i32,
-                        cache: Arc::clone(cache),
-                    });
+                    cached_halo = Some(CachedHalo::new(holder.get_pos(), plan, Arc::clone(cache)));
                 }
                 resolved
             }
@@ -315,13 +312,100 @@ fn stall(
     true
 }
 
-/// What one pass over the run's square found.
 /// A halo resolved for one run and reused by the runs after it.
 struct CachedHalo {
     radius: i32,
     cache: Arc<StaticCache2D<Arc<ChunkHolder>>>,
+    /// The cells a later run can still be blocked by, outermost first.
+    ///
+    /// Invariant: every entry has `!is_settled(distance, seen)`, and every cell
+    /// of the square that is *not* here has been seen at or past
+    /// [`max_ring_requirement`] for its distance. Both halves are maintained at
+    /// the two points a `seen` is written -- [`CachedHalo::new`] and the read in
+    /// [`recheck_cached`] -- and nowhere else.
+    pending: Vec<PendingCell>,
 }
 
+/// A halo cell a re-check may still have to read.
+struct PendingCell {
+    holder: Arc<ChunkHolder>,
+    /// Chebyshev distance from the drive's chunk, which is what selects this
+    /// cell's requirement out of a plan's ring. Constant for the life of the
+    /// cache: the square is centred on that chunk and the drive never moves.
+    distance: usize,
+    /// The highest status this cell has been *observed* at -- either a read of
+    /// `published_status`, or the requirement a resolve proved it past. Never an
+    /// inference from a previous run's requirement being met, which is the trap:
+    /// "satisfied" is only meaningful against one requirement, and a later run
+    /// asks more of the same cell.
+    ///
+    /// A published status only ever rises -- `raise_published_status` drops a
+    /// raise that does not exceed the current word, nothing resets it, and the
+    /// holder behind an `Arc` this drive holds cannot be replaced -- so this
+    /// stays a lower bound on the cell's real status for as long as the cache
+    /// lives. That is the whole licence for skipping a cell: `seen >= required`
+    /// implies `published >= required` now and for the rest of the drive.
+    seen: Option<ChunkStatus>,
+}
+
+/// Whether a cell seen at `seen` can be dropped from the walk for good.
+///
+/// [`max_ring_requirement`] is the most *any* run's ring asks at this distance,
+/// so a cell at or past it satisfies every requirement any remaining run of this
+/// drive can put on it. `None` there names a distance no ring mentions -- the
+/// halo-only outer window the `Light` run reads opportunistically -- and
+/// `None >= None` retires those cells without ever reading one.
+fn is_settled(distance: usize, seen: Option<ChunkStatus>) -> bool {
+    // `Option`'s ordering puts `None` below every status, which is exactly the
+    // meaning both sides carry here: unpublished, and unrequired.
+    seen >= max_ring_requirement(distance)
+}
+
+impl CachedHalo {
+    /// Wraps a halo `resolve_and_check` just returned `Ready` for.
+    ///
+    /// The cells are seeded from `plan.ring` rather than from the statuses the
+    /// resolve read. A `Ready` answer *is* the proof that every cell at a
+    /// distance is at or past what the ring asks there, so the requirement is a
+    /// sound lower bound, and it is one the pass does not have to carry out.
+    /// It is a weaker bound than the reading -- a neighbour that had already run
+    /// ahead is recorded as merely meeting the ring -- which costs at most one
+    /// re-read of that cell on the next run and settles it then.
+    fn new(center: ChunkPos, plan: &RunPlan, cache: Arc<StaticCache2D<Arc<ChunkHolder>>>) -> Self {
+        let radius = plan.halo_radius as i32;
+        let mut pending = Vec::new();
+        // Descending, like `resolve_and_check`: `recheck_cached` walks this list
+        // in order and `fanout_selection` takes the tail of what it emits.
+        for distance in (0..=radius).rev() {
+            let seen = plan.ring.get(distance as usize);
+            if is_settled(distance as usize, seen) {
+                // The whole ring at once, without visiting a cell. This is where
+                // a radius-8 halo sheds its 280 outer cells: it only resolved
+                // because they were all at `StructureStarts`, and that is the
+                // most any plan asks out there.
+                continue;
+            }
+            for (x, z) in ring_cells(center, distance) {
+                let Some(holder) = cache.try_get(x, z) else {
+                    unreachable!("the halo was just resolved out to this radius");
+                };
+                pending.push(PendingCell {
+                    holder: Arc::clone(holder),
+                    distance: distance as usize,
+                    seen,
+                });
+            }
+        }
+
+        Self {
+            radius,
+            cache,
+            pending,
+        }
+    }
+}
+
+/// What one pass over the run's square found.
 enum HaloResolution {
     /// Every cell is present and every required cell is at or past what the run
     /// needs of it.
@@ -426,42 +510,49 @@ fn resolve_and_check(chunk_map: &ChunkMap, center: ChunkPos, plan: &RunPlan) -> 
 /// `Arc` across revival, and one cannot be replaced while this drive holds a
 /// reference -- so only their statuses need re-reading, and those come straight
 /// off the cached `Arc`s.
-fn recheck_cached(
-    cache: &Arc<StaticCache2D<Arc<ChunkHolder>>>,
-    center: ChunkPos,
-    plan: &RunPlan,
-) -> HaloResolution {
-    let radius = plan.halo_radius as i32;
+///
+/// Caching the square only removed the lookups, not the walk: re-reading all 289
+/// statuses of a radius-8 halo on each of the three runs that reuse it left this
+/// pass at 2.98% of a 601x601 pregeneration. It does not have to look at a cell
+/// twice. `published_status` is monotone, so a cell seen at or past what the run
+/// asks of it is met whatever it does next, and [`CachedHalo::pending`] carries
+/// exactly the cells that have not yet been seen that high -- nine of the 289,
+/// once the halo has resolved. What it carries is the *status* each cell reached
+/// rather than a "satisfied" flag: the requirement rises between runs, so a flag
+/// set against one run's ring would clear cells the next run is still waiting
+/// for.
+fn recheck_cached(cached: &mut CachedHalo, plan: &RunPlan) -> HaloResolution {
     let mut unmet: Vec<UnmetDependency> = Vec::new();
 
-    // Same descending-distance order as `resolve_and_check`: the fan-out takes
+    // `retain_mut` keeps the order `CachedHalo::new` built, which is the
+    // descending-distance order `resolve_and_check` walks in: the fan-out takes
     // the tail of `unmet`, and that is only the most constraining dependencies
-    // if the walk emits them in this order.
-    for distance in (0..=radius).rev() {
-        let Some(required) = plan.ring.get(distance as usize) else {
-            continue;
+    // if the emitted order is preserved.
+    cached.pending.retain_mut(|cell| {
+        let Some(required) = plan.ring.get(cell.distance) else {
+            // Halo-only for *this* run. The cell has to stay in the cache for
+            // the step to read -- that is how `Light` keeps its opportunistic
+            // radius-2 window -- but it gates nothing here, so it is neither
+            // read nor retired: a later run may still ask something of it.
+            return true;
         };
-        for (x, z) in ring_cells(center, distance) {
-            let Some(holder) = cache.try_get(x, z) else {
-                // The cached halo is smaller than this run needs. The caller
-                // only calls in when it is at least as large, so this is a bug
-                // rather than a state to recover from.
-                unreachable!("a cached halo is only reused when it covers the run");
-            };
-            if holder
-                .published_status()
-                .is_none_or(|published| published < required)
-            {
-                unmet.push(UnmetDependency {
-                    holder: Arc::clone(holder),
-                    required,
-                });
-            }
+        if cell.seen.is_some_and(|seen| seen >= required) {
+            return true;
         }
-    }
+
+        cell.seen = cell.holder.published_status();
+        if cell.seen.is_none_or(|seen| seen < required) {
+            unmet.push(UnmetDependency {
+                holder: Arc::clone(&cell.holder),
+                required,
+            });
+            return true;
+        }
+        !is_settled(cell.distance, cell.seen)
+    });
 
     if unmet.is_empty() {
-        HaloResolution::Ready(Arc::clone(cache))
+        HaloResolution::Ready(Arc::clone(&cached.cache))
     } else {
         HaloResolution::Unmet(unmet)
     }
@@ -899,15 +990,22 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        GENERATION_FANOUT, RUN_PLANS, StallReason, UnmetDependency, fanout_selection, ring_cells,
+        CachedHalo, GENERATION_FANOUT, HaloResolution, PendingCell, RUN_PLANS, StallReason,
+        UnmetDependency, fanout_selection, recheck_cached, ring_cells,
     };
     use crate::chunk::{
         chunk_holder::{ChunkHolder, STALL_REASON_COUNT},
         chunk_ticket_manager::ChunkTicketLevel,
+        static_cache_2d::StaticCache2D,
         status::ChunkStatus,
     };
 
     const CENTRE: ChunkPos = ChunkPos::new(-3, 7);
+
+    /// The cell the re-check tests hold back while everything around it moves on.
+    const LAGGARD: ChunkPos = ChunkPos::new(CENTRE.0.x + 1, CENTRE.0.y);
+    /// The widest halo the pyramid resolves, which is the one worth testing.
+    const HALO_RADIUS: i32 = 8;
 
     /// The pass that fills a run's halo visits each cell by ring and then indexes
     /// the backing vector directly, so a ring that skipped a cell would leave a
@@ -1007,9 +1105,233 @@ mod tests {
         );
     }
 
-    fn unmet_holder() -> Arc<ChunkHolder> {
-        Arc::new(ChunkHolder::new(
+    /// A cell that is behind when one run looks at it stays behind when the next
+    /// run looks at it, and the next run asks for *more*.
+    ///
+    /// This is the case the narrowing must not lose: the cell is skipped by
+    /// nothing, because it never reaches a status that settles it, and both runs
+    /// have to see it.
+    #[test]
+    fn a_cell_behind_at_one_requirement_is_reported_again_at_the_next() {
+        let cache = square(HALO_RADIUS);
+        publish_all(&cache, ChunkStatus::StructureStarts);
+        let mut cached = CachedHalo::new(
             CENTRE,
+            &RUN_PLANS[ChunkStatus::StructureReferences.get_index()],
+            Arc::clone(&cache),
+        );
+        assert_eq!(
+            cached.pending.len(),
+            9,
+            "a radius-8 halo only resolves once every cell is at StructureStarts, which is what \
+             retires everything from distance 2 out",
+        );
+
+        // The drive and its neighbourhood run on; one neighbour does not.
+        for holder in cells(&cache) {
+            if holder.get_pos() != LAGGARD {
+                holder.finish_generation_status_for_test(ChunkStatus::Carvers);
+            }
+        }
+
+        let unmet = unmet_of(recheck_cached(
+            &mut cached,
+            &RUN_PLANS[ChunkStatus::Noise.get_index()],
+        ));
+        assert_eq!(blocked_by(&unmet), vec![(LAGGARD, ChunkStatus::Biomes)]);
+
+        let unmet = unmet_of(recheck_cached(
+            &mut cached,
+            &RUN_PLANS[ChunkStatus::Features.get_index()],
+        ));
+        assert_eq!(blocked_by(&unmet), vec![(LAGGARD, ChunkStatus::Carvers)]);
+    }
+
+    /// The trap a "satisfied" bitmap falls into.
+    ///
+    /// `Noise` needs `Biomes` of its radius-1 neighbours and `Features` needs
+    /// `Carvers` of them, so a cell that met the first run's ring exactly is
+    /// still a dependency of the second. Recording the *status* a cell reached
+    /// rather than a flag is what keeps it in the walk.
+    #[test]
+    fn a_cell_met_for_one_run_is_re_read_for_the_next_runs_higher_requirement() {
+        let cache = square(HALO_RADIUS);
+        publish_all(&cache, ChunkStatus::StructureStarts);
+        let mut cached = CachedHalo::new(
+            CENTRE,
+            &RUN_PLANS[ChunkStatus::StructureReferences.get_index()],
+            Arc::clone(&cache),
+        );
+
+        for holder in cells(&cache) {
+            holder.finish_generation_status_for_test(if holder.get_pos() == LAGGARD {
+                ChunkStatus::Biomes
+            } else {
+                ChunkStatus::Carvers
+            });
+        }
+
+        assert!(
+            matches!(
+                recheck_cached(&mut cached, &RUN_PLANS[ChunkStatus::Noise.get_index()]),
+                HaloResolution::Ready(_),
+            ),
+            "Biomes is exactly what the Noise run asks of a radius-1 neighbour",
+        );
+
+        let unmet = unmet_of(recheck_cached(
+            &mut cached,
+            &RUN_PLANS[ChunkStatus::Features.get_index()],
+        ));
+        assert_eq!(blocked_by(&unmet), vec![(LAGGARD, ChunkStatus::Carvers)]);
+    }
+
+    /// A cell is dropped from the walk only once it is past everything any run
+    /// can ask of its distance -- and then it really is dropped.
+    #[test]
+    fn a_cell_seen_at_the_retirement_status_leaves_the_walk() {
+        let cache = square(HALO_RADIUS);
+        publish_all(&cache, ChunkStatus::StructureStarts);
+        let mut cached = CachedHalo::new(
+            CENTRE,
+            &RUN_PLANS[ChunkStatus::StructureReferences.get_index()],
+            Arc::clone(&cache),
+        );
+
+        publish_all(&cache, ChunkStatus::InitializeLight);
+        assert!(matches!(
+            recheck_cached(&mut cached, &RUN_PLANS[ChunkStatus::Light.get_index()]),
+            HaloResolution::Ready(_),
+        ));
+        assert_eq!(
+            cached
+                .pending
+                .iter()
+                .map(|cell| cell.holder.get_pos())
+                .collect::<Vec<_>>(),
+            vec![CENTRE],
+            "InitializeLight is the most any ring asks at distance 1, so those eight cells are \
+             done; distance 0 is asked for Spawn by the Full run and stays",
+        );
+    }
+
+    /// The re-check emits its unmet set outermost-first, which is the whole
+    /// basis of `fanout_selection` taking the tail: a run's ring never rises
+    /// with radius, so that order runs from the lowest requirement to the
+    /// highest and the tail is what actually gates the run.
+    #[test]
+    fn the_re_check_emits_its_unmet_set_outermost_first() {
+        let cache = square(HALO_RADIUS);
+        let mut cached = CachedHalo {
+            radius: HALO_RADIUS,
+            cache: Arc::clone(&cache),
+            // Nothing observed anywhere: the widest walk the narrowing can
+            // produce, so the ordering is tested over the whole square rather
+            // than over the nine cells a settled halo leaves.
+            pending: unobserved(&cache),
+        };
+
+        let unmet = unmet_of(recheck_cached(
+            &mut cached,
+            &RUN_PLANS[ChunkStatus::Noise.get_index()],
+        ));
+        assert_eq!(
+            unmet.len(),
+            17 * 17,
+            "nothing is published, so nothing is met"
+        );
+
+        let distances: Vec<i32> = unmet
+            .iter()
+            .map(|dependency| chebyshev(dependency.holder.get_pos()))
+            .collect();
+        assert!(
+            distances.windows(2).all(|pair| pair[0] >= pair[1]),
+            "the walk must stay outermost-first: {distances:?}",
+        );
+        assert!(
+            unmet
+                .windows(2)
+                .all(|pair| pair[0].required <= pair[1].required),
+            "outermost-first must put the most constraining requirements at the tail",
+        );
+        assert_eq!(
+            fanout_selection(&unmet)
+                .next()
+                .map(|dependency| dependency.required),
+            Some(ChunkStatus::Biomes),
+            "the park must register the innermost ring first",
+        );
+    }
+
+    fn chebyshev(pos: ChunkPos) -> i32 {
+        (pos.0.x - CENTRE.0.x)
+            .abs()
+            .max((pos.0.y - CENTRE.0.y).abs())
+    }
+
+    /// A halo of fresh holders around [`CENTRE`], as `resolve_and_check` builds.
+    fn square(radius: i32) -> Arc<StaticCache2D<Arc<ChunkHolder>>> {
+        let size = radius * 2 + 1;
+        let min_x = CENTRE.0.x - radius;
+        let min_z = CENTRE.0.y - radius;
+        let cells = (0..size * size)
+            .map(|index| holder_at(ChunkPos::new(min_x + index % size, min_z + index / size)))
+            .collect();
+        Arc::new(StaticCache2D::from_row_major(min_x, min_z, size, cells))
+    }
+
+    /// Every cell of a [`square`] of `HALO_RADIUS`, outermost first.
+    fn cells(
+        cache: &Arc<StaticCache2D<Arc<ChunkHolder>>>,
+    ) -> impl Iterator<Item = &Arc<ChunkHolder>> {
+        (0..=HALO_RADIUS)
+            .rev()
+            .flat_map(|distance| ring_cells(CENTRE, distance).map(|(x, z)| cache.get(x, z)))
+    }
+
+    fn publish_all(cache: &Arc<StaticCache2D<Arc<ChunkHolder>>>, status: ChunkStatus) {
+        for holder in cells(cache) {
+            holder.finish_generation_status_for_test(status);
+        }
+    }
+
+    /// The pending set of a halo nothing has been observed in yet.
+    fn unobserved(cache: &Arc<StaticCache2D<Arc<ChunkHolder>>>) -> Vec<PendingCell> {
+        (0..=HALO_RADIUS)
+            .rev()
+            .flat_map(|distance| {
+                ring_cells(CENTRE, distance).map(move |(x, z)| PendingCell {
+                    holder: Arc::clone(cache.get(x, z)),
+                    distance: distance as usize,
+                    seen: None,
+                })
+            })
+            .collect()
+    }
+
+    fn unmet_of(resolution: HaloResolution) -> Vec<UnmetDependency> {
+        match resolution {
+            HaloResolution::Unmet(unmet) => unmet,
+            HaloResolution::Ready(_) => panic!("the run was expected to be blocked"),
+            HaloResolution::Missing(pos) => panic!("a cached halo cannot lose {pos:?}"),
+        }
+    }
+
+    fn blocked_by(unmet: &[UnmetDependency]) -> Vec<(ChunkPos, ChunkStatus)> {
+        unmet
+            .iter()
+            .map(|dependency| (dependency.holder.get_pos(), dependency.required))
+            .collect()
+    }
+
+    fn unmet_holder() -> Arc<ChunkHolder> {
+        holder_at(CENTRE)
+    }
+
+    fn holder_at(pos: ChunkPos) -> Arc<ChunkHolder> {
+        Arc::new(ChunkHolder::new(
+            pos,
             ChunkTicketLevel::FULL_CHUNK,
             Some(ChunkTicketLevel::FULL_CHUNK),
             0,
