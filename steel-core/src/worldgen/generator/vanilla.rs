@@ -399,6 +399,18 @@ impl<N: VanillaPostNoiseStateType> ChunkGenerator for VanillaGenerator<N> {
         chunk.mark_dirty();
     }
 
+    // `enum_dispatch` on `ChunkGeneratorType` otherwise inlines all three
+    // dimension monomorphisations behind one jump table, producing a single
+    // 24 KiB symbol of which only the ~8 KiB matching the running dimension is
+    // ever fetched -- and LLVM lays the three bodies out interleaved, so the
+    // dead ones sit inside the live one's fetch stream. Outlining costs one
+    // call per chunk (this runs once per chunk, not per block: instruction
+    // count moved +0.2%) and cut machine-wide `ic_tag_hit_miss.
+    // instruction_cache_miss` by 12% over a 201x201 pregeneration, this
+    // function's own share of those misses by half. It did *not* move
+    // throughput or `stalled-cycles-frontend`, because at a 93.8% op-cache hit
+    // rate these loops are not fetching from L1I in steady state.
+    #[inline(never)]
     fn fill_from_noise(
         &self,
         chunk: GenerationChunk<'_, NoisePhase>,
@@ -509,6 +521,10 @@ impl<N: VanillaPostNoiseStateType> ChunkGenerator for VanillaGenerator<N> {
     }
 
     #[expect(clippy::too_many_lines, reason = "splitting would hurt readability")]
+    // Same reason as `fill_from_noise`: the merged `enum_dispatch` body was
+    // 32 KiB (overworld 14 KiB + nether 9.5 KiB + end 8.5 KiB), which is the
+    // whole L1I for a function whose hot core is 5.6 KiB.
+    #[inline(never)]
     fn build_surface(
         &self,
         chunk: GenerationChunk<'_, SurfacePhase>,
