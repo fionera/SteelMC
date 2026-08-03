@@ -99,6 +99,12 @@ async fn drive_runs(holder: &Arc<ChunkHolder>, chunk_map: &Arc<ChunkMap>) {
         return;
     }
 
+    // Carried across runs, dropped the moment this drive stops running. A
+    // *parked* holder must retain nothing -- that is what made the previous
+    // attempt reach 13.6 GB and stop completing -- but a *running* one may, and
+    // the layer-walking model it replaces held a wider halo for longer.
+    let mut cached_halo: Option<CachedHalo> = None;
+
     loop {
         // Snapshotting the ticket *before* reading anything else is the driver
         // half of the Dekker pairing in `generation_drive`: an armer stores the
@@ -148,7 +154,23 @@ async fn drive_runs(holder: &Arc<ChunkHolder>, chunk_map: &Arc<ChunkMap>) {
         // panics on.
         let plan = &RUN_PLANS[next.get_index()];
 
-        match resolve_and_check(chunk_map, holder.get_pos(), plan) {
+        let resolution = match cached_halo.as_ref() {
+            Some(cached) if cached.radius >= plan.halo_radius as i32 => {
+                recheck_cached(&cached.cache, holder.get_pos(), plan)
+            }
+            _ => {
+                let resolved = resolve_and_check(chunk_map, holder.get_pos(), plan);
+                if let HaloResolution::Ready(ref cache) = resolved {
+                    cached_halo = Some(CachedHalo {
+                        radius: plan.halo_radius as i32,
+                        cache: Arc::clone(cache),
+                    });
+                }
+                resolved
+            }
+        };
+
+        match resolution {
             HaloResolution::Ready(halo) => {
                 let step = GENERATION_PYRAMID.get_step_to(plan.first);
                 let Some(ready) = holder.apply_step(
@@ -163,9 +185,11 @@ async fn drive_runs(holder: &Arc<ChunkHolder>, chunk_map: &Arc<ChunkMap>) {
                     continue;
                 };
                 // `apply_step` has already cloned the halo into the job it
-                // spawned. Holding a second reference across the await would
-                // keep every one of those holders alive against unloading for
-                // the whole run, for nothing.
+                // spawned, so this reference is spare. `cached_halo` still holds
+                // one for the runs after this: the holders stay pinned either
+                // way while this drive is running, and re-resolving them per run
+                // is what made this dispatcher slower than the model it
+                // replaces.
                 drop(halo);
                 match ready.await {
                     Some(()) => holder.clear_stall_backoff(),
@@ -179,10 +203,16 @@ async fn drive_runs(holder: &Arc<ChunkHolder>, chunk_map: &Arc<ChunkMap>) {
             // The permit is released by returning, before anything waits for
             // this holder -- that is the difference between this design and the
             // three that deadlocked.
-            HaloResolution::Unmet(unmet) => match park(holder, ticket, &unmet) {
-                ParkOutcome::Parked => return,
-                ParkOutcome::ReEvaluate => {}
-            },
+            HaloResolution::Unmet(unmet) => {
+                // Freed before the park handshake, not after: once registered,
+                // this holder can be woken and re-admitted by another thread
+                // while this stack is still unwinding.
+                cached_halo = None;
+                match park(holder, ticket, &unmet) {
+                    ParkOutcome::Parked => return,
+                    ParkOutcome::ReEvaluate => {}
+                }
+            }
             HaloResolution::Missing(pos) => {
                 if stall(chunk_map, holder, ticket, StallReason::HaloMiss(pos)) {
                     return;
@@ -262,6 +292,12 @@ fn stall(
 }
 
 /// What one pass over the run's square found.
+/// A halo resolved for one run and reused by the runs after it.
+struct CachedHalo {
+    radius: i32,
+    cache: Arc<StaticCache2D<Arc<ChunkHolder>>>,
+}
+
 enum HaloResolution {
     /// Every cell is present and every required cell is at or past what the run
     /// needs of it.
@@ -355,6 +391,60 @@ fn resolve_and_check(
     HaloResolution::Ready(Arc::new(StaticCache2D::from_row_major(
         min_x, min_z, size, cells,
     )))
+}
+
+/// Re-checks a halo already resolved for this drive, without touching the map.
+///
+/// A drive advances a chunk through up to six runs, and the runs' halos nest:
+/// radius 0, then 8, then 2. Resolving one per run costs 894 `chunks` lookups
+/// and `Arc` clones per chunk, against 529 for the single halo the layer-walking
+/// model built -- which is why the first version of this dispatcher was 8.3%
+/// slower despite doing strictly less scheduling work. Profiling put ~4% of the
+/// machine in this pass and another ~4.5% in the epoch pinning underneath it.
+///
+/// The holders themselves do not change between runs -- a position keeps its
+/// `Arc` across revival, and one cannot be replaced while this drive holds a
+/// reference -- so only their statuses need re-reading, and those come straight
+/// off the cached `Arc`s.
+fn recheck_cached(
+    cache: &Arc<StaticCache2D<Arc<ChunkHolder>>>,
+    center: ChunkPos,
+    plan: &RunPlan,
+) -> HaloResolution {
+    let radius = plan.halo_radius as i32;
+    let mut unmet: Vec<UnmetDependency> = Vec::new();
+
+    // Same descending-distance order as `resolve_and_check`: the fan-out takes
+    // the tail of `unmet`, and that is only the most constraining dependencies
+    // if the walk emits them in this order.
+    for distance in (0..=radius).rev() {
+        let Some(required) = plan.ring.get(distance as usize) else {
+            continue;
+        };
+        for (x, z) in ring_cells(center, distance) {
+            let Some(holder) = cache.try_get(x, z) else {
+                // The cached halo is smaller than this run needs. The caller
+                // only calls in when it is at least as large, so this is a bug
+                // rather than a state to recover from.
+                unreachable!("a cached halo is only reused when it covers the run");
+            };
+            if holder
+                .published_status()
+                .is_none_or(|published| published < required)
+            {
+                unmet.push(UnmetDependency {
+                    holder: Arc::clone(holder),
+                    required,
+                });
+            }
+        }
+    }
+
+    if unmet.is_empty() {
+        HaloResolution::Ready(Arc::clone(cache))
+    } else {
+        HaloResolution::Unmet(unmet)
+    }
 }
 
 /// The cells at exactly Chebyshev distance `distance` from `center`, each once.
