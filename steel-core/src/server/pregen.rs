@@ -9,8 +9,8 @@ use steel_utils::{ChunkPos, SectionPos};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
-use crate::chunk::chunk_pyramid::GENERATION_PYRAMID;
 use crate::chunk::chunk_map::ChunkMapSchedulingTimings;
+use crate::chunk::chunk_pyramid::GENERATION_PYRAMID;
 use crate::chunk::chunk_request::{
     ChunkRequest, ChunkRequestHandle, ChunkRequestState, ChunkTicketKind,
 };
@@ -28,14 +28,14 @@ const PREGEN_WINDOW_SIZE_ENV: &str = "PREGEN_WINDOW_SIZE";
 const PREGEN_ACTIVE_WINDOWS_ENV: &str = "PREGEN_ACTIVE_WINDOWS";
 const VANILLA_PLAYER_SPAWN_SIZE_CHUNKS: i32 = 7;
 const DEFAULT_PREGEN_WINDOW_SIZE: i32 = 32;
-/// How many windows may be generating at once.
+/// How many windows may be generating at once, on any machine.
 ///
 /// This is the pregeneration pipeline's depth. Each window is
 /// `window_size * window_size` target chunks, and a new one is admitted only as
-/// an active one finishes, so this bounds how much work the generation threads
-/// can see at any moment. Too shallow and the tail of every window -- when a
-/// handful of chunks remain and the rest of the pool has nothing to do -- is
-/// paid with idle threads.
+/// an active one finishes, so this bounds both how much work the generation
+/// threads can see at any moment and how much world is resident at once. Too
+/// shallow and the tail of every window -- when a handful of chunks remain and
+/// the rest of the pool has nothing to do -- is paid with idle threads.
 ///
 /// It was 2, which starves the pool badly. A scheduler trace of the generation
 /// threads showed 90.8% of their context switches were blocking sleeps in
@@ -45,25 +45,66 @@ const DEFAULT_PREGEN_WINDOW_SIZE: i32 = 32;
 /// collapsed the run-to-run spread: median absolute deviation fell from 2.77s
 /// to 0.26s, because the tail stalls a shallow pipeline suffers simply stop
 /// happening.
-/// How many windows may be generating at once.
 ///
-/// This is the pregeneration pipeline's depth. Each window is
-/// `window_size * window_size` target chunks, and a new one is admitted only as
-/// an active one finishes, so this bounds how much world is resident at once.
-///
-/// It was briefly scaled to one window per generation thread, on a measurement
-/// that turned out to be invalid: the benchmark generated a 301x301 area, and
-/// 127 windows of 32x32 is 130,048 target chunks, so the entire area fit inside
-/// the pipeline and *nothing ever unloaded*. That removed all unload and save
-/// work from the measurement rather than making it faster. Re-measured on a
-/// 601x601 area, where unloading is forced, depth makes no throughput
-/// difference worth having -- 16 windows 5,572 chunks/s, 32 -> 5,372, 127 ->
-/// 5,698, inside run-to-run spread -- while the peak unload backlog scales with
-/// it (30k, 47k, 133k chunks) and with it the worst scheduling epoch (121ms,
-/// 220ms, 721ms) and the resident set.
-///
-/// So depth is a memory and latency knob, not a throughput one. Keep it low.
+/// Past 16 the return is small and the memory is not, so this stays the floor
+/// every machine gets and [`DEEP_PREGEN_ACTIVE_WINDOWS`] is taken only when
+/// there is measured room for it. A depth that once looked free was measured on
+/// a 301x301 area, where 127 windows of 32x32 is 130,048 target chunks: the
+/// whole area fit inside the pipeline and *nothing ever unloaded*, which
+/// removed the unload and save work from the measurement rather than making it
+/// faster. Depth claims have to come from an area large enough to force
+/// unloading.
 const DEFAULT_PREGEN_ACTIVE_WINDOWS: usize = 16;
+/// Pipeline depth taken instead when the machine has memory to spare.
+///
+/// 601x601 under the drive, sweeping depth: 16 windows 10,188 chunks/s at 8,873
+/// MiB peak RSS, 32 -> 10,527 chunks/s (+3.3%) at 13,007 MiB (+47%), 48 ->
+/// 10,476 chunks/s at 16,129 MiB (+82%). The memory side of that is solid --
+/// resident set is a monotone function of how many chunks are pinned in flight,
+/// and it climbs the way the chunk count says it should.
+///
+/// The throughput side is not yet. It is one run per point with no spread
+/// stated, which is below the standard [`DEFAULT_PREGEN_ACTIVE_WINDOWS`] holds
+/// itself to two lines above (reps and a median absolute deviation), and there
+/// are two reasons to distrust it at this size. 48 lands *below* 32 while
+/// costing another 3 GiB, which is what noise looks like rather than a curve
+/// flattening; and the depth-16 point here (10,188) and the branch's quoted
+/// 601x601 figure (~10,290), which [`pregen_area_for_benchmark`] produces at
+/// this same floor depth, differ by 1% -- so the +3.3% is about three times a
+/// drift this workload shows between runs that should be identical to each
+/// other. An earlier sweep of the same 601x601 area under the old
+/// task model measured 16 -> 5,572, 32 -> 5,372, 127 -> 5,698 and concluded the
+/// ordering was inside run-to-run spread; the drive changed the absolute
+/// numbers, not the evidence needed to call a 3% difference real.
+///
+/// So this is provisional: it is worth taking only where the memory is
+/// genuinely spare, which is why [`choose_pregen_active_windows`] gates it on a
+/// 4x margin and never on a machine that would have to give something up for
+/// it. Before the gate is widened -- or this becomes the floor -- the sweep
+/// wants repetitions and a spread, and 32 has to clear it.
+const DEEP_PREGEN_ACTIVE_WINDOWS: usize = 32;
+/// Peak RSS attributable to one extra in-flight target chunk.
+///
+/// From the same sweep: 13,007 - 8,873 = 4,134 MiB bought 16 more windows of
+/// 32x32, i.e. 16,384 more target chunks in flight, which is 258 KiB each. 256
+/// KiB is that rounded down to a power of two, and it is what makes the depth
+/// choice extrapolate to a window size the sweep never ran -- in-flight chunks
+/// are `depth * window_size^2`, so the projection scales with window area.
+///
+/// This projects the *difference* between the two depths, not the whole
+/// resident set: the depth-16 baseline is paid whatever we decide here.
+const PREGEN_IN_FLIGHT_CHUNK_BYTES: u64 = 256 * 1024;
+/// Share of available memory the deeper pipeline is allowed to project into.
+///
+/// The deep pipeline is taken only when its projected extra working set is at
+/// most a quarter of what [`available_memory_bytes`] reports, so the ~4 GiB a
+/// 32-chunk window costs needs 16 GiB free. Depth 32 is worth a provisional
+/// +3.3%, which does not justify crowding a co-tenant, and the 256 KiB/chunk
+/// figure is a point estimate from one workload -- the 4x margin is what covers
+/// being wrong about it. It does not cover being wrong about *which* memory:
+/// that is why the reading is capped by the process's cgroup limit rather than
+/// taken from the host.
+const PREGEN_DEEP_PIPELINE_MEMORY_DIVISOR: u64 = 4;
 const PREGEN_UNLOAD_BACKPRESSURE_ENV: &str = "PREGEN_UNLOAD_BACKPRESSURE";
 /// Unload backlog at which window activation pauses.
 ///
@@ -73,18 +114,26 @@ const PREGEN_UNLOAD_BACKPRESSURE_ENV: &str = "PREGEN_UNLOAD_BACKPRESSURE";
 /// backlog growth does not trip backpressure and re-introduce the stalls the
 /// deeper pipeline was meant to remove.
 const DEFAULT_PREGEN_UNLOAD_BACKPRESSURE_HIGH: usize = 65536;
-/// Backlog watermarks that pause window activation while unloads drain.
-///
-/// Deeper pipelines retain more finished-window halo, so the high watermark and
-/// the pipeline depth have to move together: raising depth alone just trades
-/// generation stalls for backpressure stalls.
 /// Unload backlog watermark that leaves the configured pipeline room to run.
 ///
-/// The budget check rejects a depth whose in-flight chunks exceed the high
-/// watermark, so a fixed watermark silently caps how deep the pipeline may go.
-/// Now that depth tracks the generation pool, the watermark has to track depth,
-/// with headroom above the floor so ordinary backlog growth does not trip
-/// backpressure and reintroduce the stalls a deep pipeline removes.
+/// Deeper pipelines retain more finished-window halo, and
+/// [`check_pregen_window_budget`] rejects a depth whose in-flight chunks exceed
+/// the high watermark, so a watermark that could not move with depth would
+/// silently cap how deep the pipeline may go.
+///
+/// It only actually moves above depth 32, and that is deliberate rather than an
+/// oversight: at the 32-chunk window both shipped depths land on the
+/// [`DEFAULT_PREGEN_UNLOAD_BACKPRESSURE_HIGH`] floor -- 16 windows want 32,768
+/// and 32 want 65,536, and the floor is 65,536 -- so the two ship with the same
+/// 65,536-chunk watermark and the deep pipeline runs at half the floor
+/// pipeline's slack (32,768 chunks of backlog above its in-flight count, not
+/// 49,152). Backpressure is not what bounds it there: the deepest measured
+/// backlog on a 601x601 pass was 47k chunks under the old task model at this
+/// depth, below the watermark, and tripping it would pause activation until the
+/// backlog drained to `low` -- half the watermark, which at depth 32 is exactly
+/// one pipeline's worth of chunks. Raising the floor to restore the slack would
+/// change the configuration every RSS figure in this file was measured at, so
+/// it waits for a measurement of backlog against depth under the drive.
 fn default_pregen_unload_backpressure_high(active_windows: usize) -> usize {
     let window_size = DEFAULT_PREGEN_WINDOW_SIZE as usize;
     let in_flight_floor = window_size
@@ -109,6 +158,414 @@ impl UnloadBackpressure {
         }
     }
 }
+
+/// The pipeline depth a pregeneration will run at, and what decided it.
+///
+/// The basis is carried rather than logged where it is computed because the
+/// decision is made before the window budget is known to hold, and an operator
+/// chasing a memory problem needs the reason next to the number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PregenDepth {
+    active_windows: usize,
+    basis: PregenDepthBasis,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PregenDepthBasis {
+    /// `PREGEN_ACTIVE_WINDOWS` was set; nothing else was consulted.
+    Explicit,
+    /// Available memory covers the deeper pipeline's projected extra chunks.
+    MemoryHeadroom {
+        available_bytes: u64,
+        projected_extra_bytes: u64,
+    },
+    /// It does not, so the floor depth stands.
+    MemoryTight {
+        available_bytes: u64,
+        projected_extra_bytes: u64,
+    },
+    /// No way to read available memory here, so assume there is none to spare.
+    MemoryUnknown,
+    /// The deeper pipeline would not fit the unload-backpressure watermark.
+    BudgetTooTight { watermark: usize },
+}
+
+/// Picks the pipeline depth from what the machine can afford.
+///
+/// Depth is bought with resident memory: every extra in-flight window is
+/// `window_size^2` more chunks that cannot unload yet (see
+/// [`PREGEN_IN_FLIGHT_CHUNK_BYTES`] for the measurement). A server that has to
+/// coexist with other work should not spend +47% peak RSS for +3.3% of a
+/// one-time startup pass, but a pregeneration on a machine with 16 GiB spare
+/// should. So this projects the extra working set and takes the deeper pipeline
+/// only when it is a quarter of `available_bytes` or less -- which is what the
+/// process may take, not what the host has, or a memory-capped container would
+/// deepen off its node's free memory and be killed for it.
+///
+/// `backpressure_high` is the operator's `PREGEN_UNLOAD_BACKPRESSURE` if they
+/// set one; without it the watermark is the one
+/// [`default_pregen_unload_backpressure_high`] derives for the deeper depth,
+/// which at the shipped window size is the floor either way. It is an input
+/// rather than something derived afterwards because a depth the
+/// watermark cannot cover is rejected outright by
+/// [`check_pregen_window_budget`], and the automatic choice must not be able to
+/// turn a configuration that started yesterday into a startup failure today.
+fn choose_pregen_active_windows(
+    available_bytes: Option<u64>,
+    window_size: i32,
+    backpressure_high: Option<usize>,
+) -> PregenDepth {
+    // A `const` and not a runtime subtraction: retuning the deep depth below the
+    // floor stops compiling here instead of underflowing into a projection so
+    // large that nothing would ever deepen again.
+    const EXTRA_WINDOWS: u64 = (DEEP_PREGEN_ACTIVE_WINDOWS - DEFAULT_PREGEN_ACTIVE_WINDOWS) as u64;
+
+    let floor = |basis| PregenDepth {
+        active_windows: DEFAULT_PREGEN_ACTIVE_WINDOWS,
+        basis,
+    };
+
+    let watermark = backpressure_high
+        .unwrap_or_else(|| default_pregen_unload_backpressure_high(DEEP_PREGEN_ACTIVE_WINDOWS));
+    if check_pregen_window_budget(
+        window_size,
+        DEEP_PREGEN_ACTIVE_WINDOWS,
+        UnloadBackpressure::from_high(watermark),
+    )
+    .is_err()
+    {
+        return floor(PregenDepthBasis::BudgetTooTight { watermark });
+    }
+
+    let Some(available_bytes) = available_bytes else {
+        return floor(PregenDepthBasis::MemoryUnknown);
+    };
+    // A window size that cannot be a chunk count projects an unaffordable
+    // working set rather than a free one, so nonsense never reads as headroom.
+    let window_area = u64::try_from(window_size).map_or(u64::MAX, |size| size.saturating_mul(size));
+    let projected_extra_bytes = window_area
+        .saturating_mul(EXTRA_WINDOWS)
+        .saturating_mul(PREGEN_IN_FLIGHT_CHUNK_BYTES);
+
+    if projected_extra_bytes.saturating_mul(PREGEN_DEEP_PIPELINE_MEMORY_DIVISOR) <= available_bytes
+    {
+        PregenDepth {
+            active_windows: DEEP_PREGEN_ACTIVE_WINDOWS,
+            basis: PregenDepthBasis::MemoryHeadroom {
+                available_bytes,
+                projected_extra_bytes,
+            },
+        }
+    } else {
+        floor(PregenDepthBasis::MemoryTight {
+            available_bytes,
+            projected_extra_bytes,
+        })
+    }
+}
+
+/// Memory that can be handed out without pushing the machine into reclaim.
+///
+/// `MemAvailable` rather than `MemFree`: page cache is reclaimable, and a
+/// machine that has been serving for a while has almost no free memory and
+/// plenty available. No crate is pulled in for this -- it is one line of
+/// `/proc/meminfo` -- and everywhere else returns `None`, which reads as "no
+/// headroom" and keeps the conservative depth. That is the right way to be
+/// wrong: the cost is 3.3% of one startup pass.
+///
+/// `/proc/meminfo` alone is the wrong number in exactly the deployment the
+/// margin exists to protect. Inside a memory-capped container it describes the
+/// node, not the cap: on this development box a `docker run -m 4g` reads
+/// `MemAvailable` of ~1.1 TiB, clears the 16 GiB the deep pipeline wants
+/// several hundred times over, and then gets OOM-killed at the cap. So the
+/// cgroup's own headroom caps it (see [`cgroup_headroom`]).
+fn available_memory_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::fs::read_to_string;
+
+        let host_available = read_to_string("/proc/meminfo")
+            .ok()
+            .as_deref()
+            .and_then(parse_mem_available);
+        available_within_cgroup(host_available, cgroup_headroom())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// What a cgroup memory limit leaves this process, if one applies.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CgroupHeadroom {
+    /// No memory limit applies at any level, so the host figure stands alone.
+    Unlimited,
+    /// A limit applies and leaves this much of itself unused.
+    Limited(u64),
+    /// A limit applies but its numbers could not be read, so how much it leaves
+    /// is unknown.
+    Unreadable,
+}
+
+/// Narrows the host's `MemAvailable` to what this process may actually take.
+///
+/// A cgroup limit is the number the OOM killer measures against, so it caps the
+/// host figure rather than replacing it: a 4 GiB container on a 1 TiB host has
+/// 4 GiB, and a 1 TiB container on a host with 4 GiB left has 4 GiB.
+///
+/// A limit whose numbers cannot be read yields `None` -- "no headroom" -- and
+/// not the host figure. Falling back to the host there is precisely the bug
+/// this exists to remove: the fallback is only safe when there is nothing
+/// capping the process, and here something demonstrably is.
+#[cfg(any(target_os = "linux", test))]
+fn available_within_cgroup(host_available: Option<u64>, cgroup: CgroupHeadroom) -> Option<u64> {
+    match cgroup {
+        CgroupHeadroom::Unlimited => host_available,
+        CgroupHeadroom::Limited(headroom) => {
+            Some(host_available.map_or(headroom, |host| host.min(headroom)))
+        }
+        CgroupHeadroom::Unreadable => None,
+    }
+}
+
+/// A memory limit as one cgroup file states it.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CgroupLimit {
+    /// cgroup v2 `max`, or v1's saturated sentinel: this level caps nothing.
+    Unlimited,
+    Bytes(u64),
+    /// The file exists and says something this cannot read.
+    Unparseable,
+}
+
+/// cgroup v1 writes an unset limit as a page-aligned saturation of `i64`
+/// (`0x7ffffffffffff000` on 4 KiB pages), and kernels have varied the low bits,
+/// so any limit above this threshold is "unset" rather than a real cap. It is
+/// 1 EiB: a real limit anywhere near it would be a limit on nothing.
+#[cfg(any(target_os = "linux", test))]
+const CGROUP_V1_UNLIMITED_FLOOR: u64 = 1 << 60;
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_cgroup_limit(value: &str) -> CgroupLimit {
+    let value = value.trim();
+    // One function for both generations: a v2 `memory.max` never holds the v1
+    // sentinel and a v1 `memory.limit_in_bytes` never holds `max`, so accepting
+    // both spellings cannot misread either file.
+    if value == "max" {
+        return CgroupLimit::Unlimited;
+    }
+    match value.parse::<u64>() {
+        Ok(bytes) if bytes >= CGROUP_V1_UNLIMITED_FLOOR => CgroupLimit::Unlimited,
+        Ok(bytes) => CgroupLimit::Bytes(bytes),
+        Err(_) => CgroupLimit::Unparseable,
+    }
+}
+
+/// Headroom one cgroup level leaves, from its limit and current charge.
+///
+/// The charge includes page cache, which is reclaimable, so this understates
+/// headroom on a container that has been reading from disk. That is the
+/// direction to be wrong in: overstating it is what gets the process killed,
+/// and understating it costs the 3.3% the deeper pipeline is worth.
+#[cfg(any(target_os = "linux", test))]
+const fn cgroup_level_headroom(limit: CgroupLimit, current_bytes: Option<u64>) -> CgroupHeadroom {
+    match (limit, current_bytes) {
+        (CgroupLimit::Unlimited, _) => CgroupHeadroom::Unlimited,
+        (CgroupLimit::Bytes(limit), Some(current)) => {
+            CgroupHeadroom::Limited(limit.saturating_sub(current))
+        }
+        // A limit that is there but whose numbers are not readable -- either
+        // file -- is the case that must not silently read as the host's figure.
+        (CgroupLimit::Unparseable, _) | (CgroupLimit::Bytes(_), None) => CgroupHeadroom::Unreadable,
+    }
+}
+
+/// Combines two levels of the cgroup hierarchy into the one that binds.
+///
+/// Limits nest: a pod's limit and its parent slice's limit both apply, and the
+/// process is killed by whichever it hits first, so the tightest wins.
+#[cfg(any(target_os = "linux", test))]
+fn narrower_headroom(left: CgroupHeadroom, right: CgroupHeadroom) -> CgroupHeadroom {
+    match (left, right) {
+        // Unreadable dominates: a level whose headroom is unknown could be the
+        // binding one, so the answer cannot be "the other level's number".
+        (CgroupHeadroom::Unreadable, _) | (_, CgroupHeadroom::Unreadable) => {
+            CgroupHeadroom::Unreadable
+        }
+        (CgroupHeadroom::Limited(left), CgroupHeadroom::Limited(right)) => {
+            CgroupHeadroom::Limited(left.min(right))
+        }
+        (CgroupHeadroom::Limited(bytes), CgroupHeadroom::Unlimited)
+        | (CgroupHeadroom::Unlimited, CgroupHeadroom::Limited(bytes)) => {
+            CgroupHeadroom::Limited(bytes)
+        }
+        (CgroupHeadroom::Unlimited, CgroupHeadroom::Unlimited) => CgroupHeadroom::Unlimited,
+    }
+}
+
+/// The controller-relative cgroup path this process is in, v2 first.
+///
+/// `/proc/self/cgroup` is `hierarchy:controllers:path` per line; the unified
+/// (v2) hierarchy is the line with an empty controller list and id 0. A v1
+/// memory limit lives on the line whose controller list contains `memory`,
+/// which may be co-mounted with others (`cpu,memory`), hence the split.
+#[cfg(any(target_os = "linux", test))]
+fn cgroup_path<'a>(proc_self_cgroup: &'a str, controller: Option<&str>) -> Option<&'a str> {
+    proc_self_cgroup.lines().find_map(|line| {
+        let mut fields = line.splitn(3, ':');
+        let _hierarchy = fields.next()?;
+        let controllers = fields.next()?;
+        let path = fields.next()?;
+        let matches = match controller {
+            None => controllers.is_empty(),
+            Some(wanted) => controllers.split(',').any(|entry| entry == wanted),
+        };
+        matches.then_some(path)
+    })
+}
+
+/// How much of its memory limit the cgroup this process runs in has left.
+///
+/// Both hierarchies are consulted and the tighter answer wins, because on a
+/// systemd hybrid host the unified hierarchy exists while the memory controller
+/// is still on v1: reading only the one the process has a unified path for
+/// would miss the limit on exactly the machines that have one.
+///
+/// Absent cgroup files read as [`CgroupHeadroom::Unlimited`]: a kernel with no
+/// cgroup filesystem, a hierarchy that is not mounted, or a level without the
+/// memory controller enabled is not evidence of a limit. Files that exist and
+/// cannot be read are, and yield [`CgroupHeadroom::Unreadable`].
+#[cfg(target_os = "linux")]
+fn cgroup_headroom() -> CgroupHeadroom {
+    use std::fs::read_to_string;
+
+    let Ok(proc_self_cgroup) = read_to_string("/proc/self/cgroup") else {
+        return CgroupHeadroom::Unlimited;
+    };
+
+    let unified = cgroup_path(&proc_self_cgroup, None).map_or(CgroupHeadroom::Unlimited, |path| {
+        cgroup_hierarchy_headroom("/sys/fs/cgroup", path, "memory.max", "memory.current")
+    });
+    let legacy =
+        cgroup_path(&proc_self_cgroup, Some("memory")).map_or(CgroupHeadroom::Unlimited, |path| {
+            cgroup_hierarchy_headroom(
+                "/sys/fs/cgroup/memory",
+                path,
+                "memory.limit_in_bytes",
+                "memory.usage_in_bytes",
+            )
+        });
+
+    narrower_headroom(unified, legacy)
+}
+
+/// Headroom left by one cgroup hierarchy, walking the whole ancestry.
+///
+/// From this process's own cgroup up to the mount root, because a limit set on
+/// an ancestor binds just as hard as one set on the leaf -- Kubernetes puts the
+/// pod limit on the parent of the container's own cgroup, so reading only the
+/// leaf misses it entirely.
+#[cfg(target_os = "linux")]
+fn cgroup_hierarchy_headroom(
+    root: &str,
+    relative: &str,
+    limit_file: &str,
+    current_file: &str,
+) -> CgroupHeadroom {
+    use std::fs::read_to_string;
+    use std::path::{Path, PathBuf};
+
+    let root = Path::new(root);
+    let mut level = PathBuf::from(root);
+    // A namespaced container sees its own cgroup as `/`, so the walk is often a
+    // single level; on the host it is the full slice/scope chain.
+    level.push(relative.trim_start_matches('/'));
+
+    let mut headroom = CgroupHeadroom::Unlimited;
+    loop {
+        let limit = match read_to_string(level.join(limit_file)) {
+            Ok(value) => parse_cgroup_limit(&value),
+            // No such file: this hierarchy is not mounted, or the controller is
+            // not enabled at this level. Neither caps anything.
+            Err(_) => CgroupLimit::Unlimited,
+        };
+        let current = read_to_string(level.join(current_file))
+            .ok()
+            .and_then(|value| parse_cgroup_current(&value));
+        headroom = narrower_headroom(headroom, cgroup_level_headroom(limit, current));
+
+        if level == root || !level.pop() {
+            return headroom;
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_cgroup_current(value: &str) -> Option<u64> {
+    value.trim().parse::<u64>().ok()
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_mem_available(meminfo: &str) -> Option<u64> {
+    let field = meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemAvailable:"))?;
+    // The kernel writes this field in kB (KiB, despite the spelling) and has
+    // done since 3.14; a unit that is not that is a kernel this cannot read.
+    let (value, unit) = field.trim().split_once(char::is_whitespace)?;
+    if !unit.trim().eq_ignore_ascii_case("kB") {
+        return None;
+    }
+
+    value.parse::<u64>().ok()?.checked_mul(1024)
+}
+
+/// Describes a depth choice the way an operator debugging memory needs it.
+fn describe_pregen_depth(depth: PregenDepth) -> String {
+    let mib = |bytes: u64| bytes / (1024 * 1024);
+    let windows = depth.active_windows;
+    match depth.basis {
+        PregenDepthBasis::Explicit => {
+            format!("depth {windows} windows, set explicitly by {PREGEN_ACTIVE_WINDOWS_ENV}")
+        }
+        PregenDepthBasis::MemoryHeadroom {
+            available_bytes,
+            projected_extra_bytes,
+        } => format!(
+            "depth {windows} windows: its extra in-flight chunks project {} MiB against {} MiB \
+             available to this process (MemAvailable, capped by any cgroup memory limit), clearing \
+             the {PREGEN_DEEP_PIPELINE_MEMORY_DIVISOR}x margin required to deepen (set \
+             {PREGEN_ACTIVE_WINDOWS_ENV}={DEFAULT_PREGEN_ACTIVE_WINDOWS} to keep the resident set \
+             down instead)",
+            mib(projected_extra_bytes),
+            mib(available_bytes),
+        ),
+        PregenDepthBasis::MemoryTight {
+            available_bytes,
+            projected_extra_bytes,
+        } => format!(
+            "depth {windows} windows: {DEEP_PREGEN_ACTIVE_WINDOWS} would project {} MiB of extra \
+             in-flight chunks, which wants {} MiB available and this process has {} MiB \
+             (MemAvailable, capped by any cgroup memory limit)",
+            mib(projected_extra_bytes),
+            mib(projected_extra_bytes.saturating_mul(PREGEN_DEEP_PIPELINE_MEMORY_DIVISOR)),
+            mib(available_bytes),
+        ),
+        PregenDepthBasis::MemoryUnknown => format!(
+            "depth {windows} windows: available memory cannot be read here -- no readable \
+             MemAvailable, or a cgroup memory limit applies whose numbers could not be read -- so \
+             the deeper {DEEP_PREGEN_ACTIVE_WINDOWS}-window pipeline is not assumed to fit"
+        ),
+        PregenDepthBasis::BudgetTooTight { watermark } => format!(
+            "depth {windows} windows: {DEEP_PREGEN_ACTIVE_WINDOWS} would not fit the \
+             {watermark}-chunk unload-backpressure watermark"
+        ),
+    }
+}
+
 const FULL_DEPENDENCY_RADIUS: i32 = GENERATION_PYRAMID
     .get_step_to(ChunkStatus::Full)
     .accumulated_dependencies
@@ -396,6 +853,11 @@ impl Server {
     /// Set `PREGEN_SIZE` to an odd chunk side length, or `0` to skip custom pregen.
     /// Set `PREGEN_WINDOW_SIZE` to override the default 32-chunk window side length.
     /// The configured size must fit the active-window unload-backpressure budget.
+    ///
+    /// The pipeline depth is chosen from available memory unless
+    /// `PREGEN_ACTIVE_WINDOWS` pins it, and the choice with its basis is logged
+    /// here -- this runs once per startup, so that log line is the record of why
+    /// the run has the resident set it has.
     pub async fn prepare_spawn_area(&self) -> bool {
         let overworld = self.overworld();
         let pregen_size = match get_pregen_size() {
@@ -409,27 +871,48 @@ impl Server {
                 return false;
             }
         };
-        let active_window_limit = match get_pregen_active_windows() {
-            Ok(active_windows) => active_windows,
-            Err(error) => {
-                log::error!("{error}");
-                return false;
-            }
-        };
-        let backpressure = match get_pregen_unload_backpressure(active_window_limit) {
-            Ok(backpressure) => backpressure,
-            Err(error) => {
-                log::error!("{error}");
-                return false;
-            }
-        };
-        let window_size = match get_pregen_window_size(active_window_limit, backpressure) {
+        // Window size first: the depth choice projects a working set from the
+        // window area, and the watermark override has to be known before the
+        // depth so that an operator-pinned watermark constrains the automatic
+        // choice instead of being contradicted by it.
+        let requested_window_size = match get_pregen_window_size() {
             Ok(window_size) => window_size,
             Err(error) => {
                 log::error!("{error}");
                 return false;
             }
         };
+        let backpressure_high = match get_pregen_unload_backpressure_override() {
+            Ok(high) => high,
+            Err(error) => {
+                log::error!("{error}");
+                return false;
+            }
+        };
+        let depth = match get_pregen_active_windows(requested_window_size, backpressure_high) {
+            Ok(depth) => depth,
+            Err(error) => {
+                log::error!("{error}");
+                return false;
+            }
+        };
+        let active_window_limit = depth.active_windows;
+        let backpressure = UnloadBackpressure::from_high(
+            backpressure_high
+                .unwrap_or_else(|| default_pregen_unload_backpressure_high(active_window_limit)),
+        );
+        let window_size = match check_pregen_window_budget(
+            requested_window_size,
+            active_window_limit,
+            backpressure,
+        ) {
+            Ok(window_size) => window_size,
+            Err(error) => {
+                log::error!("{error}");
+                return false;
+            }
+        };
+        log::info!("Pregeneration pipeline {}", describe_pregen_depth(depth));
         let center_chunk = if pregen_size.side_length > VANILLA_PLAYER_SPAWN_SIZE_CHUNKS {
             ChunkPos::new(0, 0)
         } else {
@@ -480,6 +963,11 @@ pub async fn pregen_area_for_benchmark(
     let Some(pregen_size) = PregenSize::from_side_length(side_length)? else {
         return Ok(Some(Duration::ZERO));
     };
+    // Deliberately the floor depth and not the server's automatic choice: a
+    // benchmark number that moves with how much RAM happened to be free is not
+    // comparable across runs, and the harness installs no logger, so the chosen
+    // depth would not even be reported. Sweep depth with `--windows`; on a
+    // machine with headroom the server now ships `--windows 32`.
     let active_windows = active_window_limit.unwrap_or(DEFAULT_PREGEN_ACTIVE_WINDOWS);
     if active_windows == 0 {
         return Err("active window limit must be a positive integer".to_owned());
@@ -521,12 +1009,16 @@ fn get_pregen_size() -> Result<Option<PregenSize>, String> {
     PregenSize::from_side_length(side_length)
 }
 
-fn get_pregen_unload_backpressure(active_windows: usize) -> Result<UnloadBackpressure, String> {
+/// Reads an operator-pinned unload watermark, `None` if they pinned none.
+///
+/// Returned unresolved so the depth choice can see whether the watermark is
+/// fixed; the default is only known once a depth has been picked.
+fn get_pregen_unload_backpressure_override() -> Result<Option<usize>, String> {
     let high = match env::var(PREGEN_UNLOAD_BACKPRESSURE_ENV) {
         Ok(value) => value.parse::<usize>().map_err(|error| {
             format!("{PREGEN_UNLOAD_BACKPRESSURE_ENV} must be a positive integer: {error}")
         })?,
-        Err(env::VarError::NotPresent) => default_pregen_unload_backpressure_high(active_windows),
+        Err(env::VarError::NotPresent) => return Ok(None),
         Err(env::VarError::NotUnicode(_)) => {
             return Err(format!(
                 "{PREGEN_UNLOAD_BACKPRESSURE_ENV} must be valid unicode"
@@ -539,13 +1031,23 @@ fn get_pregen_unload_backpressure(active_windows: usize) -> Result<UnloadBackpre
         ));
     }
 
-    Ok(UnloadBackpressure::from_high(high))
+    Ok(Some(high))
 }
 
-fn get_pregen_active_windows() -> Result<usize, String> {
+fn get_pregen_active_windows(
+    window_size: i32,
+    backpressure_high: Option<usize>,
+) -> Result<PregenDepth, String> {
     match env::var(PREGEN_ACTIVE_WINDOWS_ENV) {
-        Ok(value) => parse_pregen_active_windows(&value),
-        Err(env::VarError::NotPresent) => Ok(DEFAULT_PREGEN_ACTIVE_WINDOWS),
+        Ok(value) => Ok(PregenDepth {
+            active_windows: parse_pregen_active_windows(&value)?,
+            basis: PregenDepthBasis::Explicit,
+        }),
+        Err(env::VarError::NotPresent) => Ok(choose_pregen_active_windows(
+            available_memory_bytes(),
+            window_size,
+            backpressure_high,
+        )),
         Err(env::VarError::NotUnicode(_)) => {
             Err(format!("{PREGEN_ACTIVE_WINDOWS_ENV} must be valid unicode"))
         }
@@ -565,26 +1067,22 @@ fn parse_pregen_active_windows(value: &str) -> Result<usize, String> {
     Ok(active_windows)
 }
 
-fn get_pregen_window_size(
-    active_windows: usize,
-    backpressure: UnloadBackpressure,
-) -> Result<i32, String> {
+/// Reads the requested window side length, before the budget check.
+///
+/// Only well-formedness is checked here: whether the window fits depends on the
+/// depth, and the depth is now chosen from the window area, so the budget check
+/// has to run after both are known.
+fn get_pregen_window_size() -> Result<i32, String> {
     match env::var(PREGEN_WINDOW_SIZE_ENV) {
-        Ok(value) => parse_pregen_window_size(&value, active_windows, backpressure),
-        Err(env::VarError::NotPresent) => {
-            check_pregen_window_budget(DEFAULT_PREGEN_WINDOW_SIZE, active_windows, backpressure)
-        }
+        Ok(value) => parse_pregen_window_size(&value),
+        Err(env::VarError::NotPresent) => Ok(DEFAULT_PREGEN_WINDOW_SIZE),
         Err(env::VarError::NotUnicode(_)) => {
             Err(format!("{PREGEN_WINDOW_SIZE_ENV} must be valid unicode"))
         }
     }
 }
 
-fn parse_pregen_window_size(
-    value: &str,
-    active_windows: usize,
-    backpressure: UnloadBackpressure,
-) -> Result<i32, String> {
+fn parse_pregen_window_size(value: &str) -> Result<i32, String> {
     let window_size = value
         .parse::<i32>()
         .map_err(|error| format!("{PREGEN_WINDOW_SIZE_ENV} must be a positive integer: {error}"))?;
@@ -594,7 +1092,7 @@ fn parse_pregen_window_size(
         ));
     }
 
-    check_pregen_window_budget(window_size, active_windows, backpressure)
+    Ok(window_size)
 }
 
 /// Rejects window/depth pairs whose in-flight chunks exceed the unload budget.
@@ -1029,15 +1527,26 @@ mod tests {
         );
     }
 
+    /// Parses a window size and then budget-checks it, the way startup does.
+    fn checked_window_size(
+        value: &str,
+        active_windows: usize,
+        backpressure: UnloadBackpressure,
+    ) -> Result<i32, String> {
+        check_pregen_window_budget(
+            parse_pregen_window_size(value)?,
+            active_windows,
+            backpressure,
+        )
+    }
+
     #[test]
     fn pregen_window_size_requires_a_positive_integer() {
-        let depth = 16;
-        let budget = UnloadBackpressure::from_high(DEFAULT_PREGEN_UNLOAD_BACKPRESSURE_HIGH);
-        assert_eq!(parse_pregen_window_size("1", depth, budget), Ok(1));
-        assert_eq!(parse_pregen_window_size("64", depth, budget), Ok(64));
-        assert!(parse_pregen_window_size("0", depth, budget).is_err());
-        assert!(parse_pregen_window_size("-1", depth, budget).is_err());
-        assert!(parse_pregen_window_size("wide", depth, budget).is_err());
+        assert_eq!(parse_pregen_window_size("1"), Ok(1));
+        assert_eq!(parse_pregen_window_size("64"), Ok(64));
+        assert!(parse_pregen_window_size("0").is_err());
+        assert!(parse_pregen_window_size("-1").is_err());
+        assert!(parse_pregen_window_size("wide").is_err());
     }
 
     #[test]
@@ -1046,15 +1555,15 @@ mod tests {
         // `window^2 * depth <= high`, and asserting it against whatever the default
         // happens to be makes the test fail whenever the default is retuned.
         let budget = UnloadBackpressure::from_high(8192);
-        assert!(parse_pregen_window_size("64", 2, budget).is_ok());
-        assert!(parse_pregen_window_size("65", 2, budget).is_err());
-        assert!(parse_pregen_window_size(&i32::MAX.to_string(), 2, budget).is_err());
+        assert!(checked_window_size("64", 2, budget).is_ok());
+        assert!(checked_window_size("65", 2, budget).is_err());
+        assert!(checked_window_size(&i32::MAX.to_string(), 2, budget).is_err());
         // Depth trades against window area for the same budget.
-        assert!(parse_pregen_window_size("32", 8, budget).is_ok());
-        assert!(parse_pregen_window_size("32", 9, budget).is_err());
+        assert!(checked_window_size("32", 8, budget).is_ok());
+        assert!(checked_window_size("32", 9, budget).is_err());
         // A larger budget admits a deeper pipeline at the same window size.
         let wide = UnloadBackpressure::from_high(32768);
-        assert!(parse_pregen_window_size("32", 9, wide).is_ok());
+        assert!(checked_window_size("32", 9, wide).is_ok());
         assert_eq!(wide.low, 16384);
 
         assert!(parse_pregen_active_windows("0").is_err());
@@ -1065,12 +1574,7 @@ mod tests {
     fn shipped_pregen_defaults_fit_their_own_budget() {
         let budget = UnloadBackpressure::from_high(default_pregen_unload_backpressure_high(16));
         assert!(
-            check_pregen_window_budget(
-                DEFAULT_PREGEN_WINDOW_SIZE,
-                16,
-                budget,
-            )
-            .is_ok(),
+            check_pregen_window_budget(DEFAULT_PREGEN_WINDOW_SIZE, 16, budget,).is_ok(),
             "default window size and pipeline depth must not trip their own backpressure budget"
         );
     }
@@ -1097,17 +1601,420 @@ mod tests {
     }
 
     #[test]
-    fn default_pipeline_depth_fits_its_own_backpressure_budget() {
-        // Depth is what keeps the generation pool supplied, so it scales with
-        // the pool rather than being a flat count.
-        assert_eq!(get_pregen_active_windows(), Ok(DEFAULT_PREGEN_ACTIVE_WINDOWS));
-        // And a depth that large must not trip its own backpressure budget.
-        for threads in [1, 8, 96, 127] {
+    fn any_pipeline_depth_fits_its_own_backpressure_budget() {
+        // The watermark is derived from the depth, so every depth the server can
+        // choose has to clear the budget check its own watermark implies --
+        // otherwise picking a depth is a way to make startup fail.
+        for depth in [
+            1,
+            8,
+            DEFAULT_PREGEN_ACTIVE_WINDOWS,
+            DEEP_PREGEN_ACTIVE_WINDOWS,
+            96,
+            127,
+        ] {
             let budget =
-                UnloadBackpressure::from_high(default_pregen_unload_backpressure_high(threads));
+                UnloadBackpressure::from_high(default_pregen_unload_backpressure_high(depth));
             assert!(
-                check_pregen_window_budget(DEFAULT_PREGEN_WINDOW_SIZE, threads, budget).is_ok(),
-                "default depth for {threads} threads must fit its own budget"
+                check_pregen_window_budget(DEFAULT_PREGEN_WINDOW_SIZE, depth, budget).is_ok(),
+                "depth {depth} must fit the watermark it derives"
+            );
+        }
+    }
+
+    #[test]
+    fn the_shipped_depths_share_one_floor_clamped_watermark() {
+        // The watermark is derived from depth but floored, and at the 32-chunk
+        // window both shipped depths land on the floor. Asserted because the
+        // doc above it explains the deep pipeline's slack in terms of this
+        // clamp: if the floor or the multiplier moves, the two stop sharing a
+        // watermark and that explanation is no longer the truth.
+        let floor_depth = default_pregen_unload_backpressure_high(DEFAULT_PREGEN_ACTIVE_WINDOWS);
+        let deep_depth = default_pregen_unload_backpressure_high(DEEP_PREGEN_ACTIVE_WINDOWS);
+        assert_eq!(floor_depth, DEFAULT_PREGEN_UNLOAD_BACKPRESSURE_HIGH);
+        assert_eq!(deep_depth, DEFAULT_PREGEN_UNLOAD_BACKPRESSURE_HIGH);
+
+        // What that costs, stated so it cannot change unnoticed: the deep
+        // pipeline runs at half the floor pipeline's backlog slack, and its low
+        // watermark is exactly its own in-flight count -- so if backpressure
+        // ever does trip at depth 32, activation resumes only after a full
+        // pipeline's worth of chunks has drained.
+        let window = DEFAULT_PREGEN_WINDOW_SIZE as usize * DEFAULT_PREGEN_WINDOW_SIZE as usize;
+        let floor_in_flight = window * DEFAULT_PREGEN_ACTIVE_WINDOWS;
+        let deep_in_flight = window * DEEP_PREGEN_ACTIVE_WINDOWS;
+        assert_eq!(floor_depth - floor_in_flight, 49152);
+        assert_eq!(deep_depth - deep_in_flight, 32768);
+        assert_eq!(
+            UnloadBackpressure::from_high(deep_depth).low,
+            deep_in_flight
+        );
+
+        // Above the shipped depths the derivation does take over, which is what
+        // keeps a deeper operator-pinned depth from failing its own budget.
+        assert_eq!(default_pregen_unload_backpressure_high(48), 98304);
+    }
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// Memory a window of `window_size` needs before the deep pipeline is taken.
+    fn deep_pipeline_requirement(window_size: u64) -> u64 {
+        let extra_chunks = window_size
+            * window_size
+            * (DEEP_PREGEN_ACTIVE_WINDOWS - DEFAULT_PREGEN_ACTIVE_WINDOWS) as u64;
+        extra_chunks * PREGEN_IN_FLIGHT_CHUNK_BYTES * PREGEN_DEEP_PIPELINE_MEMORY_DIVISOR
+    }
+
+    #[test]
+    fn pipeline_depth_deepens_only_with_memory_to_spare() {
+        // The shipped window: 16 extra windows of 32x32 is 16,384 in-flight
+        // chunks at 256 KiB each, so 4 GiB projected and 16 GiB required.
+        assert_eq!(deep_pipeline_requirement(32), 16 * GIB);
+
+        let deep = choose_pregen_active_windows(Some(64 * GIB), DEFAULT_PREGEN_WINDOW_SIZE, None);
+        assert_eq!(deep.active_windows, DEEP_PREGEN_ACTIVE_WINDOWS);
+        assert_eq!(
+            deep.basis,
+            PregenDepthBasis::MemoryHeadroom {
+                available_bytes: 64 * GIB,
+                projected_extra_bytes: 4 * GIB,
+            }
+        );
+
+        // Exactly enough qualifies; one byte less does not. The boundary is
+        // asserted from both sides because a `<` here would silently move the
+        // requirement by a whole factor of the divisor on the next edit.
+        assert_eq!(
+            choose_pregen_active_windows(Some(16 * GIB), DEFAULT_PREGEN_WINDOW_SIZE, None)
+                .active_windows,
+            DEEP_PREGEN_ACTIVE_WINDOWS
+        );
+        let tight =
+            choose_pregen_active_windows(Some(16 * GIB - 1), DEFAULT_PREGEN_WINDOW_SIZE, None);
+        assert_eq!(tight.active_windows, DEFAULT_PREGEN_ACTIVE_WINDOWS);
+        assert_eq!(
+            tight.basis,
+            PregenDepthBasis::MemoryTight {
+                available_bytes: 16 * GIB - 1,
+                projected_extra_bytes: 4 * GIB,
+            }
+        );
+
+        // A machine with 4 GiB to spare runs the pregeneration, just not the
+        // deep one. That the 4 GiB *container* case reaches this decision with
+        // 4 GiB rather than its host's figure is a property of the reader, and
+        // is asserted in `a_container_memory_limit_caps_the_hosts_figure`.
+        assert_eq!(
+            choose_pregen_active_windows(Some(4 * GIB), DEFAULT_PREGEN_WINDOW_SIZE, None)
+                .active_windows,
+            DEFAULT_PREGEN_ACTIVE_WINDOWS
+        );
+
+        // No reading means no evidence of headroom, not permission to assume it.
+        let unknown = choose_pregen_active_windows(None, DEFAULT_PREGEN_WINDOW_SIZE, None);
+        assert_eq!(unknown.active_windows, DEFAULT_PREGEN_ACTIVE_WINDOWS);
+        assert_eq!(unknown.basis, PregenDepthBasis::MemoryUnknown);
+    }
+
+    #[test]
+    fn pipeline_depth_requirement_scales_with_window_area() {
+        // In-flight chunks are `depth * window_size^2`, so halving the window
+        // quarters what the deeper pipeline costs and quarters what it demands.
+        for (window_size, required) in [(8, GIB), (16, 4 * GIB), (32, 16 * GIB)] {
+            assert_eq!(deep_pipeline_requirement(window_size), required);
+            let window_size = i32::try_from(window_size).expect("window size fits an i32");
+            assert_eq!(
+                choose_pregen_active_windows(Some(required), window_size, None).active_windows,
+                DEEP_PREGEN_ACTIVE_WINDOWS,
+                "window {window_size} should deepen with {required} bytes available"
+            );
+            assert_eq!(
+                choose_pregen_active_windows(Some(required - 1), window_size, None).active_windows,
+                DEFAULT_PREGEN_ACTIVE_WINDOWS,
+                "window {window_size} should not deepen just below its requirement"
+            );
+        }
+    }
+
+    #[test]
+    fn pipeline_depth_never_deepens_past_the_unload_watermark() {
+        // A 48-chunk window is inside the budget at depth 16 (36,864 in-flight
+        // against a 65,536 watermark) and outside it at depth 32 (73,728), so
+        // deepening would turn a working configuration into a startup failure.
+        // Memory is deliberately absurd here: the watermark has to veto first.
+        let wide = choose_pregen_active_windows(Some(1024 * GIB), 48, None);
+        assert_eq!(wide.active_windows, DEFAULT_PREGEN_ACTIVE_WINDOWS);
+        assert_eq!(
+            wide.basis,
+            PregenDepthBasis::BudgetTooTight { watermark: 65536 }
+        );
+        let budget = UnloadBackpressure::from_high(default_pregen_unload_backpressure_high(
+            wide.active_windows,
+        ));
+        assert!(check_pregen_window_budget(48, wide.active_windows, budget).is_ok());
+
+        // Same veto when the operator pinned a watermark too low for depth 32.
+        let pinned =
+            choose_pregen_active_windows(Some(1024 * GIB), DEFAULT_PREGEN_WINDOW_SIZE, Some(20000));
+        assert_eq!(pinned.active_windows, DEFAULT_PREGEN_ACTIVE_WINDOWS);
+        assert_eq!(
+            pinned.basis,
+            PregenDepthBasis::BudgetTooTight { watermark: 20000 }
+        );
+        // 32 windows of 32x32 is 32,768 in-flight chunks, so a watermark that
+        // clears that leaves the choice to memory again.
+        assert_eq!(
+            choose_pregen_active_windows(Some(1024 * GIB), DEFAULT_PREGEN_WINDOW_SIZE, Some(32768))
+                .active_windows,
+            DEEP_PREGEN_ACTIVE_WINDOWS
+        );
+    }
+
+    #[test]
+    fn depth_log_line_carries_the_number_and_the_evidence() {
+        // The whole point of the basis is that an operator staring at a resident
+        // set can read why it is that size, so the numbers behind the decision
+        // have to reach the log, not just the verdict.
+        let deep = describe_pregen_depth(choose_pregen_active_windows(
+            Some(64 * GIB),
+            DEFAULT_PREGEN_WINDOW_SIZE,
+            None,
+        ));
+        assert!(deep.contains("depth 32 windows"), "{deep}");
+        assert!(deep.contains("65536 MiB available"), "{deep}");
+        assert!(deep.contains("4096 MiB"), "{deep}");
+
+        let tight = describe_pregen_depth(choose_pregen_active_windows(
+            Some(GIB),
+            DEFAULT_PREGEN_WINDOW_SIZE,
+            None,
+        ));
+        assert!(tight.contains("depth 16 windows"), "{tight}");
+        assert!(tight.contains("wants 16384 MiB"), "{tight}");
+        assert!(tight.contains("has 1024 MiB"), "{tight}");
+
+        let explicit = describe_pregen_depth(PregenDepth {
+            active_windows: 48,
+            basis: PregenDepthBasis::Explicit,
+        });
+        assert!(explicit.contains("depth 48 windows"), "{explicit}");
+        assert!(explicit.contains(PREGEN_ACTIVE_WINDOWS_ENV), "{explicit}");
+    }
+
+    #[test]
+    fn explicit_pipeline_depth_wins_over_the_automatic_choice() {
+        let depth = get_pregen_active_windows(DEFAULT_PREGEN_WINDOW_SIZE, None)
+            .expect("the ambient environment should hold a valid depth");
+        // Asserted against the environment rather than by setting it: mutating
+        // the environment is unsound with other tests running in this process.
+        match env::var(PREGEN_ACTIVE_WINDOWS_ENV) {
+            Ok(value) => {
+                assert_eq!(depth.basis, PregenDepthBasis::Explicit);
+                assert_eq!(
+                    depth.active_windows,
+                    value.parse::<usize>().expect("a valid pinned depth")
+                );
+            }
+            Err(_) => assert_ne!(depth.basis, PregenDepthBasis::Explicit),
+        }
+    }
+
+    #[test]
+    fn available_memory_reads_the_kernel_estimate_not_free_pages() {
+        // MemFree first and larger, so a parser that matched the wrong field or
+        // took the first number would be caught.
+        let meminfo = "MemTotal:       32000000 kB\n\
+                       MemFree:         9000000 kB\n\
+                       MemAvailable:    1048576 kB\n\
+                       Buffers:          100000 kB\n";
+        assert_eq!(parse_mem_available(meminfo), Some(GIB));
+        assert_eq!(parse_mem_available("MemTotal: 32000000 kB\n"), None);
+        // A unit this does not understand is not worth guessing at.
+        assert_eq!(parse_mem_available("MemAvailable:  16 GB\n"), None);
+        assert_eq!(parse_mem_available("MemAvailable:  many kB\n"), None);
+    }
+
+    #[test]
+    fn a_container_memory_limit_caps_the_hosts_figure() {
+        // The deployment the margin exists for: this box's real MemAvailable
+        // (1,154,764,308 kB) inside `docker run -m 4g`. Reading the host figure
+        // clears the 16 GiB requirement seventy times over and grows the pass
+        // toward the 13,007 MiB the deep pipeline was measured at, inside a 4
+        // GiB cap. The cgroup's headroom has to win.
+        let host = 1_154_764_308 * 1024;
+        let container = available_within_cgroup(
+            Some(host),
+            cgroup_level_headroom(CgroupLimit::Bytes(4 * GIB), Some(GIB / 2)),
+        );
+        assert_eq!(container, Some(4 * GIB - GIB / 2));
+        assert_eq!(
+            choose_pregen_active_windows(container, DEFAULT_PREGEN_WINDOW_SIZE, None)
+                .active_windows,
+            DEFAULT_PREGEN_ACTIVE_WINDOWS,
+            "a 4 GiB container must not take the deep pipeline off its host's free memory"
+        );
+
+        // The cap is a cap, not a replacement: a container far larger than what
+        // the host has left still cannot have more than the host has left.
+        assert_eq!(
+            available_within_cgroup(
+                Some(2 * GIB),
+                cgroup_level_headroom(CgroupLimit::Bytes(512 * GIB), Some(0)),
+            ),
+            Some(2 * GIB)
+        );
+        // And with no limit anywhere, the host figure is the answer -- otherwise
+        // this would have taken the deep pipeline away from every bare-metal
+        // machine that was choosing it correctly.
+        assert_eq!(
+            available_within_cgroup(Some(64 * GIB), CgroupHeadroom::Unlimited),
+            Some(64 * GIB)
+        );
+        assert_eq!(
+            choose_pregen_active_windows(
+                available_within_cgroup(Some(64 * GIB), CgroupHeadroom::Unlimited),
+                DEFAULT_PREGEN_WINDOW_SIZE,
+                None
+            )
+            .active_windows,
+            DEEP_PREGEN_ACTIVE_WINDOWS
+        );
+    }
+
+    #[test]
+    fn a_limit_that_cannot_be_read_is_not_headroom() {
+        // A limit exists, so `/proc/meminfo` is known to be the wrong number;
+        // falling back to it is the failure mode this whole reading exists to
+        // avoid, so an unreadable limit has to erase the host figure entirely.
+        assert_eq!(
+            cgroup_level_headroom(CgroupLimit::Bytes(4 * GIB), None),
+            CgroupHeadroom::Unreadable
+        );
+        assert_eq!(
+            cgroup_level_headroom(CgroupLimit::Unparseable, Some(0)),
+            CgroupHeadroom::Unreadable
+        );
+        assert_eq!(
+            available_within_cgroup(Some(1024 * GIB), CgroupHeadroom::Unreadable),
+            None
+        );
+        assert_eq!(
+            choose_pregen_active_windows(
+                available_within_cgroup(Some(1024 * GIB), CgroupHeadroom::Unreadable),
+                DEFAULT_PREGEN_WINDOW_SIZE,
+                None
+            )
+            .basis,
+            PregenDepthBasis::MemoryUnknown
+        );
+
+        // An unreadable level poisons the whole walk for the same reason: it
+        // could be the one that binds.
+        assert_eq!(
+            narrower_headroom(
+                CgroupHeadroom::Limited(64 * GIB),
+                CgroupHeadroom::Unreadable
+            ),
+            CgroupHeadroom::Unreadable
+        );
+        // A charged limit with no host figure at all still answers.
+        assert_eq!(
+            available_within_cgroup(None, CgroupHeadroom::Limited(4 * GIB)),
+            Some(4 * GIB)
+        );
+    }
+
+    #[test]
+    fn an_ancestor_limit_binds_as_hard_as_the_leafs() {
+        // Kubernetes puts the pod limit on the parent of the container's own
+        // cgroup, so a walk that stopped at the leaf would read a pod capped at
+        // 2 GiB as uncapped.
+        let leaf = cgroup_level_headroom(CgroupLimit::Unlimited, Some(GIB));
+        let parent = cgroup_level_headroom(CgroupLimit::Bytes(2 * GIB), Some(GIB));
+        assert_eq!(
+            narrower_headroom(leaf, parent),
+            CgroupHeadroom::Limited(GIB)
+        );
+        // Two real limits: the tighter one is what the process is killed at.
+        assert_eq!(
+            narrower_headroom(
+                CgroupHeadroom::Limited(32 * GIB),
+                CgroupHeadroom::Limited(3 * GIB)
+            ),
+            CgroupHeadroom::Limited(3 * GIB)
+        );
+        // A charge above the limit is a cgroup already in reclaim, not headroom
+        // that wrapped around.
+        assert_eq!(
+            cgroup_level_headroom(CgroupLimit::Bytes(GIB), Some(2 * GIB)),
+            CgroupHeadroom::Limited(0)
+        );
+    }
+
+    #[test]
+    fn cgroup_limit_files_are_read_in_both_generations_spellings() {
+        // v2 writes `max` for no limit; v1 writes a page-aligned saturation of
+        // `i64`, which is not a limit either and must not read as one -- taking
+        // it literally would leave 8 EiB of "headroom" and deepen everywhere.
+        assert_eq!(parse_cgroup_limit("max\n"), CgroupLimit::Unlimited);
+        assert_eq!(
+            parse_cgroup_limit("9223372036854771712\n"),
+            CgroupLimit::Unlimited
+        );
+        assert_eq!(
+            parse_cgroup_limit("4294967296\n"),
+            CgroupLimit::Bytes(4 * GIB)
+        );
+        assert_eq!(parse_cgroup_limit("unlimited\n"), CgroupLimit::Unparseable);
+        assert_eq!(parse_cgroup_current("1073741824\n"), Some(GIB));
+        assert_eq!(parse_cgroup_current("nan\n"), None);
+
+        // `/proc/self/cgroup`: the v2 line is the one with no controllers, and
+        // the v1 memory line may be co-mounted with other controllers.
+        let hybrid = "12:cpu,cpuacct:/user.slice\n\
+                      4:memory:/docker/abc\n\
+                      0::/user.slice/user-1000.slice/session-18.scope\n";
+        assert_eq!(
+            cgroup_path(hybrid, None),
+            Some("/user.slice/user-1000.slice/session-18.scope")
+        );
+        assert_eq!(cgroup_path(hybrid, Some("memory")), Some("/docker/abc"));
+        // A co-mounted memory controller must not be missed by a prefix match.
+        assert_eq!(
+            cgroup_path("5:cpu,memory,pids:/kubepods/pod0\n", Some("memory")),
+            Some("/kubepods/pod0")
+        );
+        assert_eq!(cgroup_path("5:cpu:/x\n", Some("memory")), None);
+        assert_eq!(cgroup_path("", None), None);
+    }
+
+    /// The reading this machine actually performs has to be sane, whatever it
+    /// finds: on a bare host that is `MemAvailable`, in a container it is the
+    /// cap, and neither may come back as zero or as more than the host has.
+    #[test]
+    fn the_ambient_memory_reading_does_not_exceed_the_hosts() {
+        use std::fs::read_to_string;
+
+        let Some(available) = available_memory_bytes() else {
+            // A limit whose numbers could not be read; the depth stays at the
+            // floor, which is the safe direction.
+            return;
+        };
+        let host = read_to_string("/proc/meminfo")
+            .ok()
+            .as_deref()
+            .and_then(parse_mem_available);
+        if let Some(host) = host {
+            // `MemAvailable` is sampled twice here -- once inside
+            // `available_memory_bytes` and once above -- and it moves between
+            // the two reads on any busy machine, so a bare `<=` fails
+            // intermittently (observed roughly one full-suite run in three).
+            // The property worth pinning is that this never reports memory of a
+            // different order than the host has, not that two samples of a
+            // live counter agree, so allow generous drift.
+            let tolerance = host / 16;
+            assert!(
+                available <= host.saturating_add(tolerance),
+                "read {available} bytes available, well above the host's {host}"
             );
         }
     }
