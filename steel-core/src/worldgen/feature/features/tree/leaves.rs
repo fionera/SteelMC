@@ -1,9 +1,9 @@
-use steel_registry::vanilla_block_tags::BlockTag;
-
 use super::super::super::prelude::*;
 use super::super::super::runner::FeatureDecorationRunner;
 use super::super::super::vanilla_collections::JavaBlockPosSet;
-use super::{TreeBounds, TreePlacement};
+use super::{
+    TreeBounds, TreePlacement, tree_state_is_leaves, tree_state_prevents_nearby_leaf_decay,
+};
 
 const LEAF_DISTANCE_LIMIT: usize = 7;
 
@@ -14,11 +14,10 @@ impl FeatureDecorationRunner {
         placement: &TreePlacement,
     ) {
         let mut shape = FxHashSet::default();
-        for pos in placement
+        for &pos in placement
             .decorations
-            .java_ordered_positions()
-            .into_iter()
-            .chain(placement.roots.java_ordered_positions())
+            .insertion_order()
+            .chain(placement.roots.insertion_order())
         {
             if bounds.contains(pos) {
                 shape.insert(pos);
@@ -28,7 +27,7 @@ impl FeatureDecorationRunner {
         let mut frontiers = (0..LEAF_DISTANCE_LIMIT)
             .map(|_| JavaBlockPosSet::default())
             .collect::<Vec<_>>();
-        for pos in placement.trunks.java_ordered_positions() {
+        for &pos in placement.trunks.insertion_order() {
             frontiers[0].insert(pos);
         }
         let mut smallest_distance = 0;
@@ -199,7 +198,7 @@ impl FeatureDecorationRunner {
         state: BlockStateId,
         neighbor_state: BlockStateId,
     ) {
-        if !state.get_block().has_tag(&BlockTag::LEAVES) {
+        if !tree_state_is_leaves(state) {
             return;
         }
 
@@ -222,10 +221,7 @@ impl FeatureDecorationRunner {
     }
 
     fn tree_optional_leaf_distance_at(state: BlockStateId) -> Option<u8> {
-        if state
-            .get_block()
-            .has_tag(&BlockTag::PREVENTS_NEARBY_LEAF_DECAY)
-        {
+        if tree_state_prevents_nearby_leaf_decay(state) {
             return Some(0);
         }
 

@@ -12,6 +12,66 @@ mod root_system;
 mod roots;
 mod trunk;
 
+/// Per-state membership for a block tag the tree placers test position by position.
+///
+/// `Block::has_tag` is two string-keyed hash lookups -- one to find the tag in
+/// the registry's tag map, one to probe its member keys -- and the tree placers
+/// run it on the order of a hundred times per attempted tree:
+/// `max_free_tree_height` tests every position in the trunk's clearance volume,
+/// `try_place_tree_leaf` tests every candidate leaf, and the edge-shape pass
+/// tests both sides of every face on the finished tree's hull. Resolving a tag
+/// once into a state-indexed table is the trick `CarverReplaceableStates`
+/// already uses for the carver's replaceable tag.
+///
+/// Indexing by state id is exact rather than approximate: `BlockStateId::get_block`
+/// *is* `BlockRegistry::state_to_block_lookup[state]`, so the table holds the
+/// answer `has_tag` would have computed for that state's block.
+struct TreeTagStates {
+    states: Box<[bool]>,
+}
+
+impl TreeTagStates {
+    fn build(tag: &Identifier) -> Self {
+        Self {
+            states: REGISTRY
+                .blocks
+                .state_to_block_lookup
+                .iter()
+                .map(|&block| block.has_tag(tag))
+                .collect(),
+        }
+    }
+
+    fn contains(&self, state: BlockStateId) -> bool {
+        self.states.get(state.0 as usize).copied().unwrap_or(false)
+    }
+}
+
+static REPLACEABLE_BY_TREES_STATES: LazyLock<TreeTagStates> =
+    LazyLock::new(|| TreeTagStates::build(&BlockTag::REPLACEABLE_BY_TREES));
+static LOGS_STATES: LazyLock<TreeTagStates> =
+    LazyLock::new(|| TreeTagStates::build(&BlockTag::LOGS));
+static LEAVES_STATES: LazyLock<TreeTagStates> =
+    LazyLock::new(|| TreeTagStates::build(&BlockTag::LEAVES));
+static PREVENTS_NEARBY_LEAF_DECAY_STATES: LazyLock<TreeTagStates> =
+    LazyLock::new(|| TreeTagStates::build(&BlockTag::PREVENTS_NEARBY_LEAF_DECAY));
+
+pub(super) fn tree_state_is_replaceable_by_trees(state: BlockStateId) -> bool {
+    REPLACEABLE_BY_TREES_STATES.contains(state)
+}
+
+pub(super) fn tree_state_is_log(state: BlockStateId) -> bool {
+    LOGS_STATES.contains(state)
+}
+
+pub(super) fn tree_state_is_leaves(state: BlockStateId) -> bool {
+    LEAVES_STATES.contains(state)
+}
+
+pub(super) fn tree_state_prevents_nearby_leaf_decay(state: BlockStateId) -> bool {
+    PREVENTS_NEARBY_LEAF_DECAY_STATES.contains(state)
+}
+
 impl FeatureDecorationRunner {
     pub(crate) fn place_tree_feature(
         region: &mut WorldGenRegion<'_>,
@@ -153,8 +213,12 @@ impl FeatureDecorationRunner {
             for x in -radius..=radius {
                 for z in -radius..=radius {
                     let pos = tree_pos.offset(x, y, z);
-                    if !Self::tree_trunk_placer_is_free(region, pos, &config.trunk_placer)
-                        || (!config.ignore_vines && Self::tree_is_vine(region, pos))
+                    // One read per position instead of the two or three the
+                    // predicate helpers each used to take: nothing in this loop
+                    // writes, so every read of `pos` returns the same state.
+                    let state = region.block_state(pos);
+                    if !Self::tree_trunk_placer_is_free(state, &config.trunk_placer)
+                        || (!config.ignore_vines && Self::tree_state_is_vine(state))
                     {
                         return y - 2;
                     }
@@ -166,28 +230,21 @@ impl FeatureDecorationRunner {
     }
 
     fn tree_valid_pos(region: &WorldGenRegion<'_>, pos: BlockPos) -> bool {
-        let state = region.block_state(pos);
-        state.is_air() || state.get_block().has_tag(&BlockTag::REPLACEABLE_BY_TREES)
+        Self::tree_state_valid_pos(region.block_state(pos))
     }
 
-    fn tree_trunk_placer_is_free(
-        region: &WorldGenRegion<'_>,
-        pos: BlockPos,
-        trunk_placer: &TrunkPlacer,
-    ) -> bool {
-        let state = region.block_state(pos);
-        Self::tree_valid_pos_for_trunk_placer(region, pos, trunk_placer)
-            || state.get_block().has_tag(&BlockTag::LOGS)
+    fn tree_state_valid_pos(state: BlockStateId) -> bool {
+        state.is_air() || tree_state_is_replaceable_by_trees(state)
     }
 
-    fn tree_valid_pos_for_trunk_placer(
-        region: &WorldGenRegion<'_>,
-        pos: BlockPos,
-        trunk_placer: &TrunkPlacer,
-    ) -> bool {
+    fn tree_trunk_placer_is_free(state: BlockStateId, trunk_placer: &TrunkPlacer) -> bool {
+        Self::tree_valid_pos_for_trunk_placer(state, trunk_placer) || tree_state_is_log(state)
+    }
+
+    fn tree_valid_pos_for_trunk_placer(state: BlockStateId, trunk_placer: &TrunkPlacer) -> bool {
         match trunk_placer {
             TrunkPlacer::UpwardsBranching(placer) => {
-                Self::tree_valid_pos_or_tag(region, pos, &placer.can_grow_through)
+                Self::tree_valid_pos_or_tag(state, &placer.can_grow_through)
             }
             TrunkPlacer::Straight(_)
             | TrunkPlacer::Forking(_)
@@ -196,23 +253,24 @@ impl FeatureDecorationRunner {
             | TrunkPlacer::DarkOak(_)
             | TrunkPlacer::MegaJungle(_)
             | TrunkPlacer::Bending(_)
-            | TrunkPlacer::Cherry(_) => Self::tree_valid_pos(region, pos),
+            | TrunkPlacer::Cherry(_) => Self::tree_state_valid_pos(state),
         }
     }
 
-    fn tree_valid_pos_or_tag(region: &WorldGenRegion<'_>, pos: BlockPos, tag: &Identifier) -> bool {
-        let state = region.block_state(pos);
-        let block = state.get_block();
-        state.is_air() || block.has_tag(&BlockTag::REPLACEABLE_BY_TREES) || block.has_tag(tag)
+    /// `can_grow_through` is per-config rather than one of the fixed tags, so it
+    /// keeps the registry lookup. It is only reached once the two cheap checks
+    /// have already failed, which is the position that ends the clearance scan.
+    fn tree_valid_pos_or_tag(state: BlockStateId, tag: &Identifier) -> bool {
+        Self::tree_state_valid_pos(state) || state.get_block().has_tag(tag)
     }
 
     fn tree_is_air_or_leaves(region: &WorldGenRegion<'_>, pos: BlockPos) -> bool {
         let state = region.block_state(pos);
-        state.is_air() || state.get_block().has_tag(&BlockTag::LEAVES)
+        state.is_air() || tree_state_is_leaves(state)
     }
 
-    fn tree_is_vine(region: &WorldGenRegion<'_>, pos: BlockPos) -> bool {
-        region.block_state(pos).get_block() == &vanilla_blocks::VINE
+    fn tree_state_is_vine(state: BlockStateId) -> bool {
+        state.get_block() == &vanilla_blocks::VINE
     }
 
     fn set_tree_block(region: &mut WorldGenRegion<'_>, pos: BlockPos, state: BlockStateId) {

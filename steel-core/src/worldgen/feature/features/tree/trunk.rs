@@ -1003,7 +1003,10 @@ impl FeatureDecorationRunner {
                 let _ = Self::place_fancy_tree_log(
                     region, registry, random, pos, axis, config, placement,
                 );
-            } else if !Self::tree_trunk_placer_is_free(region, pos, &config.trunk_placer) {
+            } else if !Self::tree_trunk_placer_is_free(
+                region.block_state(pos),
+                &config.trunk_placer,
+            ) {
                 return false;
             }
         }
@@ -1177,7 +1180,7 @@ impl FeatureDecorationRunner {
         config: &TreeConfiguration,
         placement: &mut TreePlacement,
     ) -> bool {
-        if !Self::tree_trunk_placer_is_free(region, pos, &config.trunk_placer) {
+        if !Self::tree_trunk_placer_is_free(region.block_state(pos), &config.trunk_placer) {
             return false;
         }
 
@@ -1193,7 +1196,7 @@ impl FeatureDecorationRunner {
         config: &TreeConfiguration,
         placement: &mut TreePlacement,
     ) -> bool {
-        if !Self::tree_valid_pos_or_tag(region, pos, can_grow_through) {
+        if !Self::tree_valid_pos_or_tag(region.block_state(pos), can_grow_through) {
             return false;
         }
 

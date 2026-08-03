@@ -7,7 +7,10 @@
 //! Barrier pressure between neighboring aquifer cells creates solid rock
 //! walls between fluid pockets.
 
-use std::simd::i32x4;
+use std::simd::cmp::{SimdPartialEq, SimdPartialOrd};
+use std::simd::i32x16;
+use std::simd::num::SimdInt;
+use std::simd::prelude::Select;
 
 use rustc_hash::FxHashMap;
 
@@ -138,7 +141,7 @@ pub enum AquiferResult {
 }
 
 /// Column-scan state for the 12 aquifer-neighborhood cells, stored `SoA` so the
-/// per-Y distance computation can be SIMD-batched as 3× `i32x4`.
+/// per-Y distance computation is a single `i32x16` expression.
 ///
 /// `compute_substance` is called many times with the same `(world_x, world_z)`
 /// and decreasing `world_y` (innermost loop in `noise_chunk::fill`). Within a
@@ -152,13 +155,16 @@ struct AquiferColumnCache {
     world_z: i32,
     y_anchor: i32,
     /// Per-cell unpacked Y of the aquifer-cell center (constant while cached).
-    /// Padded to 16 entries so the 12 valid cells fit cleanly into 3× i32x4
-    /// SIMD batches; trailing slots stay at default `0`.
+    /// Padded to 16 entries so the 12 valid cells load as one `i32x16`;
+    /// trailing slots stay at default `0` and are masked off in
+    /// [`nearest_cell_keys`].
     cell_loc_y: [i32; 16],
     /// Per-cell `(dx + fx)² + (dz + fz)²` (Y-independent component of distance).
     cell_xz_dist_sq: [i32; 16],
-    /// Per-cell index into `location_cache` / `status_cache`.
-    cell_idx: [u32; 12],
+    /// Per-cell index into `location_cache` / `status_cache`. Padded to 16 like
+    /// the two vectors above so the lane recovered from a selection key can be
+    /// masked to four bits instead of bounds-checked.
+    cell_idx: [u32; 16],
 }
 
 impl Default for AquiferColumnCache {
@@ -169,7 +175,7 @@ impl Default for AquiferColumnCache {
             y_anchor: i32::MIN,
             cell_loc_y: [0; 16],
             cell_xz_dist_sq: [0; 16],
-            cell_idx: [0; 12],
+            cell_idx: [0; 16],
         }
     }
 }
@@ -274,6 +280,64 @@ const fn unpack_y(packed: i64) -> i32 {
 #[inline]
 const fn unpack_z(packed: i64) -> i32 {
     ((packed << 26) >> X_OFFSET) as i32
+}
+
+/// Lane index of every slot in the column cache, for the padding mask below.
+const LANE: i32x16 = i32x16::from_array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+/// Low-nibble tiebreak carried by each lane's selection key: lane `i` gets
+/// `11 - i`, so ordering keys ascending orders cells by distance ascending and,
+/// among equal distances, by scan position *descending*.
+///
+/// That reversal is not arbitrary. The insertion sort this replaces tested
+/// `dist_sq[j] >= new_dist`, so an equally-distant later cell displaced the
+/// earlier one instead of queueing behind it. Vanilla's `NoiseBasedAquifer`
+/// uses the same `>=`, and ties are common because the distances are integer
+/// squared distances, so the order has to be reproduced rather than assumed
+/// irrelevant.
+const LANE_TIEBREAK: i32x16 =
+    i32x16::from_array([11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 0, 0, 0, 0]);
+
+/// Selection keys for the 12 neighborhood cells, packed so that a plain integer
+/// `min` picks the nearest cell including the tie rule.
+///
+/// `dist << 4 | (11 - lane)` is lossless because `dist` never exceeds 1284: a
+/// cell center sits at `(anchor + {0,1}) * 16 + [0, X_RANGE)` with `anchor =
+/// (world_x - 5) >> 4`, giving `|dx|, |dz| <= 20`, and at `(anchor + {-1,0,1}) *
+/// 12 + [0, Y_RANGE)` with `anchor = (world_y + 1).div_euclid(12)`, giving
+/// `|dy| <= 22`. So the shift cannot overflow and the low four bits are free for
+/// the tiebreak.
+#[inline]
+fn nearest_cell_keys(cell_loc_y: &[i32; 16], cell_xz_dist_sq: &[i32; 16], world_y: i32) -> i32x16 {
+    let dy = i32x16::from_array(*cell_loc_y) - i32x16::splat(world_y);
+    let dist = i32x16::from_array(*cell_xz_dist_sq) + dy * dy;
+    // Lanes 12..15 are padding whose contents are meaningless; park them above
+    // every real key so they can never be selected.
+    LANE.simd_lt(i32x16::splat(12))
+        .select((dist << 4) | LANE_TIEBREAK, i32x16::splat(i32::MAX))
+}
+
+/// Removes and returns the smallest key in `keys`.
+///
+/// Branchless by construction: 4.75% of the machine sat in this selection as a
+/// 12-step insertion sort, and the profile showed why — the unrolled comparison
+/// tree was 20% of *all* branch misses in the process at an 11% miss rate,
+/// because which of the four slots a cell lands in is close to random. A min
+/// reduction plus a mask costs a fixed handful of vector ops and mispredicts
+/// nothing. Keys are distinct (the low nibble is the lane), so exactly one lane
+/// is retired per call.
+#[inline]
+fn take_nearest(keys: &mut i32x16) -> i32 {
+    let key = keys.reduce_min();
+    *keys = keys
+        .simd_eq(i32x16::splat(key))
+        .select(i32x16::splat(i32::MAX), *keys);
+    key
+}
+
+/// Squared distance a selection key was built from.
+#[inline]
+const fn key_dist(key: i32) -> i32 {
+    key >> 4
 }
 
 /// Similarity between two squared distances. Positive when the two nearest
@@ -495,11 +559,22 @@ impl<N: DimensionNoises> Aquifer<N> {
         ((y * self.grid_size_z + z) * self.grid_size_x + x) as usize
     }
 
+    /// Grid-cell index a selection key came from.
+    ///
+    /// The key's low nibble is `11 - lane` (see [`LANE_TIEBREAK`]), so the lane
+    /// is `11 - nibble`. Only lanes 0..=11 are ever selected, which keeps that
+    /// in range; the extra `& 0xF` is what lets the compiler see it and drop the
+    /// bounds check against the 16-slot array.
+    #[inline]
+    const fn cell_of(&self, key: i32) -> usize {
+        self.col_cache.cell_idx[((11 - (key & 0xF)) & 0xF) as usize] as usize
+    }
+
     /// Refill the 12-cell column cache for the current `(world_x, world_z, y_anchor)`.
     ///
     /// Iterates the same `(x1, y1, z1)` order as the inline scan so cells are
     /// stored at consistent indices, preserving tie-breaking when the per-Y
-    /// `new_dist` values are compared in `compute_substance`.
+    /// distances are compared in `compute_substance`.
     fn refill_col_cache(&mut self, world_x: i32, world_y: i32, world_z: i32) -> i32 {
         let x_anchor = grid_x(world_x + SAMPLE_OFFSET_X);
         let y_anchor = grid_y(world_y + SAMPLE_OFFSET_Y);
@@ -545,10 +620,6 @@ impl<N: DimensionNoises> Aquifer<N> {
     }
 
     /// Compute what block to place at this position given the interpolated density.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "splitting would hurt readability of the aquifer sampling logic"
-    )]
     #[inline(always)]
     pub fn compute_substance(
         &mut self,
@@ -594,6 +665,10 @@ impl<N: DimensionNoises> Aquifer<N> {
     /// into the caller without dragging this function's seven callee-saved
     /// pushes and 216-byte frame onto the paths that never sample.
     #[inline(never)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "splitting would hurt readability of the aquifer sampling logic"
+    )]
     fn compute_substance_sampled(
         &mut self,
         noises: &N,
@@ -628,66 +703,29 @@ impl<N: DimensionNoises> Aquifer<N> {
             self.refill_col_cache(world_x, world_y, world_z);
         }
 
-        // SIMD-batch the per-cell distance computation: `loc_y - world_y` then
-        // `xz_dist_sq + dy²`, processing 4 cells per `i32x4` op. The 12 valid
-        // cells fit in 3 batches; the 4-slot tail of `cell_loc_y` /
-        // `cell_xz_dist_sq` is harmless padding (we ignore the trailing slot).
-        let world_y_v = i32x4::splat(world_y);
-        let mut dists = [0i32; 12];
-        for batch in 0..3 {
-            let base = batch * 4;
-            let loc_y_v = i32x4::from_slice(&self.col_cache.cell_loc_y[base..base + 4]);
-            let xz_v = i32x4::from_slice(&self.col_cache.cell_xz_dist_sq[base..base + 4]);
-            let dy = loc_y_v - world_y_v;
-            let dist_v = xz_v + dy * dy;
-            dists[base..base + 4].copy_from_slice(&dist_v.to_array());
-        }
+        // Pull the cells out nearest-first. Only the first two are needed to
+        // answer three quarters of the calls (the `dist12_delta >= 25` return
+        // below), so the third and fourth are taken lazily where they are used.
+        let mut pool = nearest_cell_keys(
+            &self.col_cache.cell_loc_y,
+            &self.col_cache.cell_xz_dist_sq,
+            world_y,
+        );
+        let key1 = take_nearest(&mut pool);
+        let key2 = take_nearest(&mut pool);
+        let (dist1, dist2) = (key_dist(key1), key_dist(key2));
 
-        let mut dist_sq = [i32::MAX; 4];
-        let mut closest_idx = [0usize; 4];
-
-        for (i, &new_dist) in dists.iter().enumerate() {
-            let index = self.col_cache.cell_idx[i] as usize;
-
-            // Insert into sorted top-4
-            if dist_sq[0] >= new_dist {
-                dist_sq[3] = dist_sq[2];
-                closest_idx[3] = closest_idx[2];
-                dist_sq[2] = dist_sq[1];
-                closest_idx[2] = closest_idx[1];
-                dist_sq[1] = dist_sq[0];
-                closest_idx[1] = closest_idx[0];
-                dist_sq[0] = new_dist;
-                closest_idx[0] = index;
-            } else if dist_sq[1] >= new_dist {
-                dist_sq[3] = dist_sq[2];
-                closest_idx[3] = closest_idx[2];
-                dist_sq[2] = dist_sq[1];
-                closest_idx[2] = closest_idx[1];
-                dist_sq[1] = new_dist;
-                closest_idx[1] = index;
-            } else if dist_sq[2] >= new_dist {
-                dist_sq[3] = dist_sq[2];
-                closest_idx[3] = closest_idx[2];
-                dist_sq[2] = new_dist;
-                closest_idx[2] = index;
-            } else if dist_sq[3] >= new_dist {
-                dist_sq[3] = new_dist;
-                closest_idx[3] = index;
-            }
-        }
-
-        let status1 = self.get_aquifer_status(closest_idx[0], noises);
+        let status1 = self.get_aquifer_status(self.cell_of(key1), noises);
         let fluid_at = status1.at(world_y);
 
         // `similarity(d1, d2) = 1 - (d2 - d1) / 25`, so `sim12 <= 0.0` is exactly
         // `d2 - d1 >= 25` in i32. Defer the f64 conversion + divide until after
         // the early-return check. Fluid-update scheduling still matches vanilla:
         // `sim12 >= FLOWING_UPDATE_SIMILARITY` is exactly `d2 - d1 <= 44`.
-        let dist12_delta = dist_sq[1] - dist_sq[0];
+        let dist12_delta = dist2 - dist1;
         if dist12_delta >= 25 {
             if dist12_delta <= 12 * 12 - 10 * 10 {
-                let status2 = self.get_aquifer_status(closest_idx[1], noises);
+                let status2 = self.get_aquifer_status(self.cell_of(key2), noises);
                 self.should_schedule_fluid_update = status1 != status2;
             } else {
                 self.should_schedule_fluid_update = false;
@@ -697,7 +735,7 @@ impl<N: DimensionNoises> Aquifer<N> {
                 None => AquiferResult::Air,
             };
         }
-        let sim12 = similarity(dist_sq[0], dist_sq[1]);
+        let sim12 = similarity(dist1, dist2);
 
         // Water adjacent to global lava below → return water
         if let Some(id) = fluid_at
@@ -718,7 +756,7 @@ impl<N: DimensionNoises> Aquifer<N> {
 
         // Compute barrier pressure between closest pairs
         let mut barrier_noise = f64::NAN;
-        let status2 = self.get_aquifer_status(closest_idx[1], noises);
+        let status2 = self.get_aquifer_status(self.cell_of(key2), noises);
         let barrier12 = sim12
             * self.calculate_pressure(
                 noises,
@@ -734,8 +772,10 @@ impl<N: DimensionNoises> Aquifer<N> {
             return AquiferResult::Solid;
         }
 
-        let status3 = self.get_aquifer_status(closest_idx[2], noises);
-        let sim13 = similarity(dist_sq[0], dist_sq[2]);
+        let key3 = take_nearest(&mut pool);
+        let dist3 = key_dist(key3);
+        let status3 = self.get_aquifer_status(self.cell_of(key3), noises);
+        let sim13 = similarity(dist1, dist3);
         if sim13 > 0.0 {
             let barrier13 = sim12
                 * sim13
@@ -754,7 +794,7 @@ impl<N: DimensionNoises> Aquifer<N> {
             }
         }
 
-        let sim23 = similarity(dist_sq[1], dist_sq[2]);
+        let sim23 = similarity(dist2, dist3);
         if sim23 > 0.0 {
             let barrier23 = sim12
                 * sim23
@@ -779,9 +819,13 @@ impl<N: DimensionNoises> Aquifer<N> {
         if may_flow12 || may_flow23 || may_flow13 {
             self.should_schedule_fluid_update = true;
         } else {
-            self.should_schedule_fluid_update = sim13 >= FLOWING_UPDATE_SIMILARITY
-                && similarity(dist_sq[0], dist_sq[3]) >= FLOWING_UPDATE_SIMILARITY
-                && status1 != self.get_aquifer_status(closest_idx[3], noises);
+            // The fourth cell is only ever consulted here, behind a `sim13`
+            // test that usually fails, so this is where it gets taken.
+            self.should_schedule_fluid_update = sim13 >= FLOWING_UPDATE_SIMILARITY && {
+                let key4 = take_nearest(&mut pool);
+                similarity(dist1, key_dist(key4)) >= FLOWING_UPDATE_SIMILARITY
+                    && status1 != self.get_aquifer_status(self.cell_of(key4), noises)
+            };
         }
 
         // Return the closest fluid
@@ -1120,4 +1164,100 @@ fn cached_preliminary_surface_level<N: DimensionNoises>(
     prelim_cache.insert(key, level);
     noises.prelim_surface_cache().insert(key.0, key.1, level);
     level
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LANE_TIEBREAK, key_dist, nearest_cell_keys, take_nearest};
+
+    /// The 12-step insertion sort that [`take_nearest`] replaced, verbatim.
+    fn insertion_sort_top4(dists: &[i32; 12]) -> ([i32; 4], [usize; 4]) {
+        let mut dist_sq = [i32::MAX; 4];
+        let mut closest_idx = [0usize; 4];
+        for (i, &new_dist) in dists.iter().enumerate() {
+            if dist_sq[0] >= new_dist {
+                dist_sq[3] = dist_sq[2];
+                closest_idx[3] = closest_idx[2];
+                dist_sq[2] = dist_sq[1];
+                closest_idx[2] = closest_idx[1];
+                dist_sq[1] = dist_sq[0];
+                closest_idx[1] = closest_idx[0];
+                dist_sq[0] = new_dist;
+                closest_idx[0] = i;
+            } else if dist_sq[1] >= new_dist {
+                dist_sq[3] = dist_sq[2];
+                closest_idx[3] = closest_idx[2];
+                dist_sq[2] = dist_sq[1];
+                closest_idx[2] = closest_idx[1];
+                dist_sq[1] = new_dist;
+                closest_idx[1] = i;
+            } else if dist_sq[2] >= new_dist {
+                dist_sq[3] = dist_sq[2];
+                closest_idx[3] = closest_idx[2];
+                dist_sq[2] = new_dist;
+                closest_idx[2] = i;
+            } else if dist_sq[3] >= new_dist {
+                dist_sq[3] = new_dist;
+                closest_idx[3] = i;
+            }
+        }
+        (dist_sq, closest_idx)
+    }
+
+    /// The key selection has to agree with the insertion sort on *which* four
+    /// cells and in *what order*, ties included — the tie order decides which
+    /// aquifer's fluid status a block gets, so a mismatch is a world diff.
+    ///
+    /// Distances are drawn from a range far narrower than their real spread so
+    /// that ties are the common case rather than a rarity: the whole point of
+    /// the check is the `>=` behaviour, not the distinct-value behaviour.
+    #[test]
+    fn key_selection_matches_the_insertion_sort_it_replaced() {
+        let mut state = 0x2545_F491_4F6C_DD1D_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..200_000 {
+            let spread = 1 + (next() % 12) as i32;
+            let mut dists = [0i32; 12];
+            for d in &mut dists {
+                *d = (next() % (spread as u64)) as i32;
+            }
+            // `nearest_cell_keys` builds `dist = xz + dy²`; feeding the whole
+            // distance through `xz` with `dy = 0` exercises the same keys.
+            let mut loc_y = [0i32; 16];
+            let mut xz = [0i32; 16];
+            xz[..12].copy_from_slice(&dists);
+            loc_y[12..].copy_from_slice(&[7, -3, 0, 11]);
+            xz[12..].copy_from_slice(&[0, 1, 2, 3]);
+
+            let (want_dist, want_idx) = insertion_sort_top4(&dists);
+            let mut keys = nearest_cell_keys(&loc_y, &xz, 0);
+            for slot in 0..4 {
+                let key = take_nearest(&mut keys);
+                let lane = (11 - (key & 0xF)) as usize;
+                assert_eq!(key_dist(key), want_dist[slot], "dist {slot} of {dists:?}");
+                assert_eq!(lane, want_idx[slot], "cell {slot} of {dists:?}");
+            }
+        }
+    }
+
+    /// Padding lanes must never be selected however small their contents look.
+    #[test]
+    fn padding_lanes_never_win() {
+        let loc_y = [0i32; 16];
+        let xz = [0i32; 16];
+        let mut keys = nearest_cell_keys(&loc_y, &xz, 0);
+        for _ in 0..4 {
+            let key = take_nearest(&mut keys);
+            assert!(
+                (0..=11).contains(&(key & 0xF)),
+                "key {key:#x} is a padding lane"
+            );
+        }
+        assert_eq!(LANE_TIEBREAK.to_array()[11], 0);
+    }
 }

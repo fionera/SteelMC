@@ -5,11 +5,9 @@
     reason = "foliage dispatch keeps vanilla variant behavior explicit"
 )]
 
-use steel_registry::vanilla_block_tags::BlockTag;
-
 use super::super::super::prelude::*;
 use super::super::super::runner::FeatureDecorationRunner;
-use super::{FoliageAttachment, TreePlacement, abs_i32};
+use super::{FoliageAttachment, TreePlacement, abs_i32, tree_state_is_replaceable_by_trees};
 
 impl FeatureDecorationRunner {
     pub(super) fn tree_foliage_height(
@@ -960,10 +958,8 @@ impl FeatureDecorationRunner {
         let is_persistent = current_state
             .try_get_value(&BlockStateProperties::PERSISTENT)
             .unwrap_or(false);
-        let valid_tree_pos = current_state.is_air()
-            || current_state
-                .get_block()
-                .has_tag(&BlockTag::REPLACEABLE_BY_TREES);
+        let valid_tree_pos =
+            current_state.is_air() || tree_state_is_replaceable_by_trees(current_state);
         if is_persistent || !valid_tree_pos {
             return false;
         }
