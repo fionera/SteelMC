@@ -76,6 +76,7 @@ use steel_core::config::WorldStorageConfig;
 use steel_core::entity::init_entities;
 use steel_core::level_data::WorldGenerationSettings;
 use steel_core::server::default_chunk_generation_threads;
+use steel_core::server::generation_affinity::GenerationAffinity;
 use steel_core::server::pregen::pregen_area_for_benchmark;
 use steel_core::world::{World, WorldConfig};
 use steel_core::worldgen::WorldGeneratorRegistry;
@@ -305,13 +306,27 @@ fn build_harness(options: &Options, rep: usize) -> Result<Harness, String> {
         .build()
         .map_err(|error| format!("main runtime should start: {error}"))?;
 
+    // Pinned exactly as the server pins it, or this harness cannot be used to
+    // A/B the switch it is measured with. Printed rather than logged because
+    // the bench installs no logger.
+    let affinity = GenerationAffinity::resolve(options.generation_threads);
+    eprintln!("{}", affinity.summary());
     let generation_pool = Arc::new(
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(options.generation_threads)
-            .thread_name(|index| format!("rayon-gen-{index}"))
+        affinity
+            .apply(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(options.generation_threads)
+                    .thread_name(|index| format!("rayon-gen-{index}")),
+            )
             .build()
             .map_err(|error| format!("generation pool should start: {error}"))?,
     );
+    // The plan above is an intention; this is what happened. Without it a run
+    // could print "pinning enabled" and then measure an entirely unpinned pool,
+    // because the per-worker failures go to `log`, which has no logger here.
+    if let Some(warning) = affinity.verify(&generation_pool) {
+        eprintln!("{warning}");
+    }
     let encoding_pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
             .num_threads(options.encoding_threads)

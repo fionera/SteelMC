@@ -15,6 +15,8 @@ pub mod climate;
 pub mod codec;
 /// Packed RGB and ARGB colors.
 pub mod color;
+/// CPU cache topology and thread affinity.
+pub mod cpu;
 /// Direction enum for the six cardinal directions.
 pub mod direction;
 /// Deterministic concrete-type downcasting for erased Steel objects.

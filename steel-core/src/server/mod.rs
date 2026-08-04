@@ -1,5 +1,7 @@
 //! This module contains the `Server` struct, which is the main entry point for the server.
 mod broadcasting;
+/// Optional L3-domain pinning for the chunk generation pool.
+pub mod generation_affinity;
 /// Tick-polled server jobs.
 pub mod jobs;
 mod packet_processor;
@@ -66,6 +68,7 @@ use crate::portal::{
     end_portal, nether_portal,
 };
 use crate::scoreboard::DomainScoreboards;
+use crate::server::generation_affinity::GenerationAffinity;
 use crate::server::jobs::{FnServerJob, ServerJobContext, ServerJobQueue};
 use crate::server::packet_processor::PacketProcessor;
 use crate::server::registry_cache::RegistryCache;
@@ -651,17 +654,24 @@ impl Server {
             .map_err(|e| format!("failed to validate worlds.toml: {e}"))?;
 
         let generation_pool: Arc<ThreadPool> = Arc::new({
+            let generation_threads =
+                configured_chunk_generation_threads(config.chunk_generation_threads);
+            let affinity = GenerationAffinity::resolve(generation_threads);
+            log::info!("{}", affinity.summary());
             let mut builder = ThreadPoolBuilder::new().thread_name(|i| format!("rayon-gen-{i}"));
-            builder = builder.num_threads(configured_chunk_generation_threads(
-                config.chunk_generation_threads,
-            ));
+            builder = builder.num_threads(generation_threads);
             // Debug builds have deep call chains in density functions that overflow the default 2 MB stack
             if cfg!(debug_assertions) {
                 builder = builder.stack_size(8 * 1024 * 1024);
             }
-            builder
+            let pool = affinity
+                .apply(builder)
                 .build()
-                .map_err(|e| format!("failed to create generation thread pool: {e}"))?
+                .map_err(|e| format!("failed to create generation thread pool: {e}"))?;
+            if let Some(warning) = affinity.verify(&pool) {
+                log::warn!("{warning}");
+            }
+            pool
         });
         let chunk_encoding_pool = Arc::new({
             ThreadPoolBuilder::new()

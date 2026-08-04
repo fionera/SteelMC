@@ -46,6 +46,12 @@ text_components.workspace = true
 toml.workspace = true
 unicode_names2.workspace = true
 
+# `sched_setaffinity`/`CPU_SET` for `cpu::affinity`. Linux-only so that the
+# crate keeps building on targets where the syscall does not exist and the
+# topology reader returns `None` anyway.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 criterion.workspace = true
 md5.workspace = true
