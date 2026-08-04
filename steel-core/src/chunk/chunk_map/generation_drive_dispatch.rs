@@ -455,29 +455,46 @@ fn resolve_and_check(chunk_map: &ChunkMap, center: ChunkPos, plan: &RunPlan) -> 
         let required = plan.ring.get(distance as usize);
         for (x, z) in ring_cells(center, distance) {
             let pos = ChunkPos::new(x, z);
-            // One lookup that takes both the reference and the status off the
-            // same holder under the same read guard. Reading the status through
-            // a second lookup would double the cost of the pass.
+            // Once any cell is behind, this pass is going to park, and the only
+            // holders it still needs are the ones it will actually wait on.
+            // Cloning the rest would be a cross-core refcount increment followed
+            // immediately by a decrement -- two coherence round-trips on a line
+            // other workers are also writing, and by stall weight the most
+            // expensive thing this function does.
+            //
+            // So the decision to clone is made inside the guard, where the
+            // status is already in hand, rather than cloning first and sorting
+            // it out afterwards. One lookup still takes both the reference and
+            // the status off the same holder under the same read guard; reading
+            // the status through a second lookup would double the cost of the
+            // pass.
+            let parking = !unmet.is_empty();
             let cell = chunk_map.chunks.read_sync(&pos, |_, holder| {
-                (Arc::clone(holder), holder.published_status())
+                let published = holder.published_status();
+                let behind = required.is_some_and(|required| {
+                    published.is_none_or(|published| published < required)
+                });
+                let retained = (!parking || behind).then(|| Arc::clone(holder));
+                (retained, behind)
             });
-            let Some((holder, published)) = cell else {
+            let Some((retained, behind)) = cell else {
                 return HaloResolution::Missing(pos);
             };
 
-            if let Some(required) = required
-                && published.is_none_or(|published| published < required)
-            {
+            if behind {
                 if unmet.is_empty() {
                     // First unmet cell: this pass is going to park, so free the
                     // halo now rather than at the end of the pass.
                     halo = Vec::new();
                 }
-                unmet.push(UnmetDependency { holder, required });
+                unmet.push(UnmetDependency {
+                    holder: retained.expect("a cell that is behind is always retained"),
+                    required: required.expect("only a cell with a requirement can be behind"),
+                });
                 continue;
             }
 
-            if unmet.is_empty() {
+            if let Some(holder) = retained {
                 let index = ((z - min_z) * size + (x - min_x)) as usize;
                 halo[index] = Some(holder);
             }
