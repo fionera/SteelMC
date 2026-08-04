@@ -54,12 +54,10 @@ use std::fmt::{self, Display};
 use std::fs;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::num::NonZero;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::str::FromStr;
 use std::sync::{Arc, Once};
-use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rayon::prelude::*;
@@ -81,6 +79,7 @@ use steel_core::server::pregen::pregen_area_for_benchmark;
 use steel_core::world::{World, WorldConfig};
 use steel_core::worldgen::WorldGeneratorRegistry;
 use steel_registry::{REGISTRY, Registry, vanilla_dimension_types};
+use steel_utils::cpu::parallelism::{self, machine_parallelism};
 use steel_utils::types::{Difficulty, GameType};
 use steel_utils::{ChunkPos, Identifier};
 use tokio::runtime::{Builder, Runtime};
@@ -126,7 +125,9 @@ struct Options {
 
 impl Options {
     fn parse() -> Result<Self, String> {
-        let available = thread::available_parallelism().map_or(4, NonZero::get);
+        // The machine's count, not this thread's: the same snapshot the server
+        // sizes from, so a reserved arm and a control arm build the same pools.
+        let available = machine_parallelism();
         let mut options = Self {
             size: DEFAULT_SIZE,
             reps: DEFAULT_REPS,
@@ -291,26 +292,40 @@ struct Harness {
 }
 
 fn build_harness(options: &Options, rep: usize) -> Result<Harness, String> {
-    let chunk_runtime = Arc::new(
-        Builder::new_multi_thread()
-            .worker_threads(options.chunk_workers)
-            .thread_name("chunk-worker")
-            .enable_all()
-            .build()
-            .map_err(|error| format!("chunk runtime should start: {error}"))?,
-    );
-    let main_runtime = Builder::new_multi_thread()
-        .worker_threads(options.main_workers)
-        .thread_name("main-worker")
-        .enable_all()
-        .build()
-        .map_err(|error| format!("main runtime should start: {error}"))?;
-
-    // Pinned exactly as the server pins it, or this harness cannot be used to
-    // A/B the switch it is measured with. Printed rather than logged because
-    // the bench installs no logger.
+    // Resolved before the runtimes are built, exactly as the server resolves it
+    // from `main`: the plan is read off an unpinned thread's affinity mask, and
+    // both runtimes are things a domain reservation confines. Printed rather
+    // than logged because the bench installs no logger.
     let affinity = GenerationAffinity::resolve(options.generation_threads);
     eprintln!("{}", affinity.summary());
+    // Every repetition builds its own runtimes and pools, but the counters
+    // behind the checks below belong to the one process-wide decision. Without
+    // this baseline repetition 2 would re-report repetition 1's failures.
+    let checkpoint = affinity.checkpoint();
+
+    let chunk_runtime = Arc::new({
+        let mut builder = Builder::new_multi_thread();
+        builder
+            .worker_threads(options.chunk_workers)
+            .thread_name("chunk-worker")
+            .enable_all();
+        affinity.apply_reserved_runtime(&mut builder, "chunk runtime");
+        builder
+            .build()
+            .map_err(|error| format!("chunk runtime should start: {error}"))?
+    });
+    let main_runtime = {
+        let mut builder = Builder::new_multi_thread();
+        builder
+            .worker_threads(options.main_workers)
+            .thread_name("main-worker")
+            .enable_all();
+        affinity.apply_reserved_runtime(&mut builder, "main runtime");
+        builder
+            .build()
+            .map_err(|error| format!("main runtime should start: {error}"))?
+    };
+
     let generation_pool = Arc::new(
         affinity
             .apply(
@@ -324,16 +339,32 @@ fn build_harness(options: &Options, rep: usize) -> Result<Harness, String> {
     // The plan above is an intention; this is what happened. Without it a run
     // could print "pinning enabled" and then measure an entirely unpinned pool,
     // because the per-worker failures go to `log`, which has no logger here.
-    if let Some(warning) = affinity.verify(&generation_pool) {
+    if let Some(warning) = affinity.verify(&generation_pool, checkpoint) {
         eprintln!("{warning}");
     }
     let encoding_pool = Arc::new(
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(options.encoding_threads)
-            .thread_name(|index| format!("rayon-chunk-enc-{index}"))
+        affinity
+            .apply_reserved(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(options.encoding_threads)
+                    .thread_name(|index| format!("rayon-chunk-enc-{index}")),
+                "encoding pool",
+            )
             .build()
             .map_err(|error| format!("encoding pool should start: {error}"))?,
     );
+    // This thread is about to drive the whole pregeneration through `block_on`,
+    // and tokio's `on_thread_start` never fires for the thread that *enters* a
+    // runtime -- so without this, one thread burning 270 ms of CPU per 1.44 s
+    // repetition stays free to preempt generation workers on any of their CPUs
+    // while the summary line says otherwise. After the pools above, whose
+    // workers would otherwise inherit the reserved mask.
+    affinity.pin_calling_thread_to_reserved("main runtime driver");
+    // Same reasoning as the generation pool's check above, for the reserved
+    // side: a run must not print a carve-up it did not get.
+    if let Some(warning) = affinity.verify_reserved(&encoding_pool, checkpoint) {
+        eprintln!("{warning}");
+    }
 
     let generator_key = Identifier::vanilla_static("overworld");
     let generator_registry = WorldGeneratorRegistry::new_with_builtins()
@@ -478,9 +509,13 @@ impl Harness {
 }
 
 fn main() {
-    // Production does the same before it generates anything; without it the
-    // benchmark measures a differently-tuned allocator than the server.
+    // Both before anything is built. The allocator because production does the
+    // same before it generates anything, and the benchmark would otherwise
+    // measure a differently-tuned allocator than the server; the parallelism
+    // reading because it has to be taken while this process still has the mask
+    // the operator gave it (see `steel_utils::cpu::parallelism`).
     tune_for_throughput();
+    parallelism::snapshot();
 
     let options = match Options::parse() {
         Ok(options) => options,

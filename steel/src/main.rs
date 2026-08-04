@@ -2,7 +2,6 @@
 #![feature(thread_id_value)]
 
 use std::backtrace::{Backtrace, BacktraceStatus};
-use std::num::NonZero;
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::sync::Arc;
@@ -18,6 +17,9 @@ use steel_core::player::player_data::PersistentPlayerData;
 use steel_core::player::player_data_storage::GlobalPlayerData;
 use steel_core::player::player_inventory::MenuRemovalStatus;
 use steel_core::server::Server;
+use steel_core::server::configured_chunk_generation_threads;
+use steel_core::server::generation_affinity::GenerationAffinity;
+use steel_utils::cpu::parallelism::{self, machine_parallelism};
 use steel_utils::text::DisplayResolutor;
 use text_components::fmt::set_display_resolutor;
 use tokio::runtime::{Builder, Runtime};
@@ -151,6 +153,13 @@ fn steel_main() {
     #[cfg(feature = "dhat-heap")]
     let _profiler = dhat::Profiler::new_heap();
 
+    // Before anything below narrows a mask: every pool here is sized from
+    // `available_parallelism`, which reports the caller's affinity mask, so
+    // without this snapshot a domain reservation would resize pools that have
+    // nothing to do with it -- the gameplay packet pool measured 8 workers
+    // against 64 that way.
+    parallelism::snapshot();
+
     // Load config once at startup
     let steel_config = match config::load_or_create(Path::new("config/config.toml")) {
         Ok(config) => config,
@@ -164,23 +173,40 @@ fn steel_main() {
     let chunk_worker_threads =
         configured_chunk_worker_threads(steel_config.server.threads.chunk_runtime);
 
-    let chunk_runtime = Arc::new(
-        Builder::new_multi_thread()
+    // Resolved here, before either runtime exists, for two reasons: the plan is
+    // read off this thread's affinity mask, which only describes the machine
+    // while nothing has been pinned, and these two runtimes are among the
+    // things a reservation confines. `Server` picks up this same decision and
+    // logs it -- there is no logger yet at this point.
+    let generation_affinity = GenerationAffinity::resolve(configured_chunk_generation_threads(
+        steel_config.server.threads.chunk_generation,
+    ));
+
+    let chunk_runtime = Arc::new({
+        let mut builder = Builder::new_multi_thread();
+        builder
             .worker_threads(chunk_worker_threads)
             .thread_name("chunk-worker")
-            .enable_all()
-            .build()
-            .unwrap(),
-    );
+            .enable_all();
+        generation_affinity.apply_reserved_runtime(&mut builder, "chunk runtime");
+        builder.build().unwrap()
+    });
 
-    let main_runtime = Builder::new_multi_thread()
-        .worker_threads(main_worker_threads)
-        .thread_name("main-worker")
-        .enable_all()
-        .build()
-        .unwrap();
+    let main_runtime = {
+        let mut builder = Builder::new_multi_thread();
+        builder
+            .worker_threads(main_worker_threads)
+            .thread_name("main-worker")
+            .enable_all();
+        generation_affinity.apply_reserved_runtime(&mut builder, "main runtime");
+        builder.build().unwrap()
+    };
 
-    main_runtime.block_on(main_async(chunk_runtime.clone(), steel_config));
+    main_runtime.block_on(main_async(
+        chunk_runtime.clone(),
+        steel_config,
+        generation_affinity,
+    ));
 
     drop(main_runtime);
     drop(chunk_runtime);
@@ -194,8 +220,13 @@ fn configured_chunk_worker_threads(configured_threads: Option<usize>) -> usize {
     chunk_worker_threads_for_available(configured_threads, available_worker_threads())
 }
 
+/// The machine's thread count, taken before this process pins anything.
+///
+/// See [`steel_utils::cpu::parallelism`]: a live `available_parallelism` reports
+/// the calling thread's affinity mask, and a domain reservation narrows exactly
+/// that.
 fn available_worker_threads() -> usize {
-    thread::available_parallelism().map_or(4, NonZero::get)
+    machine_parallelism()
 }
 
 fn worker_threads_for_available(
@@ -251,7 +282,11 @@ fn chunk_worker_threads_for_available(
     (available_threads / 5).clamp(4, 24).min(available_threads)
 }
 
-async fn main_async(chunk_runtime: Arc<Runtime>, steel_config: config::SteelConfig) {
+async fn main_async(
+    chunk_runtime: Arc<Runtime>,
+    steel_config: config::SteelConfig,
+    generation_affinity: &'static GenerationAffinity,
+) {
     let cancel_token = CancellationToken::new();
 
     let logger = match init_tracing(cancel_token.clone(), steel_config.log.clone()).await {
@@ -323,9 +358,14 @@ async fn main_async(chunk_runtime: Arc<Runtime>, steel_config: config::SteelConf
         panic_token.cancel();
     }));
 
-    let run_result = AssertUnwindSafe(run_server(chunk_runtime, cancel_token, steel_config))
-        .catch_unwind()
-        .await;
+    let run_result = AssertUnwindSafe(run_server(
+        chunk_runtime,
+        cancel_token,
+        steel_config,
+        generation_affinity,
+    ))
+    .catch_unwind()
+    .await;
     let panic_payload = match run_result {
         Ok(Ok(())) => None,
         Ok(Err(error)) => {
@@ -383,6 +423,7 @@ async fn run_server(
     chunk_runtime: Arc<Runtime>,
     cancel_token: CancellationToken,
     steel_config: config::SteelConfig,
+    generation_affinity: &'static GenerationAffinity,
 ) -> Result<(), String> {
     #[cfg(feature = "deadlock_detection")]
     {
@@ -415,6 +456,19 @@ async fn run_server(
     let mut steel = SteelServer::new(chunk_runtime.clone(), cancel_token.clone(), steel_config)
         .await
         .map_err(|e| e.to_string())?;
+
+    // The one thread `apply_reserved_runtime` cannot reach: tokio's
+    // `on_thread_start` fires only for threads the runtime spawns, and this one
+    // *entered* the runtime through `block_on`, so it still has the
+    // process-wide mask while the summary line claims the main runtime was
+    // confined. Everything from here on -- spawn-area generation, the accept
+    // loop, shutdown -- runs on it.
+    //
+    // Deliberately after `SteelServer::new`, which builds the generation and
+    // encoding pools on this thread: rayon workers inherit their creator's
+    // mask, and a generation worker whose own pin fails has to fall back to the
+    // whole machine, never to the domains it was meant to stay off.
+    generation_affinity.pin_calling_thread_to_reserved("main runtime driver");
 
     let server = steel.server.clone();
 

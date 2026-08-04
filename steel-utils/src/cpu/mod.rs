@@ -11,5 +11,7 @@
 
 /// Setting the calling thread's CPU affinity mask.
 pub mod affinity;
+/// The machine's thread count, taken before any mask is narrowed.
+pub mod parallelism;
 /// Reading cache-sharing domains from Linux sysfs.
 pub mod topology;

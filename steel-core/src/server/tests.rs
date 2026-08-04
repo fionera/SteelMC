@@ -2846,3 +2846,43 @@ fn ender_pearl_end_return_requires_owner_seen_credits_when_owner_is_player() {
         owner_seen_credits
     ));
 }
+
+/// Thread-pool sizing must describe the machine, not the thread that asks.
+///
+/// `Server::run` asks for its packet-worker count from a main-runtime worker,
+/// and a domain reservation pins those to one L3 domain. Sized from a live
+/// `available_parallelism`, which reports the caller's affinity mask, that made
+/// the reserved arm build 8 packet workers where the control arm built 64 --
+/// a different server, not a differently-scheduled one, on the very CPUs the
+/// reservation squeezes.
+#[cfg(target_os = "linux")]
+#[test]
+fn worker_sizing_ignores_the_calling_thread_s_affinity_mask() {
+    use std::thread;
+    use steel_utils::cpu::affinity::{current_thread_cpus, pin_current_thread};
+
+    // Taken here, as the binary takes it from the top of `main`.
+    let machine = super::available_worker_threads();
+    let packet_workers = super::configured_packet_workers(None);
+    let allowed = current_thread_cpus().expect("this thread has an affinity mask");
+    if allowed.len() < 2 {
+        // Nothing to narrow to, so the assertions could not discriminate.
+        return;
+    }
+    let one_cpu = allowed[..1].to_vec();
+
+    // In a thread of its own, which then exits: affinity is per-thread, and the
+    // rest of the test harness must not inherit a one-CPU mask.
+    let (seen_machine, seen_packet_workers) = thread::spawn(move || {
+        pin_current_thread(&one_cpu).expect("pinning to an already-allowed CPU should succeed");
+        (
+            super::available_worker_threads(),
+            super::configured_packet_workers(None),
+        )
+    })
+    .join()
+    .expect("the pinned thread should not panic");
+
+    assert_eq!(seen_machine, machine);
+    assert_eq!(seen_packet_workers, packet_workers);
+}

@@ -1,6 +1,7 @@
 //! This module contains the `Server` struct, which is the main entry point for the server.
 mod broadcasting;
-/// Optional L3-domain pinning for the chunk generation pool.
+/// Optional L3-domain pinning for the chunk generation pool, and an optional
+/// reservation of domains only it runs on.
 pub mod generation_affinity;
 /// Tick-polled server jobs.
 pub mod jobs;
@@ -68,7 +69,7 @@ use crate::portal::{
     end_portal, nether_portal,
 };
 use crate::scoreboard::DomainScoreboards;
-use crate::server::generation_affinity::GenerationAffinity;
+use crate::server::generation_affinity::{GenerationAffinity, PinCheckpoint};
 use crate::server::jobs::{FnServerJob, ServerJobContext, ServerJobQueue};
 use crate::server::packet_processor::PacketProcessor;
 use crate::server::registry_cache::RegistryCache;
@@ -84,10 +85,8 @@ use rustc_hash::FxHashMap;
 use std::{
     collections::BTreeSet,
     io, mem,
-    num::NonZero,
     path::Path,
     sync::{Arc, mpsc},
-    thread,
     time::{Duration, Instant},
 };
 use steel_crypto::key_store::KeyStore;
@@ -107,6 +106,7 @@ use steel_registry::{
 };
 use steel_utils::{
     BlockPos, ChunkPos, Identifier,
+    cpu::parallelism::machine_parallelism,
     locks::{AsyncMutex, SyncMutex, SyncRwLock},
     text::DisplayResolutor,
     translations,
@@ -168,7 +168,14 @@ const CHUNK_SENDING_TPS: u64 = 20;
 /// Work duration at which background chunk work is considered slow.
 const SLOW_CHUNK_TICK_THRESHOLD: Duration = Duration::from_millis(50);
 
-fn configured_chunk_generation_threads(configured_threads: Option<usize>) -> usize {
+/// The generation pool's thread count for a given config value.
+///
+/// Public because the binary has to resolve [`GenerationAffinity`] from `main`,
+/// before the tokio runtimes exist, and that decision is sized by this count.
+/// Asking here rather than reimplementing the rule keeps the plan the runtimes
+/// are pinned against the same one the pool is later built with.
+#[must_use]
+pub fn configured_chunk_generation_threads(configured_threads: Option<usize>) -> usize {
     let available = available_worker_threads();
     cap_positive_thread_count(configured_threads, available)
         .unwrap_or_else(|| default_chunk_generation_threads(available))
@@ -256,8 +263,17 @@ fn configured_packet_workers(configured_workers: Option<usize>) -> usize {
     packet_workers_for_available(configured_workers, available_worker_threads())
 }
 
+/// The machine's thread count, never the calling thread's.
+///
+/// Deliberately the pre-pinning snapshot rather than a live
+/// `available_parallelism`, which reports the affinity mask. Every caller here
+/// sizes a pool, and some of them run on threads a domain reservation has
+/// pinned: `Server::run` asks for its packet-worker count from a main-runtime
+/// worker, which with one domain reserved would see 16 CPUs and build 8 workers
+/// where the unreserved arm builds 64. Sizing must not depend on which thread
+/// happens to ask.
 fn available_worker_threads() -> usize {
-    thread::available_parallelism().map_or(4, NonZero::get)
+    machine_parallelism()
 }
 
 fn cap_positive_thread_count(
@@ -653,11 +669,20 @@ impl Server {
             .validate_and_resolve(&generator_registry, &storage_registry)
             .map_err(|e| format!("failed to validate worlds.toml: {e}"))?;
 
+        let generation_threads =
+            configured_chunk_generation_threads(config.chunk_generation_threads);
+        // Resolved rather than decided here: the binary already made this call
+        // from `main`, before the tokio runtimes existed, because the affinity
+        // mask it reads stops describing the machine as soon as anything is
+        // pinned. This runs on the thread that entered the main runtime, which
+        // `run_server` pins to the reserved set as soon as the pools below
+        // exist -- so recomputing here would eventually mean planning against
+        // the reserved set. Logged here because this is the first point in
+        // startup that has a logger.
+        let affinity = GenerationAffinity::resolve(generation_threads);
+        log::info!("{}", affinity.summary());
+
         let generation_pool: Arc<ThreadPool> = Arc::new({
-            let generation_threads =
-                configured_chunk_generation_threads(config.chunk_generation_threads);
-            let affinity = GenerationAffinity::resolve(generation_threads);
-            log::info!("{}", affinity.summary());
             let mut builder = ThreadPoolBuilder::new().thread_name(|i| format!("rayon-gen-{i}"));
             builder = builder.num_threads(generation_threads);
             // Debug builds have deep call chains in density functions that overflow the default 2 MB stack
@@ -668,19 +693,32 @@ impl Server {
                 .apply(builder)
                 .build()
                 .map_err(|e| format!("failed to create generation thread pool: {e}"))?;
-            if let Some(warning) = affinity.verify(&pool) {
+            // Against the whole process: the server builds one set of pools, so
+            // the running totals are this set's. (The bench, which builds a set
+            // per repetition, checkpoints instead.)
+            if let Some(warning) = affinity.verify(&pool, PinCheckpoint::PROCESS_START) {
                 log::warn!("{warning}");
             }
             pool
         });
         let chunk_encoding_pool = Arc::new({
-            ThreadPoolBuilder::new()
+            let builder = ThreadPoolBuilder::new()
                 .thread_name(|i| format!("rayon-chunk-encode-{i}"))
                 .num_threads(configured_chunk_encoding_threads(
                     config.chunk_encoding_threads,
-                ))
+                ));
+            let pool = affinity
+                .apply_reserved(builder, "encoding pool")
                 .build()
-                .map_err(|e| format!("failed to create chunk encoding thread pool: {e}"))?
+                .map_err(|e| format!("failed to create chunk encoding thread pool: {e}"))?;
+            // Reported here rather than at each runtime's build site because
+            // this is the last of the reserved tenants to start, and the only
+            // one built after the logger exists. The pool doubles as the
+            // barrier that makes its own start handlers' counts readable.
+            if let Some(warning) = affinity.verify_reserved(&pool, PinCheckpoint::PROCESS_START) {
+                log::warn!("{warning}");
+            }
+            pool
         });
 
         let player_data_storage = PlayerDataStorage::new(

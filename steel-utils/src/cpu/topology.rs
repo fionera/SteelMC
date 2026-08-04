@@ -6,7 +6,7 @@
 //! callers are expected to carry on unpinned rather than treat absence as an
 //! error.
 
-use std::fmt::{self, Display, Formatter};
+use std::fmt::{self, Display, Formatter, Write as _};
 use std::fs;
 use std::path::Path;
 
@@ -77,28 +77,43 @@ impl Display for CacheDomain {
     /// Renders back into sysfs's own range syntax (`0-7,64-71`) so a log line
     /// can be compared against `shared_cpu_list` by eye.
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-        let mut index = 0;
-        let mut first = true;
-        while index < self.cpus.len() {
-            let start = self.cpus[index];
-            let mut end = start;
-            while index + 1 < self.cpus.len() && self.cpus[index + 1] == end + 1 {
-                index += 1;
-                end = self.cpus[index];
-            }
-            if !first {
-                formatter.write_str(",")?;
-            }
-            first = false;
-            if start == end {
-                write!(formatter, "{start}")?;
-            } else {
-                write!(formatter, "{start}-{end}")?;
-            }
-            index += 1;
-        }
-        Ok(())
+        formatter.write_str(&format_cpu_list(&self.cpus))
     }
+}
+
+/// Renders ascending CPU ids in sysfs's own range syntax, e.g. `0-7,64-71`.
+///
+/// Shared with [`CacheDomain`]'s `Display` rather than duplicated because
+/// callers that pin a *union* of domains -- a reserved set spanning several --
+/// have to print that union, and a second renderer would drift from the one a
+/// `shared_cpu_list` is compared against by eye. Merging across the join is the
+/// point: two adjacent domains print as one range.
+///
+/// Expects `cpus` sorted ascending and deduplicated, as every constructor here
+/// produces; unsorted input renders as more, smaller ranges rather than wrongly.
+#[must_use]
+pub fn format_cpu_list(cpus: &[usize]) -> String {
+    let mut rendered = String::new();
+    let mut index = 0;
+    while index < cpus.len() {
+        let start = cpus[index];
+        let mut end = start;
+        while index + 1 < cpus.len() && cpus[index + 1] == end + 1 {
+            index += 1;
+            end = cpus[index];
+        }
+        if !rendered.is_empty() {
+            rendered.push(',');
+        }
+        // A write to a String cannot fail.
+        if start == end {
+            let _ = write!(rendered, "{start}");
+        } else {
+            let _ = write!(rendered, "{start}-{end}");
+        }
+        index += 1;
+    }
+    rendered
 }
 
 /// The distinct level-3 unified cache domains of a machine.
@@ -254,7 +269,7 @@ pub fn parse_cpu_list(list: &str) -> Option<Vec<usize>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CacheIndex, L3Domains, parse_cpu_list};
+    use super::{CacheIndex, L3Domains, format_cpu_list, parse_cpu_list};
     use std::env;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -344,6 +359,18 @@ mod tests {
         let topology = L3Domains::read_from(&root);
         let _ = fs::remove_dir_all(&root);
         assert_eq!(topology, None);
+    }
+
+    #[test]
+    fn renders_a_union_as_merged_ranges() {
+        // The reserved-domain case: two adjacent domains' CPUs, sorted
+        // together, must print as one range per contiguous run rather than as
+        // the four the domains were.
+        let union: Vec<usize> = (48..64).chain(112..128).collect();
+        assert_eq!(format_cpu_list(&union), "48-63,112-127");
+        assert_eq!(format_cpu_list(&[3]), "3");
+        assert_eq!(format_cpu_list(&[0, 2, 4, 5, 6]), "0,2,4-6");
+        assert_eq!(format_cpu_list(&[]), "");
     }
 
     #[test]
