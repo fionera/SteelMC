@@ -599,6 +599,67 @@ fn main() {
             0.0
         },
     );
+
+    report_halo_resolution(total_chunks * options.reps as f64);
+}
+
+/// Prints the halo-resolution ratios.
+///
+/// `resolve_and_check` is the largest single source of cross-core load stalls in
+/// the server, and two attempts to make it cheaper measured flat because these
+/// ratios were never known. Whether the lever is *fewer* resolves or *cheaper*
+/// ones is decided here, so the numbers are printed alongside throughput rather
+/// than left to a one-off patch that has to be rewritten each time.
+fn report_halo_resolution(chunks: f64) {
+    use std::sync::atomic::Ordering;
+    use steel_core::chunk::chunk_holder::GENERATION_DRIVE_COUNTERS;
+
+    let counters = &GENERATION_DRIVE_COUNTERS;
+    let full = counters.full_halo_resolves.load(Ordering::Relaxed);
+    let cached = counters.cached_halo_rechecks.load(Ordering::Relaxed);
+    let parked = counters.halo_resolves_parked.load(Ordering::Relaxed);
+    let rparked = counters.halo_rechecks_parked.load(Ordering::Relaxed);
+    let missing = counters.halo_resolves_missing.load(Ordering::Relaxed);
+    let cells = counters.halo_cells_visited.load(Ordering::Relaxed);
+    let recells = counters.halo_cells_rechecked.load(Ordering::Relaxed);
+
+    let per = |n: u64| {
+        if chunks <= 0.0 {
+            0.0
+        } else {
+            n as f64 / chunks
+        }
+    };
+    let pct = |n: u64, d: u64| {
+        if d == 0 {
+            0.0
+        } else {
+            n as f64 / d as f64 * 100.0
+        }
+    };
+
+    println!(
+        "halo: {:.2} full resolves/chunk ({:.1} cells each), {:.2} cached rechecks/chunk \
+         ({:.1} cells each)",
+        per(full),
+        if full == 0 { 0.0 } else { cells as f64 / full as f64 },
+        per(cached),
+        if cached == 0 {
+            0.0
+        } else {
+            recells as f64 / cached as f64
+        },
+    );
+    println!(
+        "halo: {:.1}% of FULL resolves park, {:.1}% of cached rechecks park, {:.2}% miss; \
+         {} full, {} cached, {} chunks",
+        pct(parked, full),
+        pct(rparked, cached),
+        pct(missing, full + cached),
+        full,
+        cached,
+        chunks as u64,
+    );
 }
 
 // ---------------------------------------------------------------------------

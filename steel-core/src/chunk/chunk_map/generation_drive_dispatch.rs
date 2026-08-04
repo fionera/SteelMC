@@ -443,6 +443,13 @@ struct UnmetDependency {
 /// made the third attempt cost 13.6 GB: a parked holder would pin up to 529
 /// neighbours against unloading for as long as it waited.
 fn resolve_and_check(chunk_map: &ChunkMap, center: ChunkPos, plan: &RunPlan) -> HaloResolution {
+    GENERATION_DRIVE_COUNTERS
+        .full_halo_resolves
+        .fetch_add(1, Ordering::Relaxed);
+    // Counted locally and flushed once per pass rather than per cell: the point
+    // is to size this function, not to add 289 atomics to it.
+    let mut visited: u64 = 0;
+
     let radius = plan.halo_radius as i32;
     let size = radius * 2 + 1;
     let min_x = center.0.x - radius;
@@ -454,6 +461,7 @@ fn resolve_and_check(chunk_map: &ChunkMap, center: ChunkPos, plan: &RunPlan) -> 
     for distance in (0..=radius).rev() {
         let required = plan.ring.get(distance as usize);
         for (x, z) in ring_cells(center, distance) {
+            visited += 1;
             let pos = ChunkPos::new(x, z);
             // Once any cell is behind, this pass is going to park, and the only
             // holders it still needs are the ones it will actually wait on.
@@ -478,6 +486,10 @@ fn resolve_and_check(chunk_map: &ChunkMap, center: ChunkPos, plan: &RunPlan) -> 
                 (retained, behind)
             });
             let Some((retained, behind)) = cell else {
+                flush_halo_cells_visited(visited);
+                GENERATION_DRIVE_COUNTERS
+                    .halo_resolves_missing
+                    .fetch_add(1, Ordering::Relaxed);
                 return HaloResolution::Missing(pos);
             };
 
@@ -501,7 +513,11 @@ fn resolve_and_check(chunk_map: &ChunkMap, center: ChunkPos, plan: &RunPlan) -> 
         }
     }
 
+    flush_halo_cells_visited(visited);
     if !unmet.is_empty() {
+        GENERATION_DRIVE_COUNTERS
+            .halo_resolves_parked
+            .fetch_add(1, Ordering::Relaxed);
         return HaloResolution::Unmet(unmet);
     }
 
@@ -539,6 +555,13 @@ fn resolve_and_check(chunk_map: &ChunkMap, center: ChunkPos, plan: &RunPlan) -> 
 /// set against one run's ring would clear cells the next run is still waiting
 /// for.
 fn recheck_cached(cached: &mut CachedHalo, plan: &RunPlan) -> HaloResolution {
+    GENERATION_DRIVE_COUNTERS
+        .cached_halo_rechecks
+        .fetch_add(1, Ordering::Relaxed);
+    GENERATION_DRIVE_COUNTERS
+        .halo_cells_rechecked
+        .fetch_add(cached.pending.len() as u64, Ordering::Relaxed);
+
     let mut unmet: Vec<UnmetDependency> = Vec::new();
 
     // `retain_mut` keeps the order `CachedHalo::new` built, which is the
@@ -571,8 +594,18 @@ fn recheck_cached(cached: &mut CachedHalo, plan: &RunPlan) -> HaloResolution {
     if unmet.is_empty() {
         HaloResolution::Ready(Arc::clone(&cached.cache))
     } else {
+        GENERATION_DRIVE_COUNTERS
+            .halo_rechecks_parked
+            .fetch_add(1, Ordering::Relaxed);
         HaloResolution::Unmet(unmet)
     }
+}
+
+/// Adds a full pass's cell count to the shared gauge.
+fn flush_halo_cells_visited(visited: u64) {
+    GENERATION_DRIVE_COUNTERS
+        .halo_cells_visited
+        .fetch_add(visited, Ordering::Relaxed);
 }
 
 /// The cells at exactly Chebyshev distance `distance` from `center`, each once.

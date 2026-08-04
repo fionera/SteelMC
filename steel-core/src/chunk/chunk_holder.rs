@@ -164,7 +164,7 @@ impl ChangedLightSections {
 /// same reason.
 ///
 /// Everything here stays at zero until the drive is wired into the scheduler.
-pub(crate) static GENERATION_DRIVE_COUNTERS: GenerationDriveCounters =
+pub static GENERATION_DRIVE_COUNTERS: GenerationDriveCounters =
     GenerationDriveCounters::new();
 
 /// The counters behind [`GENERATION_DRIVE_COUNTERS`].
@@ -173,7 +173,7 @@ pub(crate) static GENERATION_DRIVE_COUNTERS: GenerationDriveCounters =
 /// and an unmatched decrement has to read as `-1` rather than as `u64::MAX`,
 /// which is the difference between "we have a bug" and "the counter is
 /// meaningless".
-pub(crate) struct GenerationDriveCounters {
+pub struct GenerationDriveCounters {
     /// Holders currently parked on at least one dependency.
     pub(crate) parked_holders: AtomicI64,
     /// Holders currently stalled, i.e. unable to progress until re-armed.
@@ -209,6 +209,34 @@ pub(crate) struct GenerationDriveCounters {
     pub(crate) permits_waiting_on_light_window: AtomicI64,
     /// Stalls, indexed by the drive's stall reason.
     pub(crate) stalls_by_reason: [AtomicU64; STALL_REASON_COUNT],
+
+    // Halo resolution accounting. `resolve_and_check` is the single largest
+    // source of cross-core load stalls in the server (10.21% of load-stall
+    // weight by IBS), and two attempts to make it cheaper measured flat because
+    // the ratios below were never measured. Every one of these is a plain
+    // relaxed increment on a thread-local-ish hot path, so they are cheap
+    // enough to leave in, and without them the resolve family cannot be ranked.
+    /// Full `resolve_and_check` passes: a map lookup and a possible clone per
+    /// cell.
+    pub full_halo_resolves: AtomicU64,
+    /// `recheck_cached` passes, which touch no map at all.
+    pub cached_halo_rechecks: AtomicU64,
+    /// Full resolves that ended in `Unmet`, i.e. the drive parked.
+    pub halo_resolves_parked: AtomicU64,
+    /// Cached rechecks that ended in `Unmet`.
+    ///
+    /// Split from the full count because the two imply opposite fixes: parks on
+    /// the cheap cached path say "park less", parks on the 195-cell full path
+    /// say "do not throw the halo away when parking".
+    pub halo_rechecks_parked: AtomicU64,
+    /// Resolves that ended in `Missing`.
+    pub halo_resolves_missing: AtomicU64,
+    /// Cells visited by full resolves. Divided by `full_halo_resolves` this is
+    /// the mean halo width actually walked, which is what a fusing change moves
+    /// in the opposite direction to the resolve count.
+    pub halo_cells_visited: AtomicU64,
+    /// Cells re-examined by cached rechecks.
+    pub halo_cells_rechecked: AtomicU64,
 }
 
 /// Number of stall reasons the drive distinguishes.
@@ -228,6 +256,13 @@ impl GenerationDriveCounters {
             contended_status_claims: AtomicU64::new(0),
             permits_waiting_on_light_window: AtomicI64::new(0),
             stalls_by_reason: [const { AtomicU64::new(0) }; STALL_REASON_COUNT],
+            full_halo_resolves: AtomicU64::new(0),
+            cached_halo_rechecks: AtomicU64::new(0),
+            halo_resolves_parked: AtomicU64::new(0),
+            halo_rechecks_parked: AtomicU64::new(0),
+            halo_resolves_missing: AtomicU64::new(0),
+            halo_cells_visited: AtomicU64::new(0),
+            halo_cells_rechecked: AtomicU64::new(0),
         }
     }
 }
