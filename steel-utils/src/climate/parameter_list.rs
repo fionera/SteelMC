@@ -241,6 +241,27 @@ fn snapshot_buckets(entries: &[BuildEntry]) -> (i64, Vec<Vec<BuildEntry>>) {
     (total_cost, buckets)
 }
 
+/// Narrows a bounding-box bound to the width `FlatNode` stores it at.
+///
+/// Every bound originates in `quantize_coord`, which is
+/// `((coord as f32) * 10000.0) as i64` over a climate parameter in roughly
+/// [-2, 2], so the real range is about +/-20,000 and `i32` is far wider than it
+/// needs to be. This is a build-time conversion, run once at startup per
+/// dimension, so the check is free.
+///
+/// It panics rather than saturating on purpose. A bound that did not fit would
+/// mean the quantisation contract changed, and silently clamping it would move a
+/// biome's bounding box -- which is a parity break that no test would attribute
+/// back to here.
+fn narrow_bound(bound: i64) -> i32 {
+    i32::try_from(bound).unwrap_or_else(|_| {
+        panic!(
+            "climate bound {bound} does not fit in i32; quantize_coord is supposed to keep these \
+             near +/-20,000, so either the quantisation or the parameter range changed"
+        )
+    })
+}
+
 /// Compact node for the flattened R-Tree.
 ///
 /// Children of the same parent are stored at contiguous indices in a single
@@ -249,17 +270,38 @@ fn snapshot_buckets(entries: &[BuildEntry]) -> (i64, Vec<Vec<BuildEntry>>) {
 /// search tend to be near each other in memory.
 struct FlatNode {
     /// Bounding box minimum values for each parameter dimension.
-    mins: [i64; PARAMETER_COUNT],
+    ///
+    /// Narrower than the `i64` these are compared against, so that a node is
+    /// exactly one cache line: see the note on the struct's size below.
+    mins: [i32; PARAMETER_COUNT],
     /// Bounding box maximum values for each parameter dimension.
-    maxs: [i64; PARAMETER_COUNT],
+    maxs: [i32; PARAMETER_COUNT],
     /// For leaf nodes: index into the values array.
-    /// For subtree nodes: `u32::MAX` (sentinel).
-    value_index: u32,
-    /// Start index of children in the nodes array (subtree only).
-    children_start: u32,
+    /// For subtree nodes: start index of the children in the nodes array.
+    ///
+    /// The two never coexist -- a node is a leaf or a subtree -- so they share
+    /// the word, which is what buys the last four bytes. `children_count`
+    /// discriminates; read it through `value_index()` or `children_start()`
+    /// rather than directly, so the discriminant is always checked.
+    payload: u32,
     /// Number of children (0 = leaf, 1..=6 = subtree).
     children_count: u8,
 }
+
+// The whole point of the layout above: 7+7 bounds at 4 bytes, a shared 4-byte
+// payload and a 1-byte tag is 61 bytes, which pads to exactly one 64-byte cache
+// line. At `[i64; 7]` a node was 121 bytes padded to 128 -- two lines, and two
+// misses per node visit on a data-dependent walk.
+//
+// This matters more than one line per node sounds like. `search_nearest` is hit
+// 1,536 times per chunk by `create_biomes`, on every generation thread at once,
+// and the overworld tree is ~9.1 K nodes. At 128 B that array is ~1.17 MB,
+// larger than a core's 1 MiB L2 slice, so the walk misses to L3 indefinitely. At
+// 64 B it is ~585 KB and fits with room to spare.
+const _: () = assert!(
+    size_of::<FlatNode>() == 64,
+    "FlatNode must stay one cache line; check the field packing above"
+);
 
 impl FlatNode {
     /// Compute the squared distance from a target point to this node's bounding box.
@@ -272,10 +314,16 @@ impl FlatNode {
         reason = "indexing into parallel min/max arrays; iterator zip would be less clear"
     )]
     fn distance(&self, target: &[i64; PARAMETER_COUNT]) -> i64 {
+        // The bounds are stored narrow but the arithmetic stays wide, and it has
+        // to. A per-dimension difference reaches 20,000, its square 4x10^8, and
+        // seven of those sum to ~2.8x10^9 -- past `i32::MAX` (2.147x10^9). So
+        // widen each bound on load and accumulate in `i64`; narrowing the
+        // accumulator too would overflow on distant points and silently pick the
+        // wrong biome.
         let mut d = 0i64;
         for i in 0..PARAMETER_COUNT {
-            let di = (target[i] - self.maxs[i])
-                .max(self.mins[i] - target[i])
+            let di = (target[i] - i64::from(self.maxs[i]))
+                .max(i64::from(self.mins[i]) - target[i])
                 .max(0);
             d += di * di;
         }
@@ -285,6 +333,20 @@ impl FlatNode {
     #[inline]
     const fn is_leaf(&self) -> bool {
         self.children_count == 0
+    }
+
+    /// Index into the values array. Leaves only.
+    #[inline]
+    const fn value_index(&self) -> u32 {
+        debug_assert!(self.is_leaf(), "value_index read from a subtree node");
+        self.payload
+    }
+
+    /// Start index of this node's children. Subtrees only.
+    #[inline]
+    const fn children_start(&self) -> u32 {
+        debug_assert!(!self.is_leaf(), "children_start read from a leaf node");
+        self.payload
     }
 }
 
@@ -306,7 +368,7 @@ fn flatten_tree(root: RTreeNode) -> Vec<FlatNode> {
 
         // Fix up parent's children_start to point to this batch
         if let Some(pidx) = parent_idx {
-            nodes[pidx as usize].children_start = batch_start;
+            nodes[pidx as usize].payload = batch_start;
         }
 
         for node in batch {
@@ -317,10 +379,9 @@ fn flatten_tree(root: RTreeNode) -> Vec<FlatNode> {
                     value_index,
                 } => {
                     nodes.push(FlatNode {
-                        mins: parameter_space.map(|p| p.min),
-                        maxs: parameter_space.map(|p| p.max),
-                        value_index: value_index as u32,
-                        children_start: 0,
+                        mins: parameter_space.map(|p| narrow_bound(p.min)),
+                        maxs: parameter_space.map(|p| narrow_bound(p.max)),
+                        payload: value_index as u32,
                         children_count: 0,
                     });
                 }
@@ -330,10 +391,9 @@ fn flatten_tree(root: RTreeNode) -> Vec<FlatNode> {
                 } => {
                     let children_count = children.len() as u8;
                     nodes.push(FlatNode {
-                        mins: parameter_space.map(|p| p.min),
-                        maxs: parameter_space.map(|p| p.max),
-                        value_index: u32::MAX,
-                        children_start: 0, // fixed up when children batch is processed
+                        mins: parameter_space.map(|p| narrow_bound(p.min)),
+                        maxs: parameter_space.map(|p| narrow_bound(p.max)),
+                        payload: 0, // fixed up when the children batch is processed
                         children_count,
                     });
                     queue.push_back((children, Some(flat_idx)));
@@ -356,7 +416,7 @@ fn search_nearest(
     best_dist: &mut i64,
     best_idx: &mut Option<u32>,
 ) {
-    let start = node.children_start as usize;
+    let start = node.children_start() as usize;
     let end = start + node.children_count as usize;
     let children = &nodes[start..end];
 
@@ -367,7 +427,7 @@ fn search_nearest(
             if child.is_leaf() {
                 // Leaf: child_dist IS the exact distance — no recursion needed
                 *best_dist = child_dist;
-                *best_idx = Some(child.value_index);
+                *best_idx = Some(child.value_index());
             } else {
                 // Subtree: recurse into children
                 search_nearest(nodes, child, target, best_dist, best_idx);
@@ -444,7 +504,7 @@ impl<T> ParameterList<T> {
         let target_array = target.to_parameter_array();
         let root = &self.nodes[0];
         if root.is_leaf() {
-            return &self.values[root.value_index as usize].1;
+            return &self.values[root.value_index() as usize].1;
         }
         let mut best_dist = i64::MAX;
         let mut best_idx = None;
@@ -474,7 +534,7 @@ impl<T> ParameterList<T> {
 
         let root = &self.nodes[0];
         if root.is_leaf() {
-            let idx = root.value_index as usize;
+            let idx = root.value_index() as usize;
             *cache = Some(idx);
             return &self.values[idx].1;
         }
