@@ -157,6 +157,13 @@ impl WorldGenAccessMode {
 struct CachedWorldgenHeightmaps {
     world_surface_wg: Option<Box<[i32; 256]>>,
     ocean_floor_wg: Option<Box<[i32; 256]>>,
+    /// Column maxima, kept in the same entry as the arrays they summarise so
+    /// they are materialised and invalidated together and cannot drift apart.
+    ///
+    /// Only meaningful when the matching array is `Some`; `max_of` enforces
+    /// that rather than leaving a zero to be mistaken for a real height.
+    world_surface_wg_max: i32,
+    ocean_floor_wg_max: i32,
 }
 
 impl CachedWorldgenHeightmaps {
@@ -176,10 +183,30 @@ impl CachedWorldgenHeightmaps {
     }
 
     fn set(&mut self, heightmap_type: HeightmapType, columns: Box<[i32; 256]>) {
+        let max = columns.iter().copied().max().unwrap_or(i32::MIN);
         match heightmap_type {
-            HeightmapType::WorldSurfaceWg => self.world_surface_wg = Some(columns),
-            HeightmapType::OceanFloorWg => self.ocean_floor_wg = Some(columns),
+            HeightmapType::WorldSurfaceWg => {
+                self.world_surface_wg = Some(columns);
+                self.world_surface_wg_max = max;
+            }
+            HeightmapType::OceanFloorWg => {
+                self.ocean_floor_wg = Some(columns);
+                self.ocean_floor_wg_max = max;
+            }
             _ => {}
+        }
+    }
+
+    /// The highest column of a materialised map, or `None` if it is not cached.
+    const fn max_of(&self, heightmap_type: HeightmapType) -> Option<i32> {
+        match heightmap_type {
+            HeightmapType::WorldSurfaceWg if self.world_surface_wg.is_some() => {
+                Some(self.world_surface_wg_max)
+            }
+            HeightmapType::OceanFloorWg if self.ocean_floor_wg.is_some() => {
+                Some(self.ocean_floor_wg_max)
+            }
+            _ => None,
         }
     }
 }
@@ -725,6 +752,35 @@ impl<'a> WorldGenRegion<'a> {
                 ),
             }
         })
+    }
+
+    /// The highest column of a chunk's worldgen heightmap, if one can be cached
+    /// for it.
+    ///
+    /// A conservative upper bound over the whole chunk, which is what lets a
+    /// caller reject all 256 of its columns at once. `None` means no bound is
+    /// available -- an unsupported map, a chunk outside the region, or a
+    /// `ReadOnlyFull` neighbour, whose queries are delegated to the wrapped
+    /// chunk and never cached here -- and the caller must then read columns
+    /// individually.
+    ///
+    /// Materialisation goes through `height_at`, so the cache is primed by
+    /// exactly the path a column read would have primed it by; asking for the
+    /// bound can never leave the region in a state a column read would not.
+    #[must_use]
+    pub fn worldgen_height_max(
+        &self,
+        heightmap_type: HeightmapType,
+        chunk_x: i32,
+        chunk_z: i32,
+    ) -> Option<i32> {
+        if !CachedWorldgenHeightmaps::supports(heightmap_type) {
+            return None;
+        }
+        let cache_index = self.chunk_cache_index(chunk_x, chunk_z)?;
+        let _ = self.height_at(heightmap_type, chunk_x << 4, chunk_z << 4);
+        let heightmaps = self.worldgen_heightmaps.borrow();
+        heightmaps.get(cache_index)?.max_of(heightmap_type)
     }
 
     fn cached_proto_height_at(

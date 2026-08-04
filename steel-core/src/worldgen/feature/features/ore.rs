@@ -37,13 +37,55 @@ impl FeatureDecorationRunner {
         let size_xz = 2 * (spread_xz_ceil + max_radius);
         let size_y = 2 * (2 + max_radius);
 
-        for x_probe in x_start..=x_start + size_xz {
-            for z_probe in z_start..=z_start + size_xz {
-                if y_start <= region.height_at(HeightmapType::OceanFloorWg, x_probe, z_probe) {
-                    return Self::do_place_ore(
+        // The probe is a pure boolean OR: `do_place_ore` is called with the same
+        // arguments whichever column satisfies it, and no randomness is drawn
+        // inside the loop. So the answer is exactly
+        // `y_start <= max(height_at)` over the square, and a bound over a whole
+        // chunk can reject all of that chunk's columns at once.
+        //
+        // Worth doing because of where the cost sits. Measured over a 201x201
+        // pregeneration: 247.9 probe loops per chunk at 71.6 `height_at` calls
+        // each, 17,737 calls per chunk in all, and **63.3% of loops fall
+        // through** -- scanning every column of the square and finding nothing.
+        // Those fall-through loops are ~95% of the calls, and they are exactly
+        // what a per-chunk bound deletes.
+        //
+        // The bound only ever *rejects*. A chunk that passes is still scanned
+        // column by column, because its highest column may lie outside the
+        // probe square. Chunks with no bound available (a `ReadOnlyFull`
+        // neighbour, whose heights are delegated and never cached) are scanned
+        // exactly as before.
+        let x_end = x_start + size_xz;
+        let z_end = z_start + size_xz;
+        let chunk_x0 = SectionPos::block_to_section_coord(x_start);
+        let chunk_x1 = SectionPos::block_to_section_coord(x_end);
+        let chunk_z0 = SectionPos::block_to_section_coord(z_start);
+        let chunk_z1 = SectionPos::block_to_section_coord(z_end);
+
+        for chunk_x in chunk_x0..=chunk_x1 {
+            for chunk_z in chunk_z0..=chunk_z1 {
+                if let Some(max) =
+                    region.worldgen_height_max(HeightmapType::OceanFloorWg, chunk_x, chunk_z)
+                    && max < y_start
+                {
+                    continue;
+                }
+
+                let x_lo = x_start.max(chunk_x << 4);
+                let x_hi = x_end.min((chunk_x << 4) + 15);
+                let z_lo = z_start.max(chunk_z << 4);
+                let z_hi = z_end.min((chunk_z << 4) + 15);
+                for x_probe in x_lo..=x_hi {
+                    for z_probe in z_lo..=z_hi {
+                        if y_start
+                            <= region.height_at(HeightmapType::OceanFloorWg, x_probe, z_probe)
+                        {
+                            return Self::do_place_ore(
                         region, registry, random, config, x0, x1, z0, z1, y0, y1, x_start, y_start,
                         z_start, size_xz, size_y,
                     );
+                        }
+                    }
                 }
             }
         }
