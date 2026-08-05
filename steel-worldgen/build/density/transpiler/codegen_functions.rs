@@ -289,6 +289,45 @@ impl TranspileContext {
             quote! { false }
         };
 
+        // Above which Y is the blended noise annihilated before it reaches any
+        // interpolated channel? Checked against `all_inners` because those are
+        // exactly the trees emitted into `fill_cell_corner_densities`, the only
+        // consumers of the hoisted `blended_noise_value` parameter.
+        //
+        // Restricted to the overworld on purpose. The structural analysis below
+        // is dimension-agnostic and does derive a threshold for the nether and
+        // the end, but the two parity obligations behind it -- that blended
+        // noise reaches no channel outside the annihilated product, and that the
+        // annihilated subtree is finite so `0.0 * x` is really `+-0.0` -- were
+        // discharged by reading the generated *overworld* source only.
+        //
+        // Emitting an underived threshold for the other dimensions would be a
+        // silent-corruption hazard rather than a caught bug: `nether_biome_hashes`
+        // and `end_biome_hashes` gate biomes, not noise columns, so a wrong
+        // threshold there produces wrong terrain and still passes every gate.
+        //
+        // `None` reproduces the unoptimized behaviour exactly, so this costs the
+        // nether one corner and the end nothing (its derived threshold was above
+        // its top corner and already a no-op). Lift the restriction per dimension
+        // only once the same two obligations have been discharged for it.
+        //
+        // This gate is also what keeps the optimization compatible with runtime
+        // datapacks: a dimension whose density functions are overridden at load
+        // time must fall back to `None`, and the per-dimension opt-out is the
+        // mechanism that will express it.
+        let proof_discharged_for_dimension = input.prefix == "Overworld";
+        let blended_irrelevant_tok: TokenStream = if !proof_discharged_for_dimension {
+            quote! { None }
+        } else {
+            match super::bounds::blended_noise_irrelevant_at_or_above_y(&all_inners, input) {
+                Some(y) => {
+                    let y_lit = Literal::i32_unsuffixed(y);
+                    quote! { Some(#y_lit) }
+                }
+                None => quote! { None },
+            }
+        };
+
         // Determine whether vein interpolation is present
         let has_vein_interp =
             entries.contains_key("vein_toggle") || entries.contains_key("vein_ridged");
@@ -315,6 +354,13 @@ impl TranspileContext {
             /// non-positive `final_density`. Enables whole-run air skipping in
             /// `NoiseChunk::fill`; conservatively `false` when unprovable.
             pub const DENSITY_NONPOSITIVE_FROM_CHANNEL0: bool = #density_nonpositive_tok;
+
+            /// Y at or above which channel 0's top slide multiplies the whole
+            /// blended-noise contribution by exactly zero, so cell corners there
+            /// produce bit-identical channel values whatever the blended noise
+            /// is. Lets `NoiseChunk::fill` stop the blended-noise column early;
+            /// conservatively `None` when unprovable.
+            pub const BLENDED_NOISE_IRRELEVANT_AT_OR_ABOVE_Y: Option<i32> = #blended_irrelevant_tok;
 
             /// Evaluate the inner functions of all `Interpolated` markers at a cell corner.
             ///

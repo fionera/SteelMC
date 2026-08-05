@@ -1055,6 +1055,9 @@ fn generate_noise_settings(dimension: &str, prefix: &str) -> TokenStream {
             const DENSITY_NONPOSITIVE_FROM_CHANNEL0: bool =
                 DENSITY_NONPOSITIVE_FROM_CHANNEL0;
 
+            const BLENDED_NOISE_IRRELEVANT_AT_OR_ABOVE_Y: Option<i32> =
+                BLENDED_NOISE_IRRELEVANT_AT_OR_ABOVE_Y;
+
             #[inline]
             fn compute_noise_column(&self, x: i32, block_ys: &[i32], z: i32, out: &mut [f64]) {
                 self.blended_noise.compute_column(x, block_ys, z, out);

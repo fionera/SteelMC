@@ -179,6 +179,22 @@ pub trait DimensionNoises: Sized + Send + Sync {
     /// check; `false` simply disables the optimization.
     const DENSITY_NONPOSITIVE_FROM_CHANNEL0: bool = false;
 
+    /// Y at or above which channel 0's top slide is exactly zero, so blended
+    /// noise cannot reach the output. `None` disables the optimisation.
+    ///
+    /// When `Some(y)`, every `Interpolated` channel multiplies its whole
+    /// blended-noise contribution by a `y_clamped_gradient` that evaluates to
+    /// exactly zero for cell corners at or above `y`, and the resulting signed
+    /// zero is absorbed by an addition with a provably non-zero operand — so
+    /// the corners at or above `y` produce bit-identical channel values
+    /// whatever the blended noise is. `NoiseChunk::fill` uses this to stop the
+    /// blended-noise column early; the corner-fill loop still runs over every
+    /// corner and reads zeros from the untouched tail.
+    ///
+    /// Generated per dimension by a conservative structural check; `None`
+    /// simply disables the optimization.
+    const BLENDED_NOISE_IRRELEVANT_AT_OR_ABOVE_Y: Option<i32> = None;
+
     /// Compute blended noise for an entire column of Y values.
     ///
     /// Called by `NoiseChunk::fill_slice` before iterating over Y corners.

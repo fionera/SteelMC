@@ -41,6 +41,27 @@ const MAX_SLICE_LEN: usize = 256;
 /// works and is what non-AVX-512 hosts get.
 const DENSITY_LANES: usize = 8;
 
+/// How many leading entries of the blended-noise column actually have to be
+/// computed.
+///
+/// `threshold` is a dimension's
+/// [`BLENDED_NOISE_IRRELEVANT_AT_OR_ABOVE_Y`], the Y at and above which every
+/// interpolated channel multiplies its blended-noise contribution by an
+/// exactly-zero top slide. Corners at or above it read a leftover `0.0` from
+/// the zero-initialised column and still produce bit-identical channel values,
+/// so the column can stop there. `None` keeps the full column and reproduces
+/// the unoptimized behaviour exactly.
+///
+/// `block_ys` is ascending, so the cut is a `partition_point`; the threshold is
+/// never a literal here because the y=256 band is an overworld-only fact.
+///
+/// [`BLENDED_NOISE_IRRELEVANT_AT_OR_ABOVE_Y`]: crate::density::DimensionNoises::BLENDED_NOISE_IRRELEVANT_AT_OR_ABOVE_Y
+fn blended_column_len(threshold: Option<i32>, block_ys: &[i32], corners_y: usize) -> usize {
+    threshold.map_or(corners_y, |threshold| {
+        block_ys.partition_point(|&y| y < threshold)
+    })
+}
+
 /// How far below zero channel 0 must be before a run is treated as air.
 ///
 /// The trilerp evaluates `a + t*(b - a)` rather than the convex form, so with
@@ -198,6 +219,7 @@ impl<N: DimensionNoises> NoiseChunk<N> {
         cell_x: i32,
         block_ys: &[i32],
         blended_column: &mut [f64],
+        blended_len: usize,
         interp_count: usize,
         corners_y: usize,
         cell_count_xz: usize,
@@ -222,8 +244,18 @@ impl<N: DimensionNoises> NoiseChunk<N> {
             // Ensure column cache for this (x, z)
             cache.ensure(block_x, block_z, noises);
 
-            // SIMD-batch blended noise for the entire Y column.
-            noises.compute_noise_column(block_x, block_ys, block_z, blended_column);
+            // SIMD-batch blended noise for the Y column, stopping at
+            // `blended_len` (see `NoiseChunk::fill`). Entries at and past it are
+            // never written by anyone, so they keep the `0.0` they were
+            // allocated with — which is exactly what the corner loops below read
+            // for those corners, and what the generated channel expressions
+            // annihilate anyway.
+            noises.compute_noise_column(
+                block_x,
+                &block_ys[..blended_len],
+                block_z,
+                &mut blended_column[..blended_len],
+            );
 
             // Wide SIMD-batched corner fill, `DENSITY_LANES` Y values at a
             // time. Tail is handled by the scalar loop below for any remaining
@@ -324,6 +356,16 @@ impl<N: DimensionNoises> NoiseChunk<N> {
         // and add coordination + cache-clone overhead with no spare cores to use.
         let mut beard_column = beardifier.map(BeardifierColumn::new);
         let n_slices = cell_count_xz + 1;
+        // `local_blended` stays `corners_y` long — every corner reads it — but
+        // only its first `blended_len` entries are ever computed. Above the
+        // dimension's threshold the generated channel expressions multiply the
+        // blended noise by an exactly-zero top slide, so those corners produce
+        // the same bits from the leftover `0.0` as from the real noise.
+        let blended_len = blended_column_len(
+            N::BLENDED_NOISE_IRRELEVANT_AT_OR_ABOVE_Y,
+            block_ys,
+            corners_y,
+        );
         let mut local_blended = vec![0.0f64; corners_y];
         for cx_off in 0..n_slices {
             let cell_x = first_cell_x + cx_off as i32;
@@ -332,6 +374,7 @@ impl<N: DimensionNoises> NoiseChunk<N> {
                 cell_x,
                 block_ys,
                 &mut local_blended,
+                blended_len,
                 interp_count,
                 corners_y,
                 cell_count_xz,
@@ -571,5 +614,147 @@ impl<N: DimensionNoises> NoiseChunk<N> {
             // No swap needed: all slices are pre-filled and indexed directly
             // via `self.slices[cell_x_idx]` / `[cell_x_idx + 1]`.
         }
+    }
+}
+
+#[cfg(test)]
+mod blended_column_tests {
+    use super::{DENSITY_LANES, blended_column_len};
+    use crate::density::DimensionNoises;
+    use crate::density_functions::overworld::{
+        BLENDED_NOISE_IRRELEVANT_AT_OR_ABOVE_Y as OVERWORLD_THRESHOLD, OverworldNoiseSettings,
+    };
+
+    /// Rebuild the cell-corner Y values exactly as `NoiseChunk::new` does.
+    fn block_ys(min_y: i32, height: i32, cell_height: i32) -> Vec<i32> {
+        let cell_min_y = min_y.div_euclid(cell_height);
+        let corners_y = (height / cell_height) as usize + 1;
+        (0..corners_y)
+            .map(|cy| (cy as i32 + cell_min_y) * cell_height)
+            .collect()
+    }
+
+    /// The overworld column geometry the truncation depends on. Asserted rather
+    /// than assumed: the y=256 band is an overworld-only fact, and a datapack
+    /// change to `min_y` / `height` / `size_vertical` would move the corner the
+    /// threshold lands on.
+    #[test]
+    fn overworld_corner_geometry_puts_the_top_slide_at_corner_40() {
+        assert_eq!(OverworldNoiseSettings::MIN_Y, -64);
+        assert_eq!(OverworldNoiseSettings::HEIGHT, 384);
+        assert_eq!(OverworldNoiseSettings::CELL_HEIGHT, 8);
+
+        let ys = block_ys(
+            OverworldNoiseSettings::MIN_Y,
+            OverworldNoiseSettings::HEIGHT,
+            OverworldNoiseSettings::CELL_HEIGHT,
+        );
+
+        assert_eq!(ys.len(), 49, "corners_y");
+        assert_eq!(ys[40], 256, "block_ys[40]");
+        assert_eq!(*ys.first().unwrap(), -64);
+        assert_eq!(*ys.last().unwrap(), 320);
+    }
+
+    /// The transpiler must recognise the overworld's `y_clamped_gradient`
+    /// top slide (240 -> 256, 1 -> 0) and cut the column at the corner where it
+    /// first evaluates to exactly zero.
+    #[test]
+    fn overworld_threshold_truncates_to_forty_corners() {
+        assert_eq!(OVERWORLD_THRESHOLD, Some(256));
+
+        let ys = block_ys(
+            OverworldNoiseSettings::MIN_Y,
+            OverworldNoiseSettings::HEIGHT,
+            OverworldNoiseSettings::CELL_HEIGHT,
+        );
+        let len = blended_column_len(OVERWORLD_THRESHOLD, &ys, ys.len());
+
+        assert_eq!(len, 40);
+        // Every skipped corner is at or above the threshold, so its top slide
+        // is exactly zero and the blended noise there cannot reach the output.
+        assert!(ys[len..].iter().all(|&y| y >= 256));
+        // The last computed corner is still below it, so nothing live is lost.
+        assert!(ys[len - 1] < 256);
+        // 40 is a whole number of SIMD batches, so the scalar remainder in
+        // `BlendedNoise::compute_column` disappears too.
+        assert_eq!(len % DENSITY_LANES, 0);
+    }
+
+    /// A dimension that opts out must behave exactly as before: the whole
+    /// column is computed, whatever its geometry.
+    #[test]
+    fn none_threshold_keeps_the_whole_column() {
+        for (min_y, height, cell_height) in [(-64, 384, 8), (0, 128, 8), (0, 128, 4)] {
+            let ys = block_ys(min_y, height, cell_height);
+            assert_eq!(
+                blended_column_len(None, &ys, ys.len()),
+                ys.len(),
+                "None must not truncate ({min_y}, {height}, {cell_height})"
+            );
+        }
+    }
+
+    /// Guards the invariant the truncation relies on: the column buffer stays
+    /// full length and its tail keeps the `0.0` it was allocated with, so the
+    /// corner loops never read uninitialised memory.
+    #[test]
+    fn untouched_tail_stays_zero() {
+        let ys = block_ys(-64, 384, 8);
+        let corners_y = ys.len();
+        let len = blended_column_len(Some(256), &ys, corners_y);
+
+        let mut column = vec![0.0f64; corners_y];
+        // Stand in for `compute_noise_column`, which writes only the prefix.
+        for (i, slot) in column[..len].iter_mut().enumerate() {
+            *slot = i as f64 + 1.0;
+        }
+
+        assert_eq!(column.len(), corners_y, "buffer must stay full length");
+        assert!(
+            column[len..].iter().all(|&v| v == 0.0),
+            "tail must stay 0.0 for the corner loops to read"
+        );
+        // Reused across slices without re-zeroing: the tail is never written,
+        // so a second pass leaves it zero too.
+        for (i, slot) in column[..len].iter_mut().enumerate() {
+            *slot = i as f64 + 100.0;
+        }
+        assert!(column[len..].iter().all(|&v| v == 0.0));
+    }
+
+    /// Read the threshold back through the trait exactly as `fill` does, so the
+    /// generated const is really the one the runtime sees, and check each
+    /// dimension truncates only where its own geometry allows.
+    #[test]
+    fn every_dimension_threshold_is_consistent_with_its_geometry() {
+        fn check<N: DimensionNoises>(min_y: i32, height: i32, cell_height: i32, label: &str) {
+            let ys = block_ys(min_y, height, cell_height);
+            let corners_y = ys.len();
+            let len = blended_column_len(N::BLENDED_NOISE_IRRELEVANT_AT_OR_ABOVE_Y, &ys, corners_y);
+
+            assert!(len <= corners_y, "{label}: cannot exceed the column");
+
+            match N::BLENDED_NOISE_IRRELEVANT_AT_OR_ABOVE_Y {
+                // Opted out: nothing changes.
+                None => assert_eq!(len, corners_y, "{label}: None must keep the full column"),
+                Some(threshold) => {
+                    // Every dropped corner sits at or above the threshold...
+                    assert!(
+                        ys[len..].iter().all(|&y| y >= threshold),
+                        "{label}: dropped a corner below the threshold"
+                    );
+                    // ...and every kept corner below it is genuinely needed.
+                    assert!(
+                        ys[..len].iter().all(|&y| y < threshold),
+                        "{label}: kept a corner at or above the threshold"
+                    );
+                }
+            }
+        }
+
+        check::<crate::density_functions::overworld::OverworldNoises>(-64, 384, 8, "overworld");
+        check::<crate::density_functions::nether::NetherNoises>(0, 128, 8, "nether");
+        check::<crate::density_functions::end::EndNoises>(0, 128, 4, "end");
     }
 }
