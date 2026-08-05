@@ -347,6 +347,85 @@ mod tests {
         }
     }
 
+    /// The transpiled `IntervalSelect` SIMD arm calls [`NormalNoise::get_value_simd`]
+    /// at width 8 with *lane-varying* scales: every lane samples the same noise
+    /// object, but each lane's `(x, y, z)` is pre-multiplied by the scale of
+    /// whichever interval branch that lane selected. That is the only production
+    /// caller of the fully general SIMD path, so pin it down directly: sweep the
+    /// real branch scales of `overworld/caves/spaghetti_2d` and
+    /// `overworld/caves/entrances` across a wide coordinate range and require
+    /// bit-identical agreement with eight independent scalar calls.
+    #[test]
+    fn test_get_value_simd_width8_matches_scalar_with_per_lane_scales() {
+        use std::simd::f64x8;
+
+        let mut rng = Xoroshiro::from_seed(20_260_803);
+        let splitter = rng.next_positional();
+        let noise = NormalNoise::create(&splitter, "simd_lane_scales", -7, &[1.0; 8]);
+
+        // Branch scales as they appear in the vanilla density functions.
+        let spaghetti_2d = [
+            2.0,
+            1.333_333_333_333_333_3,
+            1.0,
+            0.5,
+            0.333_333_333_333_333_3,
+        ];
+        let spaghetti_3d = [1.333_333_333_333_333_3, 1.0, 0.666_666_666_666_666_6, 0.5];
+
+        // Cell-corner Y batches look like this in the real fill loop: eight
+        // consecutive corner Ys at a fixed (x, z).
+        let bases = [
+            (0.0, -64.0, 0.0),
+            (12.5, 0.0, -7.25),
+            (-1000.5, 56.0, 2048.0),
+            (33_554_400.0, 312.0, -33_554_400.0),
+            (-0.000_000_1, -60.0, 0.000_000_1),
+        ];
+
+        let mut checked = 0_u32;
+        for &(bx, by, bz) in &bases {
+            for scales in [&spaghetti_2d[..], &spaghetti_3d[..]] {
+                // Walk every assignment offset so lanes get genuinely mixed
+                // scales, including the all-same-scale case.
+                for rot in 0..scales.len() {
+                    let mut xs = [0.0_f64; 8];
+                    let mut ys = [0.0_f64; 8];
+                    let mut zs = [0.0_f64; 8];
+                    for lane in 0..8 {
+                        let s = scales[(lane + rot) % scales.len()];
+                        let y = by + (lane as f64) * 8.0;
+                        xs[lane] = bx * s;
+                        ys[lane] = y * s;
+                        zs[lane] = bz * s;
+                    }
+
+                    let simd = noise.get_value_simd(
+                        f64x8::from_array(xs),
+                        f64x8::from_array(ys),
+                        f64x8::from_array(zs),
+                    );
+
+                    for lane in 0..8 {
+                        let scalar = noise.get_value(xs[lane], ys[lane], zs[lane]);
+                        #[expect(
+                            clippy::float_cmp,
+                            reason = "the SIMD interval-select arm must be bit-identical to the scalar fallback it replaces"
+                        )]
+                        let bit_match = scalar == simd[lane];
+                        assert!(
+                            bit_match,
+                            "lane {lane} mismatch at ({}, {}, {}): scalar={scalar:?}, simd={:?}",
+                            xs[lane], ys[lane], zs[lane], simd[lane],
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 5 * (5 + 4) * 8, "sweep coverage changed");
+    }
+
     #[test]
     fn test_zero_axis_helpers_match_full_noise() {
         let mut rng = Xoroshiro::from_seed(98_765);

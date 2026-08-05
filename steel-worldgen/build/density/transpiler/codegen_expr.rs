@@ -14,8 +14,8 @@ use quote::{format_ident, quote};
 
 use super::DENSITY_LANES;
 use crate::density::{
-    CubicSpline, DensityFunction, MappedType, MarkerType, RarityValueMapper, SplineValue,
-    TwoArgType,
+    CubicSpline, DensityFunction, IntervalSelect, MappedType, MarkerType, RarityValueMapper,
+    SplineValue, TwoArgType,
 };
 
 use super::TranspilerInput;
@@ -1048,9 +1048,154 @@ impl TranspileContext {
                 }}
             }
 
+            DensityFunction::IntervalSelect(interval) => {
+                if let Some(vectorized) =
+                    self.gen_scaled_noise_interval_simd(interval, input, is_flat)
+                {
+                    vectorized
+                } else {
+                    self.gen_simd_scalar_fallback(df, input, is_flat)
+                }
+            }
+
             // All other variants: scalar 4× fallback.
             _ => self.gen_simd_scalar_fallback(df, input, is_flat),
         }
+    }
+
+    /// SIMD arm for `IntervalSelect` trees whose branches all sample the *same*
+    /// noise object, differing only in a constant coefficient and a constant
+    /// scale — the shape vanilla uses for `overworld/caves/spaghetti_2d` and the
+    /// two `spaghetti_3d` nodes inside `overworld/caves/entrances`:
+    ///
+    /// ```text
+    /// interval_select(input, [t_1 .. t_n], [mul(c_k, noise(id, s_k, s_k))])
+    /// ```
+    ///
+    /// Returns `None` for any other shape, leaving the caller on the scalar
+    /// per-lane fallback.
+    ///
+    /// The scalar fallback evaluates this node once per lane, so a `DENSITY_LANES`
+    /// batch costs `DENSITY_LANES` scalar `NormalNoise` samples. Because the only
+    /// thing that varies between branches is a *scale applied to the coordinates*,
+    /// the whole batch collapses into a single vector sample: select each lane's
+    /// coefficient and scale with mask-selects over the thresholds, scale the
+    /// coordinates per lane, and take one `get_value_simd` call covering all
+    /// lanes at once. No branch is evaluated speculatively — every lane samples
+    /// exactly the branch it selected, so this does strictly less work than the
+    /// fallback regardless of how the lanes are distributed across intervals.
+    ///
+    /// Bit-identical to the scalar path: `splat(x) * s_k`, `ys * s_k` and
+    /// `splat(z) * s_k` reproduce the scalar `x * s_k`, `y * s_k`, `z * s_k`
+    /// operand-for-operand, and `NormalNoise::get_value_simd` is per-lane
+    /// bit-identical to `NormalNoise::get_value` (both bottom out in the same
+    /// `grad_dot_simd`). Threshold comparisons keep the scalar `<`, and the
+    /// selects are applied from the largest threshold down so the *first*
+    /// matching interval wins, exactly as the `if / else if` chain does. A NaN
+    /// input compares false everywhere in both forms and lands on the final
+    /// branch.
+    fn gen_scaled_noise_interval_simd(
+        &mut self,
+        interval: &IntervalSelect,
+        input: &TranspilerInput,
+        is_flat: bool,
+    ) -> Option<TokenStream> {
+        // A single-branch interval_select has no thresholds to select over;
+        // leave it to the fallback rather than emitting a degenerate form.
+        if interval.thresholds.is_empty() {
+            return None;
+        }
+        if interval.functions.len() != interval.thresholds.len() + 1 {
+            return None;
+        }
+
+        let mut noise_id: Option<&str> = None;
+        // (coefficient, xz_scale, y_scale) per branch.
+        let mut branches: Vec<(f64, f64, f64)> = Vec::with_capacity(interval.functions.len());
+
+        for function in &interval.functions {
+            let DensityFunction::TwoArgumentSimple(mul) = function.as_ref() else {
+                return None;
+            };
+            if mul.op != TwoArgType::Mul {
+                return None;
+            }
+            let DensityFunction::Constant(coefficient) = mul.argument1.as_ref() else {
+                return None;
+            };
+            let DensityFunction::Noise(noise) = mul.argument2.as_ref() else {
+                return None;
+            };
+            // `y_scale == 0` noise is Y-independent: the `Noise` arm serves it
+            // from the column cache, which is cheaper than anything here.
+            if noise.y_scale == 0.0 {
+                return None;
+            }
+            // STAGE 1: restricted to `overworld/caves/spaghetti_2d` while the
+            // parity gates validate the approach on one self-contained symbol.
+            // Widened to the general shape once those gates pass.
+            if noise.noise_id != "minecraft:spaghetti_2d" {
+                return None;
+            }
+            match noise_id {
+                None => noise_id = Some(&noise.noise_id),
+                // All branches must name the same noise object — otherwise there
+                // is no single vector sample to collapse into.
+                Some(id) if id == noise.noise_id => {}
+                Some(_) => return None,
+            }
+            branches.push((coefficient.value, noise.xz_scale, noise.y_scale));
+        }
+
+        let field = noise_field_ident(noise_id?);
+        let input_simd = self.gen_expr_simd(&interval.input, input, is_flat);
+
+        let (last, earlier) = branches.split_last()?;
+        let mut coefficient = splat_lit(last.0);
+        let mut xz_scale = splat_lit(last.1);
+        let mut y_scale = splat_lit(last.2);
+
+        // Fold from the largest threshold down, so the smallest matching
+        // threshold is applied last and wins — the `if v < t_1 { .. } else if
+        // v < t_2 { .. }` precedence of the scalar arm.
+        let mut masks = Vec::with_capacity(earlier.len());
+        for (index, (threshold, branch)) in interval
+            .thresholds
+            .iter()
+            .zip(earlier.iter())
+            .enumerate()
+            .rev()
+        {
+            let mask = format_ident!("__is_lt_{}", index);
+            let threshold = Literal::f64_unsuffixed(*threshold);
+            masks.push(quote! {
+                let #mask = __is_v.simd_lt(f64x8::splat(#threshold));
+            });
+            let (branch_coefficient, branch_xz, branch_y) = *branch;
+            let (c, sxz, sy) = (
+                splat_lit(branch_coefficient),
+                splat_lit(branch_xz),
+                splat_lit(branch_y),
+            );
+            coefficient = quote! { #mask.select(#c, #coefficient) };
+            xz_scale = quote! { #mask.select(#sxz, #xz_scale) };
+            y_scale = quote! { #mask.select(#sy, #y_scale) };
+        }
+        // `masks` was built in reverse; emit the bindings in threshold order.
+        masks.reverse();
+
+        Some(quote! {{
+            let __is_v = #input_simd;
+            #(#masks)*
+            let __is_coefficient = #coefficient;
+            let __is_xz_scale = #xz_scale;
+            let __is_y_scale = #y_scale;
+            __is_coefficient * noises.#field.get_value_simd(
+                f64x8::splat(x) * __is_xz_scale,
+                ys * __is_y_scale,
+                f64x8::splat(z) * __is_xz_scale,
+            )
+        }})
     }
 
     /// Scalar 4× fallback for variants not yet migrated to true SIMD.
@@ -1287,4 +1432,10 @@ impl TranspileContext {
 
         (bindings, hoisted_fps)
     }
+}
+
+/// `f64x8::splat(<literal>)`, for building per-lane constant vectors.
+fn splat_lit(value: f64) -> TokenStream {
+    let value = Literal::f64_unsuffixed(value);
+    quote! { f64x8::splat(#value) }
 }
