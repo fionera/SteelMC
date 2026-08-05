@@ -1131,12 +1131,6 @@ impl TranspileContext {
             if noise.y_scale == 0.0 {
                 return None;
             }
-            // STAGE 1: restricted to `overworld/caves/spaghetti_2d` while the
-            // parity gates validate the approach on one self-contained symbol.
-            // Widened to the general shape once those gates pass.
-            if noise.noise_id != "minecraft:spaghetti_2d" {
-                return None;
-            }
             match noise_id {
                 None => noise_id = Some(&noise.noise_id),
                 // All branches must name the same noise object — otherwise there
