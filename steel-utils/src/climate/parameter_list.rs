@@ -13,6 +13,9 @@
 )]
 
 use std::cmp::Ordering;
+use std::simd::Simd;
+use std::simd::cmp::SimdOrd;
+use std::simd::num::SimdInt;
 
 use super::PARAMETER_COUNT;
 use super::types::{Parameter, ParameterPoint, TargetPoint};
@@ -20,6 +23,27 @@ use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 /// Maximum children per tree node. Matches vanilla's `CHILDREN_PER_NODE` = 6.
 const CHILDREN_PER_NODE: usize = 6;
+
+/// Lane count for the distance kernel: `PARAMETER_COUNT` rounded up to a vector
+/// width. The 8th lane is padding and is held at zero everywhere.
+const LANES: usize = PARAMETER_COUNT.next_power_of_two();
+
+/// A search target laid out for [`FlatNode::distance`].
+///
+/// Lane 7 is padding and is always zero. Built once per lookup by
+/// [`pack_target`] and then carried unchanged through the whole tree walk, so
+/// the widening happens once rather than once per visited node.
+type PackedTarget = Simd<i64, LANES>;
+
+/// Widen a target to the kernel's lane count, zero-filling the padding lane.
+///
+/// The target keeps its full `i64` range: `TargetPoint`'s fields are public
+/// `i64` and nothing bounds them, so narrowing here would put a precondition on
+/// a public API that callers have no way to see.
+#[inline]
+fn pack_target(target: &[i64; PARAMETER_COUNT]) -> PackedTarget {
+    Simd::load_or_default(target)
+}
 
 /// R-Tree node used during construction only. After building, the tree is
 /// flattened into a `Vec<FlatNode>` for search.
@@ -306,28 +330,38 @@ const _: () = assert!(
 impl FlatNode {
     /// Compute the squared distance from a target point to this node's bounding box.
     ///
-    /// Uses branchless `max` operations (compiles to `cmov`) to avoid branch
-    /// mispredictions in the hot inner loop.
+    /// One 8-lane pass over a 7-dimensional box. `PARAMETER_COUNT` is 7, which
+    /// is not a vector width, and left to itself LLVM split each node into a
+    /// 4-lane `ymm` chunk, a 2-lane `xmm` chunk and a scalar tail -- two
+    /// horizontal reduction chains and two `vpmullq` per node. Rounding the
+    /// work up to 8 lanes and eating one dead lane is strictly cheaper than
+    /// splitting it three ways.
+    ///
+    /// The arithmetic stays `i64` end to end. The bounds are *stored* as `i32`
+    /// (see the layout note above) but a per-dimension difference reaches
+    /// 20,000, its square 4x10^8, and seven of those sum to ~2.8x10^9 -- past
+    /// `i32::MAX` (2.147x10^9). Widening the loaded bounds and keeping the
+    /// lanes 64-bit means this kernel is bit-identical to the scalar loop it
+    /// replaces for *every* `i64` target, with no range precondition on the
+    /// caller: same operations, same order, same wrapping behaviour. Narrowing
+    /// the lanes to `i32` would be faster still, but only for targets close
+    /// enough to the tree, and a target is public API -- `TargetPoint`'s fields
+    /// are plain `i64`. `distance_scalar` in the tests below is kept as the
+    /// reference this is checked against.
     #[inline]
-    #[expect(
-        clippy::needless_range_loop,
-        reason = "indexing into parallel min/max arrays; iterator zip would be less clear"
-    )]
-    fn distance(&self, target: &[i64; PARAMETER_COUNT]) -> i64 {
-        // The bounds are stored narrow but the arithmetic stays wide, and it has
-        // to. A per-dimension difference reaches 20,000, its square 4x10^8, and
-        // seven of those sum to ~2.8x10^9 -- past `i32::MAX` (2.147x10^9). So
-        // widen each bound on load and accumulate in `i64`; narrowing the
-        // accumulator too would overflow on distant points and silently pick the
-        // wrong biome.
-        let mut d = 0i64;
-        for i in 0..PARAMETER_COUNT {
-            let di = (target[i] - i64::from(self.maxs[i]))
-                .max(i64::from(self.mins[i]) - target[i])
-                .max(0);
-            d += di * di;
-        }
-        d
+    fn distance(&self, target: PackedTarget) -> i64 {
+        // Lane 7 is padding: `load_or_default` zero-fills it from the 7-element
+        // arrays, and `pack_target` zero-fills the target's, so it computes
+        // `max(0 - 0, 0 - 0, 0)^2 == 0` and cannot contribute to the sum. On
+        // AVX-512 each of these is a single masked load, so the padding costs
+        // nothing to suppress.
+        let mins: PackedTarget = Simd::<i32, LANES>::load_or_default(&self.mins).cast();
+        let maxs: PackedTarget = Simd::<i32, LANES>::load_or_default(&self.maxs).cast();
+
+        let di = (target - maxs)
+            .simd_max(mins - target)
+            .simd_max(Simd::splat(0));
+        (di * di).reduce_sum()
     }
 
     #[inline]
@@ -412,7 +446,7 @@ fn flatten_tree(root: RTreeNode) -> Vec<FlatNode> {
 fn search_nearest(
     nodes: &[FlatNode],
     node: &FlatNode,
-    target: &[i64; PARAMETER_COUNT],
+    target: PackedTarget,
     best_dist: &mut i64,
     best_idx: &mut Option<u32>,
 ) {
@@ -511,7 +545,7 @@ impl<T> ParameterList<T> {
         search_nearest(
             &self.nodes,
             root,
-            &target_array,
+            pack_target(&target_array),
             &mut best_dist,
             &mut best_idx,
         );
@@ -557,7 +591,7 @@ impl<T> ParameterList<T> {
         search_nearest(
             &self.nodes,
             root,
-            &target_array,
+            pack_target(&target_array),
             &mut best_dist,
             &mut best_idx,
         );
@@ -571,6 +605,231 @@ impl<T> ParameterList<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::{RngExt, SeedableRng, rngs::StdRng};
+
+    impl FlatNode {
+        /// The scalar loop `distance` replaced, kept verbatim as the reference
+        /// the vector kernel is checked against.
+        ///
+        /// Do not "simplify" this to call `distance`: its whole job is to be an
+        /// independently written second opinion.
+        #[expect(
+            clippy::needless_range_loop,
+            reason = "indexing into parallel min/max arrays; iterator zip would be less clear"
+        )]
+        fn distance_scalar(&self, target: &[i64; PARAMETER_COUNT]) -> i64 {
+            let mut d = 0i64;
+            for i in 0..PARAMETER_COUNT {
+                let di = (target[i] - i64::from(self.maxs[i]))
+                    .max(i64::from(self.mins[i]) - target[i])
+                    .max(0);
+                d += di * di;
+            }
+            d
+        }
+    }
+
+    /// Build a leaf whose box is `[mins[d], maxs[d]]` per dimension.
+    fn node(mins: [i32; PARAMETER_COUNT], maxs: [i32; PARAMETER_COUNT]) -> FlatNode {
+        FlatNode {
+            mins,
+            maxs,
+            payload: 0,
+            children_count: 0,
+        }
+    }
+
+    fn assert_same(n: &FlatNode, target: [i64; PARAMETER_COUNT]) {
+        let scalar = n.distance_scalar(&target);
+        let vector = n.distance(pack_target(&target));
+        assert_eq!(
+            vector, scalar,
+            "vector kernel disagreed with the scalar reference\n  mins   = {:?}\n  maxs   = {:?}\n  target = {target:?}",
+            n.mins, n.maxs,
+        );
+    }
+
+    /// The vector kernel must return *exactly* the scalar result, not a close
+    /// one: `search_nearest` prunes with a strict `>`, so a distance that ties
+    /// differently picks a different biome.
+    #[test]
+    fn distance_matches_scalar_reference_over_random_sweep() {
+        let mut rng = StdRng::seed_from_u64(0x0DDB_A11C_0FFE_E5EE);
+
+        // Three tiers, widening from the range worldgen actually produces out
+        // to the widest range that cannot overflow the reference itself.
+        //
+        // `quantize_coord` is `((c as f32) * 10000.0) as i64` over a climate
+        // parameter in roughly [-2, 2], so real bounds and targets live inside
+        // +/-20,000; tier 0 is that, plus slack to land outside every box.
+        //
+        // The reference squares and sums seven differences in `i64`, so it
+        // overflows once a difference passes ~1.1x10^9 (7 * d^2 <= i64::MAX).
+        // Tier 2 stays under that: beyond it the reference is not a reference
+        // any more, it is UB in debug and a wrap in release.
+        for (tier, span) in [25_000i64, 1_000_000, 500_000_000].into_iter().enumerate() {
+            for _ in 0..40_000 {
+                let mut mins = [0i32; PARAMETER_COUNT];
+                let mut maxs = [0i32; PARAMETER_COUNT];
+                let mut target = [0i64; PARAMETER_COUNT];
+                for d in 0..PARAMETER_COUNT {
+                    let a = rng.random_range(-span..=span);
+                    let b = rng.random_range(-span..=span);
+                    mins[d] = i32::try_from(a.min(b)).expect("tier span fits i32");
+                    maxs[d] = i32::try_from(a.max(b)).expect("tier span fits i32");
+                    target[d] = rng.random_range(-span..=span);
+                }
+                assert_same(&node(mins, maxs), target);
+            }
+            assert!(tier < 3);
+        }
+    }
+
+    /// Largest per-dimension difference the `i64` reference can square and sum
+    /// seven of without overflowing: `sqrt(i64::MAX / 7)`.
+    const REFERENCE_LIMIT: i64 = 1_147_878_293;
+
+    /// Values that sit exactly on, just inside and just outside a box edge,
+    /// plus the quantisation extremes. Capped so that the *reference* stays
+    /// well-defined -- see `distance_matches_scalar_reference_when_it_wraps`
+    /// for the range past this.
+    const INTERESTING: [i64; 11] = [
+        -500_000_000,
+        -46_341,
+        -46_340, // -floor(sqrt(i32::MAX)): the i32-lane cutoff, if we ever narrow
+        -20_001,
+        -20_000, // the quantisation range: ((c as f32) * 10000.0) over c in [-2, 2]
+        -1,
+        0,
+        1,
+        20_000,
+        46_340,
+        500_000_000,
+    ];
+
+    /// The interesting inputs are the ones on the boundary, where a one-off in
+    /// the `max` chain flips a `>` and picks a different biome.
+    #[test]
+    fn distance_matches_scalar_reference_on_boundaries() {
+        for &lo in &INTERESTING {
+            for &hi in &INTERESTING {
+                if lo > hi {
+                    continue;
+                }
+                let mins = [i32::try_from(lo).expect("INTERESTING fits i32"); PARAMETER_COUNT];
+                let maxs = [i32::try_from(hi).expect("INTERESTING fits i32"); PARAMETER_COUNT];
+                let n = node(mins, maxs);
+                for &t in &INTERESTING {
+                    // Straddle each edge in both directions as well.
+                    for delta in [-1i64, 0, 1] {
+                        let t = t + delta;
+                        assert!(
+                            (t - lo).abs().max((t - hi).abs()) <= REFERENCE_LIMIT,
+                            "test input would overflow the reference, not the kernel",
+                        );
+                        assert_same(&n, [t; PARAMETER_COUNT]);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Past `REFERENCE_LIMIT` the original scalar loop overflows `i64` itself:
+    /// `i32::MIN` against `i32::MAX` is a difference of 4.3x10^9, whose square
+    /// is 1.8x10^19. That is a property of the code this replaces, not of the
+    /// replacement -- release builds wrap there and always have.
+    ///
+    /// Parity still has to hold in that regime, because release is what ships.
+    /// Two's-complement add and multiply wrap associatively, so the vector
+    /// kernel's tree-shaped reduction wraps to the same value as the scalar
+    /// loop's sequential one. This pins that down against a reference written
+    /// with explicit wrapping ops, which debug builds will not trap on.
+    #[test]
+    fn distance_matches_scalar_reference_when_it_wraps() {
+        #[expect(
+            clippy::needless_range_loop,
+            reason = "mirrors the scalar reference's indexing, deliberately"
+        )]
+        fn wrapping_reference(n: &FlatNode, target: &[i64; PARAMETER_COUNT]) -> i64 {
+            let mut d = 0i64;
+            for i in 0..PARAMETER_COUNT {
+                let di = (target[i].wrapping_sub(i64::from(n.maxs[i])))
+                    .max(i64::from(n.mins[i]).wrapping_sub(target[i]))
+                    .max(0);
+                d = d.wrapping_add(di.wrapping_mul(di));
+            }
+            d
+        }
+
+        let extremes = [
+            i64::from(i32::MIN),
+            i64::from(i32::MIN) + 1,
+            -1,
+            0,
+            1,
+            i64::from(i32::MAX) - 1,
+            i64::from(i32::MAX),
+        ];
+
+        let mut rng = StdRng::seed_from_u64(0xC0FF_EE15_600D);
+        for _ in 0..20_000 {
+            let mut mins = [0i32; PARAMETER_COUNT];
+            let mut maxs = [0i32; PARAMETER_COUNT];
+            let mut target = [0i64; PARAMETER_COUNT];
+            for d in 0..PARAMETER_COUNT {
+                let a: i32 = rng.random();
+                let b: i32 = rng.random();
+                mins[d] = a.min(b);
+                maxs[d] = a.max(b);
+                // Full i64 targets: nothing bounds `TargetPoint`'s fields.
+                target[d] = if rng.random_bool(0.5) {
+                    extremes[rng.random_range(0..extremes.len())]
+                } else {
+                    rng.random()
+                };
+            }
+            let n = node(mins, maxs);
+            assert_eq!(
+                n.distance(pack_target(&target)),
+                wrapping_reference(&n, &target),
+                "vector kernel and scalar loop wrapped differently\n  mins   = {mins:?}\n  maxs   = {maxs:?}\n  target = {target:?}",
+            );
+        }
+    }
+
+    /// A degenerate box (min == max) and a target inside it must both give
+    /// exactly zero, and a zero must survive the padding lane.
+    #[test]
+    fn distance_inside_the_box_is_zero() {
+        let n = node([-100; PARAMETER_COUNT], [100; PARAMETER_COUNT]);
+        for t in [-100i64, -50, 0, 50, 100] {
+            assert_eq!(n.distance(pack_target(&[t; PARAMETER_COUNT])), 0);
+        }
+
+        // Only one dimension escapes the box: the other six, and the padding
+        // lane, must contribute nothing.
+        let mut target = [0i64; PARAMETER_COUNT];
+        target[3] = 130;
+        assert_eq!(n.distance(pack_target(&target)), 30 * 30);
+        assert_same(&n, target);
+    }
+
+    /// Mixed per-dimension boxes, so a bug that broadcasts one lane's bound
+    /// across the vector cannot pass.
+    #[test]
+    fn distance_uses_each_dimension_independently() {
+        let mins = [-10, -20, -30, -40, -50, -60, -70];
+        let maxs = [10, 20, 30, 40, 50, 60, 70];
+        let n = node(mins, maxs);
+        let target = [100i64, -200, 300, -400, 500, -600, 700];
+        // 90^2 + 180^2 + 270^2 + 360^2 + 450^2 + 540^2 + 630^2
+        let expected: i64 = [90i64, 180, 270, 360, 450, 540, 630]
+            .iter()
+            .map(|d| d * d)
+            .sum();
+        assert_eq!(n.distance(pack_target(&target)), expected);
+        assert_same(&n, target);
+    }
 
     #[test]
     fn test_parameter_list_find_value() {
