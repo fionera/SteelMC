@@ -619,11 +619,15 @@ impl<N: DimensionNoises> NoiseChunk<N> {
 
 #[cfg(test)]
 mod blended_column_tests {
-    use super::{DENSITY_LANES, blended_column_len};
-    use crate::density::DimensionNoises;
+    use super::{DENSITY_LANES, MAX_INTERP, NoiseChunk, blended_column_len};
+    use crate::density::{ColumnCache, DimensionNoises, NoiseSettings};
+    use crate::density_functions::end::EndNoises;
+    use crate::density_functions::nether::NetherNoises;
     use crate::density_functions::overworld::{
         BLENDED_NOISE_IRRELEVANT_AT_OR_ABOVE_Y as OVERWORLD_THRESHOLD, OverworldNoiseSettings,
     };
+    use crate::noise_parameters::get_noise_parameters;
+    use crate::random::{Random, legacy_random::LegacyRandom, xoroshiro::Xoroshiro};
 
     /// Rebuild the cell-corner Y values exactly as `NoiseChunk::new` does.
     fn block_ys(min_y: i32, height: i32, cell_height: i32) -> Vec<i32> {
@@ -756,5 +760,207 @@ mod blended_column_tests {
         check::<crate::density_functions::overworld::OverworldNoises>(-64, 384, 8, "overworld");
         check::<crate::density_functions::nether::NetherNoises>(0, 128, 8, "nether");
         check::<crate::density_functions::end::EndNoises>(0, 128, 4, "end");
+    }
+
+    // ── The `None` arm, on real dimensions ──────────────────────────────────
+    //
+    // Everything above is arithmetic on `blended_column_len`. What follows runs
+    // whole dimensions through `NoiseChunk` itself, because nothing else covers
+    // the `None` arm: only the overworld emits `Some`, so the overworld parity
+    // gates never reach it, and `nether_biome_hashes` / `end_biome_hashes` hash
+    // biomes rather than noise columns — they would pass with the nether's
+    // blended column truncated to nothing. A runtime-loaded datapack that
+    // declines the optimisation takes this same path.
+
+    /// Block coordinates of the chunk every fill below is run for. Off the
+    /// origin so the noise is not sampled at a degenerate lattice point.
+    const PROBE_CHUNK_X: i32 = 48;
+    /// See [`PROBE_CHUNK_X`].
+    const PROBE_CHUNK_Z: i32 = -80;
+    /// World seed the probe dimensions are built from.
+    const PROBE_SEED: u64 = 0x5EED_C0DE_1234_5678;
+
+    /// Every live cell-corner channel value of a filled chunk, as raw bits.
+    ///
+    /// Bits rather than `f64` because the claim under test is bit-identical
+    /// parity: a sign-flipped zero or a 1-ULP drift has to fail.
+    fn corner_bits<N: DimensionNoises>(chunk: &NoiseChunk<N>) -> Vec<u64> {
+        let corners = (chunk.cell_count_xz + 1) * chunk.corners_y;
+        let mut bits = Vec::with_capacity(chunk.slices.len() * corners * chunk.interp_count);
+        for slice in &chunk.slices {
+            let values: &[f64] = &slice[..];
+            for corner in 0..corners {
+                let base = corner * MAX_INTERP;
+                bits.extend(
+                    values[base..base + chunk.interp_count]
+                        .iter()
+                        .map(|value| value.to_bits()),
+                );
+            }
+        }
+        bits
+    }
+
+    /// Fill every slice of one chunk with an explicit blended-column length.
+    ///
+    /// `blended_len == corners_y` is the pre-optimisation body verbatim: before
+    /// the parameter existed, `fill_slice_into` handed `compute_noise_column`
+    /// the whole column and every corner read a computed entry.
+    fn corner_bits_at_len<N: DimensionNoises>(
+        noises: &N,
+        cache: &mut N::ColumnCache,
+        blended_len: usize,
+    ) -> Vec<u64> {
+        let mut chunk = NoiseChunk::<N>::new(PROBE_CHUNK_X, PROBE_CHUNK_Z);
+        let corners_y = chunk.corners_y;
+        let interp_count = chunk.interp_count;
+        let cell_count_xz = chunk.cell_count_xz;
+        let first_cell_x = chunk.first_cell_x;
+        let first_cell_z = chunk.first_cell_z;
+        let block_ys = chunk.block_ys.clone();
+        // Allocated zeroed and never re-zeroed, exactly like `fill`'s
+        // `local_blended`: a short column leaves 0.0 in the tail for the corner
+        // loops to read.
+        let mut column = vec![0.0f64; corners_y];
+        for cx_off in 0..=cell_count_xz {
+            NoiseChunk::<N>::fill_slice_into(
+                &mut chunk.slices[cx_off],
+                first_cell_x + cx_off as i32,
+                &block_ys,
+                &mut column,
+                blended_len,
+                interp_count,
+                corners_y,
+                cell_count_xz,
+                first_cell_z,
+                noises,
+                cache,
+            );
+        }
+        corner_bits(&chunk)
+    }
+
+    /// Which cell corners' channel values actually change when their
+    /// blended-noise input does, probed through the dimension's own generated
+    /// corner fill.
+    ///
+    /// Whether a corner consumes it is a function of the corner's Y alone —
+    /// what annihilates it is a `y_clamped_gradient` slide — so one column
+    /// decides it for the whole chunk.
+    fn corners_consuming_blended<N: DimensionNoises>(
+        noises: &N,
+        cache: &mut N::ColumnCache,
+        block_ys: &[i32],
+    ) -> Vec<bool> {
+        let interp_count = N::interpolated_count();
+        let mut without = vec![0.0f64; interp_count];
+        let mut with = vec![0.0f64; interp_count];
+        cache.ensure(PROBE_CHUNK_X, PROBE_CHUNK_Z, noises);
+        block_ys
+            .iter()
+            .map(|&y| {
+                let (x, z) = (PROBE_CHUNK_X, PROBE_CHUNK_Z);
+                noises.fill_cell_corner_densities(cache, x, y, z, 0.0, &mut without);
+                noises.fill_cell_corner_densities(cache, x, y, z, 1.0, &mut with);
+                without
+                    .iter()
+                    .zip(&with)
+                    .any(|(a, b)| a.to_bits() != b.to_bits())
+            })
+            .collect()
+    }
+
+    /// Compare two corner-bit vectors, reporting the first differing value
+    /// rather than dumping several hundred `u64`s.
+    fn assert_corner_bits_eq(actual: &[u64], expected: &[u64], label: &str, what: &str) {
+        assert_eq!(actual.len(), expected.len(), "{label}: {what} (length)");
+        if let Some(i) = actual.iter().zip(expected).position(|(a, b)| a != b) {
+            panic!(
+                "{label}: {what}; first difference at value {i}: {} vs {}",
+                f64::from_bits(actual[i]),
+                f64::from_bits(expected[i])
+            );
+        }
+    }
+
+    /// A dimension that opts out must produce exactly the corner densities the
+    /// unoptimized code produced, and must be one whose blended noise really
+    /// reaches those densities.
+    fn check_opted_out<N: DimensionNoises>(label: &str) {
+        assert_eq!(
+            N::BLENDED_NOISE_IRRELEVANT_AT_OR_ABOVE_Y,
+            None,
+            "{label} no longer opts out; this test exists to cover the None arm, \
+             so retarget it at a dimension that still takes it"
+        );
+
+        let splitter = if N::Settings::LEGACY_RANDOM_SOURCE {
+            LegacyRandom::from_seed(PROBE_SEED).next_positional()
+        } else {
+            Xoroshiro::from_seed(PROBE_SEED).next_positional()
+        };
+        let noises = N::create(PROBE_SEED, &splitter, &get_noise_parameters());
+
+        let mut cache = N::ColumnCache::default();
+        cache.init_grid(PROBE_CHUNK_X, PROBE_CHUNK_Z, &noises);
+
+        // The production path, which is the only thing that reads the const.
+        let mut chunk = NoiseChunk::<N>::new(PROBE_CHUNK_X, PROBE_CHUNK_Z);
+        chunk.fill(&noises, &mut cache, None, None, |_, _, _, _, _, _| {});
+        let production = corner_bits(&chunk);
+
+        let corners_y = chunk.corners_y;
+        let block_ys = chunk.block_ys.clone();
+
+        // The pre-optimisation behaviour: the whole column, for every slice.
+        let full_column = corner_bits_at_len::<N>(&noises, &mut cache, corners_y);
+        assert_corner_bits_eq(
+            &production,
+            &full_column,
+            label,
+            "opting out must compute and consume the whole blended column",
+        );
+
+        // Non-vacuity. Without this the equality above would hold just as well
+        // for a dimension that never looks at its blended noise, which is the
+        // one way this test could pass while proving nothing.
+        let consuming = corners_consuming_blended::<N>(&noises, &mut cache, &block_ys);
+        let Some(last) = consuming.iter().rposition(|&consumed| consumed) else {
+            panic!("{label}: no cell corner consumes its blended noise");
+        };
+
+        // Corners above the last consuming one are the only ones a threshold
+        // could ever drop for free...
+        assert_corner_bits_eq(
+            &corner_bits_at_len::<N>(&noises, &mut cache, last + 1),
+            &full_column,
+            label,
+            "dropping only corners that ignore their blended noise must change nothing",
+        );
+        // ...and dropping one more is visible in the densities. So the column
+        // this dimension computes is live all the way up to corner `last`, and
+        // `None` — which truncates nothing — is what keeps it that way.
+        assert!(
+            corner_bits_at_len::<N>(&noises, &mut cache, last) != full_column,
+            "{label}: corner y={} consumes its blended noise, so cutting the column \
+             there must change the densities",
+            block_ys[last]
+        );
+        assert_eq!(
+            blended_column_len(
+                N::BLENDED_NOISE_IRRELEVANT_AT_OR_ABOVE_Y,
+                &block_ys,
+                corners_y
+            ),
+            corners_y,
+            "{label}: opting out must leave the column at full length"
+        );
+    }
+
+    /// The dimensions that take the `None` arm, end to end.
+    #[test]
+    fn opted_out_dimensions_match_the_full_blended_column() {
+        check_opted_out::<NetherNoises>("nether");
+        check_opted_out::<EndNoises>("end");
     }
 }
