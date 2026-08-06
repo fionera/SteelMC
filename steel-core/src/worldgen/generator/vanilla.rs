@@ -26,7 +26,7 @@ use steel_worldgen::surface::{
 };
 
 use crate::chunk::Chunk;
-use crate::chunk::heightmap::{Heightmap, HeightmapType};
+use crate::chunk::heightmap::WorldgenHeightmaps;
 use crate::worldgen::carver::{
     CarveRun, CarverBlockIds, CarvingContext, PreliminarySurfaceCorners, SourceChunk, cave,
 };
@@ -447,10 +447,11 @@ impl<N: VanillaPostNoiseStateType> ChunkGenerator for VanillaGenerator<N> {
         let mut pending_writes: Vec<(usize, usize, usize, BlockStateId)> = Vec::new();
         let mut prev_x: usize = usize::MAX;
         let mut prev_z: usize = usize::MAX;
-        let mut ocean_floor_wg =
-            Heightmap::new(HeightmapType::OceanFloorWg, min_y, N::Settings::HEIGHT);
-        let mut world_surface_wg =
-            Heightmap::new(HeightmapType::WorldSurfaceWg, min_y, N::Settings::HEIGHT);
+        // Derived from `pending_writes` at each flush rather than per block:
+        // the fill walks a column top-down, so the batch about to be flushed is
+        // exactly that column's placed blocks in descending Y, which is all
+        // either worldgen heightmap needs. See `WorldgenHeightmaps`.
+        let mut wg_heightmaps = WorldgenHeightmaps::new(min_y, N::Settings::HEIGHT);
 
         let air_only_above_y = aquifer.air_only_above_y();
 
@@ -463,6 +464,20 @@ impl<N: VanillaPostNoiseStateType> ChunkGenerator for VanillaGenerator<N> {
                 // Flush when we move to a new column
                 if local_x != prev_x || local_z != prev_z {
                     if !pending_writes.is_empty() {
+                        // `prev_x`/`prev_z` still name the column these writes
+                        // belong to; the batch is flushed exactly when it ends.
+                        debug_assert!(
+                            pending_writes
+                                .iter()
+                                .all(|&(x, _, z, _)| x == prev_x && z == prev_z)
+                        );
+                        wg_heightmaps.push_column(
+                            prev_x,
+                            prev_z,
+                            pending_writes
+                                .iter()
+                                .map(|&(_, relative_y, _, id)| (min_y + relative_y as i32, id)),
+                        );
                         chunk.write_block_batch(&pending_writes);
                         pending_writes.clear();
                     }
@@ -490,13 +505,9 @@ impl<N: VanillaPostNoiseStateType> ChunkGenerator for VanillaGenerator<N> {
                             })
                             .unwrap_or(default_block_id);
                         pending_writes.push((local_x, relative_y, local_z, block));
-                        ocean_floor_wg.update_for_initial_fill(local_x, world_y, local_z, block);
-                        world_surface_wg.update_for_initial_fill(local_x, world_y, local_z, block);
                     }
                     AquiferResult::Fluid(id) => {
                         pending_writes.push((local_x, relative_y, local_z, id));
-                        ocean_floor_wg.update_for_initial_fill(local_x, world_y, local_z, id);
-                        world_surface_wg.update_for_initial_fill(local_x, world_y, local_z, id);
                         if aquifer.should_schedule_fluid_update() && id.has_fluid() {
                             chunk.mark_pos_for_postprocessing(BlockPos::new(
                                 world_x, world_y, world_z,
@@ -510,9 +521,17 @@ impl<N: VanillaPostNoiseStateType> ChunkGenerator for VanillaGenerator<N> {
 
         // Flush remaining writes
         if !pending_writes.is_empty() {
+            wg_heightmaps.push_column(
+                prev_x,
+                prev_z,
+                pending_writes
+                    .iter()
+                    .map(|&(_, relative_y, _, id)| (min_y + relative_y as i32, id)),
+            );
             chunk.write_block_batch(&pending_writes);
         }
 
+        let (ocean_floor_wg, world_surface_wg) = wg_heightmaps.into_parts();
         chunk.replace_noise_heightmaps(ocean_floor_wg, world_surface_wg);
 
         if N::Settings::AQUIFERS_ENABLED {

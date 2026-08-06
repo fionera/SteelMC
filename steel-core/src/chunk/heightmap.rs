@@ -384,6 +384,98 @@ impl Heightmap {
     }
 }
 
+// ─── WorldgenHeightmaps ──────────────────────────────────────────────────────
+
+/// The pair of worldgen heightmaps built while the noise fill writes a chunk.
+///
+/// Built per column rather than per block. The noise fill walks each `(x, z)`
+/// column strictly top-down and only ever adds blocks to an empty column, so
+/// `first_available` is monotone non-decreasing and *only the topmost opaque
+/// block in a column can ever set that column's height* — every later call in
+/// the column fails `y >= first_available` and returns without doing anything.
+/// Feeding the fill's per-block writes through [`Heightmap::update_for_initial_fill`]
+/// therefore ran ~81,500 calls per chunk to produce 512 height stores (0.63%);
+/// the other 99.4% paid an opacity-table lookup, a `LazyLock` check and a
+/// bounds check only to bail on the `y` compare.
+///
+/// [`Self::push_column`] consumes one finished column's writes and performs the
+/// same selection directly, so the per-chunk cost is 256 short scans that stop
+/// as soon as both maps have their answer, and the opacity table is resolved
+/// once per chunk instead of once per block.
+#[derive(Debug)]
+pub struct WorldgenHeightmaps {
+    ocean_floor_wg: Heightmap,
+    world_surface_wg: Heightmap,
+    /// Resolved once here so the scan does not re-check a `LazyLock` per block.
+    ///
+    /// This is the full table, which is valid for both worldgen types:
+    /// `heightmap_opacity_mask` only routes to
+    /// `WORLD_SURFACE_OPACITY_MASK_BY_STATE` as an initialisation-cost shortcut,
+    /// and both builders set the `WORLD_SURFACE_WG` bit under exactly the same
+    /// `!is_air` condition (pinned by `worldgen_masks_agree_across_tables`).
+    opacity_masks: &'static [u8],
+}
+
+impl WorldgenHeightmaps {
+    /// Creates both worldgen heightmaps, every column at `min_y`.
+    #[must_use]
+    pub fn new(min_y: i32, height: i32) -> Self {
+        Self {
+            ocean_floor_wg: Heightmap::new(HeightmapType::OceanFloorWg, min_y, height),
+            world_surface_wg: Heightmap::new(HeightmapType::WorldSurfaceWg, min_y, height),
+            opacity_masks: &HEIGHTMAP_OPACITY_MASK_BY_STATE,
+        }
+    }
+
+    /// Records one finished column of initial-fill writes.
+    ///
+    /// `descending` must yield the blocks the fill placed in column
+    /// `(local_x, local_z)`, in strictly descending Y. Air is not placed, so
+    /// only actual writes appear; a column with no writes keeps `min_y` in both
+    /// maps, which is what the per-block path produced for it too.
+    ///
+    /// # Panics
+    /// Panics if a block state ID is invalid.
+    pub fn push_column(
+        &mut self,
+        local_x: usize,
+        local_z: usize,
+        descending: impl IntoIterator<Item = (i32, BlockStateId)>,
+    ) {
+        const OCEAN_FLOOR: u8 = HeightmapType::OCEAN_FLOOR_WG_MASK;
+        const WORLD_SURFACE: u8 = HeightmapType::WORLD_SURFACE_WG_MASK;
+
+        // Cleared as each map finds its topmost opaque block, so the scan stops
+        // at the shallower of the two answers rather than walking the column.
+        let mut pending = OCEAN_FLOOR | WORLD_SURFACE;
+        for (y, state) in descending {
+            let Some(&state_mask) = self.opacity_masks.get(state.0 as usize) else {
+                panic!("invalid block state id {}", state.0);
+            };
+            let resolved = state_mask & pending;
+            if resolved == 0 {
+                continue;
+            }
+            if resolved & OCEAN_FLOOR != 0 {
+                self.ocean_floor_wg.set_height(local_x, local_z, y + 1);
+            }
+            if resolved & WORLD_SURFACE != 0 {
+                self.world_surface_wg.set_height(local_x, local_z, y + 1);
+            }
+            pending &= !resolved;
+            if pending == 0 {
+                break;
+            }
+        }
+    }
+
+    /// Returns the finished maps as `(ocean_floor_wg, world_surface_wg)`.
+    #[must_use]
+    pub fn into_parts(self) -> (Heightmap, Heightmap) {
+        (self.ocean_floor_wg, self.world_surface_wg)
+    }
+}
+
 // ─── ChunkHeightmaps ─────────────────────────────────────────────────────────
 
 /// Heightmap storage retained across every phase of a chunk.
@@ -717,6 +809,95 @@ mod tests {
 
         assert!(!ocean_floor.update_for_initial_fill(0, 4, 0, stone));
         assert_eq!(ocean_floor.get_first_available(0, 0), 6);
+    }
+
+    /// `WorldgenHeightmaps` reads the `WORLD_SURFACE_WG` bit out of the full
+    /// table, so the two tables must not disagree on it.
+    #[test]
+    fn worldgen_masks_agree_across_tables() {
+        init_test_state();
+
+        let world_surface = &**WORLD_SURFACE_OPACITY_MASK_BY_STATE;
+        let full = &**HEIGHTMAP_OPACITY_MASK_BY_STATE;
+        assert_eq!(world_surface.len(), full.len());
+
+        let wg = HeightmapType::WORLD_SURFACE_WG_MASK;
+        for (state, (&surface_mask, &full_mask)) in
+            world_surface.iter().zip(full.iter()).enumerate()
+        {
+            assert_eq!(
+                surface_mask & wg,
+                full_mask & wg,
+                "tables disagree on WORLD_SURFACE_WG for state {state}"
+            );
+        }
+    }
+
+    /// The column scan must reproduce the per-block path it replaced, block for
+    /// block, including the "no opaque block at all" case.
+    #[test]
+    fn worldgen_column_matches_per_block_initial_fill() {
+        init_test_state();
+
+        let air = REGISTRY.blocks.get_default_state_id(&vanilla_blocks::AIR);
+        let water = REGISTRY.blocks.get_default_state_id(&vanilla_blocks::WATER);
+        let stone = REGISTRY.blocks.get_default_state_id(&vanilla_blocks::STONE);
+        let cobweb = REGISTRY.blocks.get_default_state_id(&vanilla_blocks::COBWEB);
+
+        let min_y = -64;
+        let height = 384;
+        // Descending-Y columns, as the noise fill emits them. Covers: solid on
+        // top, water over stone (ocean floor sits below the surface), a column
+        // that never blocks motion, and an all-air column.
+        let columns: [Vec<BlockStateId>; 5] = [
+            vec![stone, stone, stone],
+            vec![water, water, water, stone, stone],
+            vec![cobweb, water, cobweb],
+            vec![air, air],
+            vec![water, cobweb, stone, water, stone],
+        ];
+
+        for (index, column) in columns.iter().enumerate() {
+            let top = 100 - index as i32;
+            let blocks: Vec<(i32, BlockStateId)> = column
+                .iter()
+                .enumerate()
+                .map(|(offset, &state)| (top - offset as i32, state))
+                .collect();
+
+            let mut expect_ocean = Heightmap::new(HeightmapType::OceanFloorWg, min_y, height);
+            let mut expect_surface = Heightmap::new(HeightmapType::WorldSurfaceWg, min_y, height);
+            for &(y, state) in &blocks {
+                expect_ocean.update_for_initial_fill(3, y, 7, state);
+                expect_surface.update_for_initial_fill(3, y, 7, state);
+            }
+
+            let mut actual = WorldgenHeightmaps::new(min_y, height);
+            actual.push_column(3, 7, blocks.iter().copied());
+            let (ocean, surface) = actual.into_parts();
+
+            assert_eq!(
+                ocean.get_first_available(3, 7),
+                expect_ocean.get_first_available(3, 7),
+                "ocean floor mismatch for column {index}"
+            );
+            assert_eq!(
+                surface.get_first_available(3, 7),
+                expect_surface.get_first_available(3, 7),
+                "world surface mismatch for column {index}"
+            );
+        }
+    }
+
+    /// A column the fill never wrote to must stay at `min_y` in both maps.
+    #[test]
+    fn worldgen_untouched_column_stays_at_min_y() {
+        init_test_state();
+
+        let maps = WorldgenHeightmaps::new(-64, 384);
+        let (ocean, surface) = maps.into_parts();
+        assert_eq!(ocean.get_first_available(0, 0), -64);
+        assert_eq!(surface.get_first_available(15, 15), -64);
     }
 
     #[test]
