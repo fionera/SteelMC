@@ -139,6 +139,28 @@ impl OreVeinifier {
 
         let veininess = vein_toggle.abs();
 
+        // The threshold test below is `veininess + edge_roundoff`, and
+        // `edge_roundoff` can only ever subtract: it is
+        // `map_clamped(dist_from_edge, 0.0, 20.0, -0.2, 0.0)`, whose factor is
+        // `dist_from_edge / 20.0`, and the Y-range guard just below returns
+        // `None` unless both distances are non-negative. So the factor is never
+        // negative, `clamped_lerp`'s `factor < 0` arm is unreachable, and the
+        // value is `0.0` above the range or `-0.2 + 0.2 * factor` within it --
+        // in every reachable case at most `0.0`.
+        //
+        // IEEE addition is monotonic in each operand, so adding something that
+        // is at most zero cannot increase `veininess`: a `veininess` already
+        // below the threshold is still below it afterwards. Testing it here is
+        // therefore exactly the test below, minus the arithmetic -- and the
+        // arithmetic includes a scalar divide that ran for every solid block in
+        // either vein type's Y range and was discarded ~93% of the time.
+        //
+        // NaN is left to fall through on purpose: `NaN < threshold` is false,
+        // so a NaN toggle takes the original path with the original result.
+        if veininess < VEININESS_THRESHOLD {
+            return None;
+        }
+
         // Check Y range
         let dist_from_top = vein_type.max_y - world_y;
         let dist_from_bottom = world_y - vein_type.min_y;
@@ -207,5 +229,70 @@ impl OreVeinifier {
             // Below richness threshold: filler block
             Some(vein_type.filler)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EDGE_ROUNDOFF_BEGIN, MAX_EDGE_ROUNDOFF, VEININESS_THRESHOLD};
+    use steel_math::map_clamped;
+
+    /// The roundoff term as `compute_interpolated` computed it before the
+    /// early-out was added, verbatim.
+    fn edge_roundoff(dist_from_edge: i32) -> f64 {
+        map_clamped(
+            f64::from(dist_from_edge),
+            0.0,
+            EDGE_ROUNDOFF_BEGIN,
+            MAX_EDGE_ROUNDOFF,
+            0.0,
+        )
+    }
+
+    /// The early-out is only sound because the roundoff never *adds*. The Y-range
+    /// guard leaves `dist_from_edge >= 0`, and the two vein types span 51 and 53
+    /// levels, so the reachable distances are small and can be checked directly.
+    #[test]
+    fn edge_roundoff_is_never_positive() {
+        for dist in 0..=64 {
+            let roundoff = edge_roundoff(dist);
+            assert!(
+                roundoff <= 0.0,
+                "edge_roundoff({dist}) = {roundoff}, which would let the early-out \
+                 discard a block the full test would have kept"
+            );
+        }
+    }
+
+    /// `veininess < THRESHOLD` must imply `veininess + edge_roundoff < THRESHOLD`
+    /// for every reachable pair, or the early-out changes generated terrain.
+    #[test]
+    fn early_out_agrees_with_full_threshold_test() {
+        for dist in 0..=64 {
+            let roundoff = edge_roundoff(dist);
+            // Walk veininess across the threshold in ulps, so the boundary
+            // itself is covered rather than approached.
+            let mut veininess = VEININESS_THRESHOLD;
+            for _ in 0..2048 {
+                veininess = f64::from_bits(veininess.to_bits() - 1);
+            }
+            for _ in 0..4096 {
+                let early_out = veininess < VEININESS_THRESHOLD;
+                let full_test = veininess + roundoff < VEININESS_THRESHOLD;
+                assert!(
+                    !early_out || full_test,
+                    "early-out rejected veininess={veininess} at dist={dist}, but the \
+                     full test (sum {}) would have kept it",
+                    veininess + roundoff
+                );
+                veininess = f64::from_bits(veininess.to_bits() + 1);
+            }
+        }
+    }
+
+    /// NaN must reach the original path, not the early-out.
+    #[test]
+    fn nan_veininess_falls_through() {
+        assert!(!(f64::NAN < VEININESS_THRESHOLD));
     }
 }
