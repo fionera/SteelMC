@@ -1,4 +1,5 @@
 use std::marker::PhantomData;
+use std::ops::Range;
 
 use steel_utils::{BlockPos, BlockStateId, ChunkPos, DowncastType, types::UpdateFlags};
 
@@ -208,12 +209,21 @@ impl GenerationChunk<'_, SurfacePhase> {
         self.chunk.sections().read_all_biomes()
     }
 
-    /// Reads one complete block column into `output`.
+    /// Reads the sections of one block column named by `section_bands` into `output`.
+    ///
+    /// Positions outside the requested bands keep whatever the previous call
+    /// left in `output`; see [`Sections::read_column_bands_into`].
     #[inline]
-    pub fn read_column_into(self, local_x: usize, local_z: usize, output: &mut Vec<BlockStateId>) {
+    pub fn read_column_bands_into(
+        self,
+        local_x: usize,
+        local_z: usize,
+        output: &mut Vec<BlockStateId>,
+        section_bands: &[Range<usize>],
+    ) {
         self.chunk
             .sections()
-            .read_column_into(local_x, local_z, output);
+            .read_column_bands_into(local_x, local_z, output, section_bands);
     }
 
     /// Reads the world-surface worldgen height, lazily priming it if needed.

@@ -628,6 +628,7 @@ impl<N: VanillaPostNoiseStateType> ChunkGenerator for VanillaGenerator<N> {
 
         let mut pending_writes: Vec<(usize, BlockStateId)> = Vec::new();
         let mut column_buf: Vec<BlockStateId> = Vec::new();
+        let column_capacity = section_count * 16;
         let condition_noise_values = N::surface_noise_ids()
             .iter()
             .map(|_| Cell::new(0.0))
@@ -684,19 +685,8 @@ impl<N: VanillaPostNoiseStateType> ChunkGenerator for VanillaGenerator<N> {
                     );
                 }
 
-                // Snapshot the column once — avoids per-block section locking in the Y scan.
-                // Taken after eroded_badlands_extension which may write blocks above the surface.
-                chunk.read_column_into(local_x, local_z, &mut column_buf);
-
                 // Surface depth for this column
                 let surface_depth = self.surface_system.get_surface_depth(block_x, block_z);
-
-                let surface_secondary = if surface_rule_uses_surface_secondary {
-                    self.surface_system.get_surface_secondary(block_x, block_z)
-                } else {
-                    0.0
-                };
-                condition_noise_cache.reset();
 
                 let min_surface_level = if let Some(corners) = preliminary_surface_corners {
                     // Vanilla: (float)(blockX & 15) / 16.0F — exact for 0-15.
@@ -714,6 +704,79 @@ impl<N: VanillaPostNoiseStateType> ChunkGenerator for VanillaGenerator<N> {
                 } else {
                     0
                 };
+
+                // The downward scan runs the full rule from the top of the
+                // column down to the preliminary surface. Below that the
+                // specialization takes over and none of the scan's running state
+                // is read any more, so the scan stops there rather than carrying
+                // stone depths and water heights nothing will ask for.
+                let deep_band_top = if use_deep_band {
+                    min_surface_level - 1
+                } else {
+                    min_y - 1
+                };
+                // Debug builds scan the whole column regardless, so the
+                // specialization can be checked against the full rule at every
+                // position it claims to cover. The deep pass below is skipped
+                // there; this loop has already done its work.
+                let scan_floor = if cfg!(debug_assertions) {
+                    min_y
+                } else {
+                    deep_band_top.saturating_add(1).max(min_y)
+                };
+                // Top of the deep pass. Above it that pass writes nothing, so it
+                // does not run there and nothing reads the column there either.
+                let deep_band_ceiling = deep_band_top
+                    .min(start_height)
+                    .min(deep_band_write_ceiling.saturating_sub(1));
+
+                // Snapshot the column once — avoids per-block section locking in the Y scan.
+                // Taken after eroded_badlands_extension which may write blocks above the surface.
+                //
+                // Only the sections something below actually reads are locked and
+                // copied. Three spans of the column are dead: everything above
+                // the world surface, which is air the scan starts below and the
+                // iceberg extension reads off the end of the snapshot as air
+                // anyway; everything under the scan floor, which the scan reaches
+                // only as far as its stone-depth lookahead; and the gap between
+                // the deep pass's ceiling and that lookahead, which no consumer
+                // touches at all. In the overworld that leaves about a third of
+                // the sections, and the locks are what the rest cost.
+                let column_len = ((start_height - min_y) as usize).min(column_capacity - 1) + 1;
+                let top_section = (column_len - 1) / 16 + 1;
+                // `below_class` looks one block under the scan floor, and the
+                // bounded stone-depth lookahead reaches `bound` blocks under it.
+                // A rule with no bound scans to the bottom of the world instead.
+                let live_section_floor = match stone_depth_below_bound {
+                    Some(bound) => {
+                        let reach = bound.max(1);
+                        let floor = scan_floor.saturating_sub(reach).max(min_y);
+                        (((floor - min_y) as usize) / 16).min(top_section)
+                    }
+                    None => 0,
+                };
+                let deep_section_ceiling = if use_deep_band && !cfg!(debug_assertions) {
+                    if deep_band_ceiling < min_y {
+                        0
+                    } else {
+                        ((deep_band_ceiling - min_y) as usize) / 16 + 1
+                    }
+                } else {
+                    0
+                };
+                let section_bands = if deep_section_ceiling >= live_section_floor {
+                    [0..top_section, 0..0]
+                } else {
+                    [0..deep_section_ceiling, live_section_floor..top_section]
+                };
+                chunk.read_column_bands_into(local_x, local_z, &mut column_buf, &section_bands);
+
+                let surface_secondary = if surface_rule_uses_surface_secondary {
+                    self.surface_system.get_surface_secondary(block_x, block_z)
+                } else {
+                    0.0
+                };
+                condition_noise_cache.reset();
 
                 // Steep condition: vanilla only checks south >= north + 4 and
                 // west >= east + 4 (asymmetric, not absolute difference).
@@ -737,26 +800,6 @@ impl<N: VanillaPostNoiseStateType> ChunkGenerator for VanillaGenerator<N> {
                 let mut water_height: i32 = i32::MIN;
                 let mut next_ceiling_stone_y: i32 = i32::MAX;
                 pending_writes.clear();
-
-                // The downward scan runs the full rule from the top of the
-                // column down to the preliminary surface. Below that the
-                // specialization takes over and none of the scan's running state
-                // is read any more, so the scan stops there rather than carrying
-                // stone depths and water heights nothing will ask for.
-                let deep_band_top = if use_deep_band {
-                    min_surface_level - 1
-                } else {
-                    min_y - 1
-                };
-                // Debug builds scan the whole column regardless, so the
-                // specialization can be checked against the full rule at every
-                // position it claims to cover. The deep pass below is skipped
-                // there; this loop has already done its work.
-                let scan_floor = if cfg!(debug_assertions) {
-                    min_y
-                } else {
-                    deep_band_top.saturating_add(1).max(min_y)
-                };
 
                 // Nothing writes `column_buf` until the scan has finished, so
                 // each block can be classified one iteration before it is
@@ -922,9 +965,6 @@ impl<N: VanillaPostNoiseStateType> ChunkGenerator for VanillaGenerator<N> {
                     // At and above the write ceiling the specialization returns
                     // nothing, so that span is skipped entirely instead of being
                     // walked to be told so once per block.
-                    let deep_band_ceiling = deep_band_top
-                        .min(start_height)
-                        .min(deep_band_write_ceiling.saturating_sub(1));
                     for y in (min_y..=deep_band_ceiling).rev() {
                         let relative_y = (y - min_y) as usize;
                         if column_buf[relative_y] != default_block_id {
@@ -979,7 +1019,9 @@ impl<N: VanillaPostNoiseStateType> ChunkGenerator for VanillaGenerator<N> {
                         start_height,
                         min_surface_level,
                         min_y,
-                        &column_buf,
+                        // Past the world surface the snapshot stops rather than
+                        // carrying air the extension would read as air regardless.
+                        &column_buf[..column_len],
                         &mut pending_writes,
                     );
                     if !pending_writes.is_empty() {

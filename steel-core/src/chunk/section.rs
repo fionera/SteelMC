@@ -2,7 +2,7 @@
 use std::{
     fmt::Debug,
     io::Cursor,
-    ops::{Deref, DerefMut},
+    ops::{Deref, DerefMut, Range},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -286,12 +286,28 @@ impl Sections {
         })
     }
 
-    /// Reads an entire column at `(x, z)` across all sections into a caller-owned buffer.
+    /// Reads the parts of the column at `(x, z)` named by `section_bands` into a
+    /// caller-owned buffer.
     ///
-    /// Holds each section's read lock once for 16 Y reads instead of acquiring
-    /// a lock per block. Indexed by `relative_y` (0 = chunk min-y).
-    /// The buffer is resized if needed and reused across calls to avoid allocation.
-    pub fn read_column_into(&self, x: usize, z: usize, buf: &mut Vec<BlockStateId>) {
+    /// Holds each visited section's read lock once for its 16 Y reads instead of
+    /// acquiring a lock per block. Indexed by `relative_y` (0 = chunk min-y), so
+    /// indices stay absolute whichever bands were asked for.
+    ///
+    /// The buffer is sized to the whole column once and reused across calls to
+    /// avoid allocation, but only the requested bands are written: everywhere
+    /// else it still holds what the previous call left there. A caller must ask
+    /// for every section it intends to read.
+    ///
+    /// `section_bands` holds section indices, clamped to the sections that exist.
+    /// Bands that overlap cost their sections a second lock and copy, so callers
+    /// that build more than one should merge them first.
+    pub fn read_column_bands_into(
+        &self,
+        x: usize,
+        z: usize,
+        buf: &mut Vec<BlockStateId>,
+        section_bands: &[Range<usize>],
+    ) {
         debug_assert!(x < BlockPalette::SIZE);
         debug_assert!(z < BlockPalette::SIZE);
 
@@ -299,12 +315,16 @@ impl Sections {
         if buf.len() != total {
             buf.resize(total, BlockStateId::default());
         }
-        for (i, holder) in self.sections.iter().enumerate() {
-            let guard = holder.read();
-            let base = i * 16;
-            guard
-                .states
-                .copy_column_into(x, z, &mut buf[base..base + 16]);
+        for band in section_bands {
+            let start = band.start.min(self.sections.len());
+            let end = band.end.clamp(start, self.sections.len());
+            for (offset, holder) in self.sections[start..end].iter().enumerate() {
+                let guard = holder.read();
+                let base = (start + offset) * 16;
+                guard
+                    .states
+                    .copy_column_into(x, z, &mut buf[base..base + 16]);
+            }
         }
     }
 
