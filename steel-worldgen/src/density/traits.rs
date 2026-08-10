@@ -311,6 +311,16 @@ pub trait DimensionNoises: Sized + Send + Sync {
     /// Whether the generated surface rule reads steep-column context.
     fn surface_rule_uses_steep() -> bool;
 
+    /// The deepest `stone_depth_below` this dimension's surface rule can tell
+    /// apart, or `None` when it needs the exact depth.
+    ///
+    /// Every ceiling-type stone-depth condition is a `stone_depth_below <= bound`
+    /// test, so once the depth exceeds the largest bound in the rule every such
+    /// test has settled and counting further cannot change an answer. The caller
+    /// counts the run of solid blocks below a position one block at a time, and
+    /// this is where it may stop. `Some(0)` means the rule never reads the value.
+    fn surface_rule_stone_depth_below_bound() -> Option<i32>;
+
     /// Apply the transpiled surface rule at the given context position.
     fn try_apply_surface_rule(ctx: &mut SurfaceRuleContext<'_>) -> Option<BlockStateId>;
 

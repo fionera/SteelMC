@@ -150,6 +150,31 @@ pub struct VanillaGenerator<N: DimensionNoises> {
     _phantom: PhantomData<N>,
 }
 
+/// How the surface scan sees one block of a column.
+///
+/// Vanilla's surface rules only ever ask which of these three a block is, and
+/// answering costs two dependent loads through the block registry, so the scan
+/// asks once per block and passes the answer along.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ColumnClass {
+    Air,
+    Liquid,
+    /// Vanilla's `isStone`: neither air nor liquid.
+    Solid,
+}
+
+/// Classify one block, short-circuiting the liquid lookup for air.
+#[inline]
+fn classify_column_block(state: BlockStateId) -> ColumnClass {
+    if state.is_air() {
+        ColumnClass::Air
+    } else if state.get_block().config.liquid {
+        ColumnClass::Liquid
+    } else {
+        ColumnClass::Solid
+    }
+}
+
 #[derive(Clone, Copy)]
 struct SurfaceExtensionBiomes {
     eroded_badlands: bool,
@@ -560,6 +585,7 @@ impl<N: VanillaPostNoiseStateType> ChunkGenerator for VanillaGenerator<N> {
         let surface_rule_uses_preliminary_surface = N::surface_rule_uses_preliminary_surface();
         let surface_rule_uses_surface_secondary = N::surface_rule_uses_surface_secondary();
         let surface_rule_uses_steep = N::surface_rule_uses_steep();
+        let stone_depth_below_bound = N::surface_rule_stone_depth_below_bound();
         let lazy_surface_rule_biome =
             surface_rule_uses_biome && surface_rule_uses_preliminary_surface;
         let surface_needs_min_surface_level =
@@ -732,43 +758,92 @@ impl<N: VanillaPostNoiseStateType> ChunkGenerator for VanillaGenerator<N> {
                     deep_band_top.saturating_add(1).max(min_y)
                 };
 
+                // Nothing writes `column_buf` until the scan has finished, so
+                // each block can be classified one iteration before it is
+                // reached: the class of the block below decides this position's
+                // ceiling depth and is this position's own class next time
+                // round. That is one classification per iteration either way,
+                // and it makes the depth below a block the scan already knows
+                // rather than something to go and count.
+                let mut class = if scan_floor <= start_height {
+                    classify_column_block(column_buf[(start_height - min_y) as usize])
+                } else {
+                    ColumnClass::Air
+                };
+
                 for y in (scan_floor..=start_height).rev() {
                     let relative_y = (y - min_y) as usize;
                     let state = column_buf[relative_y];
+                    let this_class = class;
+                    let below_class = if relative_y == 0 {
+                        // Nothing below the bottom of the world; vanilla's scan
+                        // stops there and calls the depth one.
+                        ColumnClass::Air
+                    } else {
+                        classify_column_block(column_buf[relative_y - 1])
+                    };
+                    class = below_class;
 
-                    if state.is_air() {
+                    if this_class == ColumnClass::Air {
                         stone_depth_above = 0;
                         water_height = i32::MIN;
                         continue;
                     }
 
-                    if state.get_block().config.liquid {
+                    if this_class == ColumnClass::Liquid {
                         if water_height == i32::MIN {
                             water_height = y + 1;
                         }
                         continue;
                     }
 
-                    // Solid block — scan for stone_depth_below (lookahead)
-                    if next_ceiling_stone_y >= y {
-                        next_ceiling_stone_y = i32::MIN;
-                        for la_y in (min_y - 1..y).rev() {
-                            if la_y < min_y {
-                                next_ceiling_stone_y = la_y + 1;
-                                break;
+                    stone_depth_above += 1;
+
+                    // Depth of the run of solid blocks from here down. The rule
+                    // only ever tests it against constants, so counting stops
+                    // once the answer can no longer change; the count is exact
+                    // below that and the surface rule cannot tell the difference
+                    // above it. Dimensions whose rule compares against a runtime
+                    // value get the exact depth from the full scan below.
+                    let stone_depth_below = if let Some(bound) = stone_depth_below_bound {
+                        if below_class != ColumnClass::Solid {
+                            1
+                        } else if bound <= 1 {
+                            2
+                        } else {
+                            let mut depth = 2;
+                            let mut la_y = y - 2;
+                            while depth <= bound && la_y >= min_y {
+                                let la_state = column_buf[(la_y - min_y) as usize];
+                                if classify_column_block(la_state) != ColumnClass::Solid {
+                                    break;
+                                }
+                                depth += 1;
+                                la_y -= 1;
                             }
-                            let la_rel = (la_y - min_y) as usize;
-                            let la_state = column_buf[la_rel];
-                            // isStone = !isAir && !isLiquid
-                            if la_state.is_air() || la_state.get_block().config.liquid {
-                                next_ceiling_stone_y = la_y + 1;
-                                break;
+                            depth
+                        }
+                    } else {
+                        // Scan for the bottom of this run of solid blocks, and
+                        // keep it: every position down to it has the same answer.
+                        if next_ceiling_stone_y >= y {
+                            next_ceiling_stone_y = i32::MIN;
+                            for la_y in (min_y - 1..y).rev() {
+                                if la_y < min_y {
+                                    next_ceiling_stone_y = la_y + 1;
+                                    break;
+                                }
+                                let la_rel = (la_y - min_y) as usize;
+                                let la_state = column_buf[la_rel];
+                                // isStone = !isAir && !isLiquid
+                                if la_state.is_air() || la_state.get_block().config.liquid {
+                                    next_ceiling_stone_y = la_y + 1;
+                                    break;
+                                }
                             }
                         }
-                    }
-
-                    stone_depth_above += 1;
-                    let stone_depth_below = y - next_ceiling_stone_y + 1;
+                        y - next_ceiling_stone_y + 1
+                    };
 
                     // Only apply surface rules to the default block
                     if state == default_block_id {

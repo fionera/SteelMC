@@ -145,6 +145,15 @@ pub struct SurfaceRuleTranspiler {
     pub uses_surface_secondary: bool,
     /// Whether generated conditions use `ctx.steep`.
     pub uses_steep: bool,
+    /// The largest depth any ceiling-type `StoneDepth` condition compares
+    /// `ctx.stone_depth_below` against, or `None` when some comparison bound is
+    /// not a compile-time constant.
+    ///
+    /// Every such condition has the shape `stone_depth_below <= bound`, so a
+    /// depth greater than the largest bound is indistinguishable from any other
+    /// depth greater than it, and the caller need not count past that. `Some(0)`
+    /// means the value is never read at all.
+    pub stone_depth_below_bound: Option<i32>,
     /// Facts held true for the copy currently being emitted.
     facts: SurfaceRuleFacts,
     /// Biomes named by `BiomeIs` conditions that survived the current pass.
@@ -188,12 +197,27 @@ impl SurfaceRuleTranspiler {
             uses_preliminary_surface,
             uses_surface_secondary: false,
             uses_steep: false,
+            stone_depth_below_bound: Some(0),
             facts: SurfaceRuleFacts::default(),
             referenced_biomes: Vec::new(),
             reads_scan_state: false,
             min_y,
             height,
         }
+    }
+
+    /// Widen the recorded `stone_depth_below` bound to cover one more condition.
+    ///
+    /// `None` is absorbing: once one condition compares against a runtime value
+    /// the exact depth is needed and no later constant bound can take that back.
+    /// The bound is otherwise the maximum, and is only ever widened, so passes
+    /// that fold conditions away -- the deep-band copies -- cannot narrow what
+    /// the full rule established.
+    fn note_stone_depth_below_bound(&mut self, bound: Option<i32>) {
+        self.stone_depth_below_bound = match (self.stone_depth_below_bound, bound) {
+            (Some(seen), Some(bound)) => Some(seen.max(bound)),
+            _ => None,
+        };
     }
 
     /// Transpile a surface rule tree into a Rust function body.
@@ -273,6 +297,13 @@ impl SurfaceRuleTranspiler {
                 let depth_field = if is_floor {
                     quote! { ctx.stone_depth_above }
                 } else {
+                    // Ceiling depth is counted by the caller one block at a
+                    // time, so record how far it has to count. A bound that is
+                    // not a compile-time constant poisons the answer and the
+                    // caller falls back to counting the run out in full.
+                    let bound = (!*add_surface_depth && *secondary_depth_range <= 0)
+                        .then(|| (1 + *offset).max(0));
+                    self.note_stone_depth_below_bound(bound);
                     quote! { ctx.stone_depth_below }
                 };
 
@@ -570,6 +601,9 @@ pub struct SurfaceRuleFunctionArtifacts {
     pub uses_preliminary_surface: bool,
     pub uses_surface_secondary: bool,
     pub uses_steep: bool,
+    /// Largest `stone_depth_below` any condition distinguishes, or `None` when
+    /// the rule needs the exact depth. See the transpiler field of the same name.
+    pub stone_depth_below_bound: Option<i32>,
     /// The deep-band specialization, absent when the rule does not admit one.
     pub deep_band: Option<DeepBandArtifacts>,
 }
@@ -612,6 +646,7 @@ pub fn generate_surface_rule_function(
     let uses_preliminary_surface = transpiler.uses_preliminary_surface;
     let uses_surface_secondary = transpiler.uses_surface_secondary;
     let uses_steep = transpiler.uses_steep;
+    let stone_depth_below_bound = transpiler.stone_depth_below_bound;
 
     let deep_function = deep.as_ref().map(|(_, body)| {
         quote! {
@@ -651,6 +686,7 @@ pub fn generate_surface_rule_function(
         uses_preliminary_surface,
         uses_surface_secondary,
         uses_steep,
+        stone_depth_below_bound,
         deep_band: deep.map(|(artifacts, _)| artifacts),
     }
 }

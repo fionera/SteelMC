@@ -789,6 +789,7 @@ fn generate_noise_settings(dimension: &str, prefix: &str) -> TokenStream {
         surface_rule_uses_preliminary_surface,
         surface_rule_uses_surface_secondary,
         surface_rule_uses_steep,
+        surface_rule_stone_depth_below_bound,
         surface_deep_band_tokens,
     ) = if let Some(rule) = settings.surface_rule.take() {
         let artifacts =
@@ -824,6 +825,10 @@ fn generate_noise_settings(dimension: &str, prefix: &str) -> TokenStream {
             artifacts.uses_preliminary_surface,
             artifacts.uses_surface_secondary,
             artifacts.uses_steep,
+            match artifacts.stone_depth_below_bound {
+                Some(bound) => quote! { Some(#bound) },
+                None => quote! { None },
+            },
             deep_band_tokens,
         )
     } else {
@@ -845,6 +850,8 @@ fn generate_noise_settings(dimension: &str, prefix: &str) -> TokenStream {
             false,
             false,
             false,
+            // Nothing reads the ceiling depth when there is no rule at all.
+            quote! { Some(0) },
             generate_deep_band_glue(None),
         )
     };
@@ -1126,6 +1133,10 @@ fn generate_noise_settings(dimension: &str, prefix: &str) -> TokenStream {
 
             fn surface_rule_uses_steep() -> bool {
                 #surface_rule_uses_steep
+            }
+
+            fn surface_rule_stone_depth_below_bound() -> Option<i32> {
+                #surface_rule_stone_depth_below_bound
             }
 
             fn try_apply_surface_rule(
