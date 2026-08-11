@@ -1,8 +1,79 @@
+use super::super::{CHUNK_COLUMN_COUNT, CHUNK_EDGE};
 use super::{
     BlockPos, BlockStateExt, ChunkPos, Direction, LIGHT_BLOCKED, LightAxisDirection,
     LightDirectionSet, LightQueueFlags, MAX_LIGHT_LEVEL, PackedLightQueueEntry, SectionPos,
     SkyLightChunkEdgeChecks, SkyLightPropagationContext, get_light_block_into, get_light_opacity,
 };
+
+/// Where a downward sky-source walk sends the seeds it produces.
+enum SkySeedSink<'a> {
+    /// `light_chunk` seeding: writes `MAX_LIGHT_LEVEL` immediately and buffers
+    /// the seeds so the caller can drop provably inert ones before they reach
+    /// the increase queue.
+    Buffered(&'a mut SkySeedBuffer),
+    /// `propagate_block_changes`: enqueues immediately and defers the writes.
+    Delayed(&'a mut Vec<PackedLightQueueEntry>),
+}
+
+/// Sky-source seeds for one chunk, plus the contiguous run of
+/// `MAX_LIGHT_LEVEL` writes the column walk that produced them left behind.
+///
+/// `run_top`/`run_len` describe the *current* column: the walk wrote
+/// `MAX_LIGHT_LEVEL` at every `y` in `run_top - run_len + 1 ..= run_top`, and
+/// those writes are the first `run_len` entries this column pushed, in
+/// descending `y`. The run is closed as soon as a write is skipped or an entry
+/// cannot be packed, so the mapping from run index to `y` never drifts.
+struct SkySeedBuffer {
+    entries: Vec<PackedLightQueueEntry>,
+    run_top: i32,
+    run_len: u32,
+    run_open: bool,
+}
+
+impl SkySeedBuffer {
+    fn new() -> Self {
+        Self {
+            // A chunk seeds roughly 4k columns-blocks of sky source; size for
+            // that so the common case never reallocates.
+            entries: Vec::with_capacity(CHUNK_COLUMN_COUNT * 24),
+            run_top: i32::MIN,
+            run_len: 0,
+            run_open: false,
+        }
+    }
+
+    /// Starts a new column and returns its first entry index.
+    fn begin_column(&mut self) -> usize {
+        self.run_top = i32::MIN;
+        self.run_len = 0;
+        self.run_open = true;
+        self.entries.len()
+    }
+
+    fn push(&mut self, entry: PackedLightQueueEntry) {
+        self.entries.push(entry);
+    }
+
+    /// Records that the walk wrote `MAX_LIGHT_LEVEL` at `y` for the entry that
+    /// was just pushed.
+    fn extend_run(&mut self, y: i32) {
+        if !self.run_open {
+            return;
+        }
+        if self.run_len == 0 {
+            self.run_top = y;
+            self.run_len = 1;
+        } else if y == self.run_top - self.run_len as i32 {
+            self.run_len += 1;
+        } else {
+            self.run_open = false;
+        }
+    }
+
+    fn break_run(&mut self) {
+        self.run_open = false;
+    }
+}
 
 impl SkyLightPropagationContext<'_, '_, '_> {
     /// Runs sky chunk lighting with the selected `ScalableLux` edge-check mode.
@@ -324,15 +395,104 @@ impl SkyLightPropagationContext<'_, '_, '_> {
         let section_min_z = chunk_pos.0.y << 4;
         let start_y = (highest_section << 4) | 15;
 
-        for z in 0..super::super::CHUNK_EDGE {
-            for x in 0..super::super::CHUNK_EDGE {
+        let mut buffer = SkySeedBuffer::new();
+        let mut column_start = [0u32; CHUNK_COLUMN_COUNT];
+        let mut column_len = [0u32; CHUNK_COLUMN_COUNT];
+        let mut run_top = [i32::MIN; CHUNK_COLUMN_COUNT];
+        let mut run_len = [0u32; CHUNK_COLUMN_COUNT];
+
+        for z in 0..CHUNK_EDGE {
+            for x in 0..CHUNK_EDGE {
+                let column = (z << 4) | x;
+                let start = buffer.begin_column();
                 self.try_propagate_skylight_inner(
                     section_min_x + x as i32,
                     start_y + 1,
                     section_min_z + z as i32,
                     false,
-                    None,
+                    SkySeedSink::Buffered(&mut buffer),
                 );
+                column_start[column] = start as u32;
+                column_len[column] = (buffer.entries.len() - start) as u32;
+                run_top[column] = buffer.run_top;
+                run_len[column] = buffer.run_len;
+            }
+        }
+
+        self.enqueue_sky_source_seeds(&buffer, &column_start, &column_len, &run_top, &run_len);
+    }
+
+    /// Queues the buffered sky-source seeds, dropping the ones that provably
+    /// cannot do anything.
+    ///
+    /// A seed carries level `MAX_LIGHT_LEVEL` and `all_except(PositiveY)`, so
+    /// `perform_light_increase` visits five neighbors and skips each one whose
+    /// stored level is already at least `MAX_LIGHT_LEVEL - 1`. The walk above
+    /// wrote `MAX_LIGHT_LEVEL` before any dequeue happens and the increase pass
+    /// only ever raises a level, so a neighbor covered by a walk run is still
+    /// `MAX_LIGHT_LEVEL` when the seed is dequeued. When all five neighbors are
+    /// covered the entry performs no write at all, and dropping it leaves the
+    /// queue an order-preserving subsequence of what it held before, so the
+    /// fixpoint is unchanged.
+    ///
+    /// Only interior columns qualify: an edge column has a horizontal neighbor
+    /// in another chunk, whose levels this walk did not write and cannot vouch
+    /// for.
+    fn enqueue_sky_source_seeds(
+        &mut self,
+        buffer: &SkySeedBuffer,
+        column_start: &[u32; CHUNK_COLUMN_COUNT],
+        column_len: &[u32; CHUNK_COLUMN_COUNT],
+        run_top: &[i32; CHUNK_COLUMN_COUNT],
+        run_len: &[u32; CHUNK_COLUMN_COUNT],
+    ) {
+        for z in 0..CHUNK_EDGE {
+            for x in 0..CHUNK_EDGE {
+                let column = (z << 4) | x;
+                let start = column_start[column] as usize;
+                let len = column_len[column] as usize;
+                if len == 0 {
+                    continue;
+                }
+
+                let own_run_top = run_top[column];
+                let own_run_len = run_len[column];
+                let interior =
+                    x > 0 && x < CHUNK_EDGE - 1 && z > 0 && z < CHUNK_EDGE - 1 && own_run_len > 0;
+
+                // Inclusive window of `y` values whose five neighbors are all
+                // covered; empty unless every neighbor column has a run.
+                let (mut skip_min, mut skip_max) = (i32::MAX, i32::MIN);
+                if interior {
+                    // NegativeY: `y - 1` must sit inside this column's own run.
+                    skip_min = own_run_top - own_run_len as i32 + 2;
+                    skip_max = own_run_top;
+                    for neighbor in [
+                        column - 1,
+                        column + 1,
+                        column - CHUNK_EDGE,
+                        column + CHUNK_EDGE,
+                    ] {
+                        let neighbor_run_len = run_len[neighbor];
+                        if neighbor_run_len == 0 {
+                            skip_max = i32::MIN;
+                            break;
+                        }
+                        skip_min = skip_min.max(run_top[neighbor] - neighbor_run_len as i32 + 1);
+                        skip_max = skip_max.min(run_top[neighbor]);
+                    }
+                }
+
+                let run_entries = own_run_len as usize;
+                for index in 0..len {
+                    if index < run_entries {
+                        let y = own_run_top - index as i32;
+                        if y >= skip_min && y <= skip_max {
+                            continue;
+                        }
+                    }
+                    self.queues.enqueue_increase(buffer.entries[start + index]);
+                }
             }
         }
     }
@@ -345,7 +505,13 @@ impl SkyLightPropagationContext<'_, '_, '_> {
         extrude_initialized: bool,
         delayed_increases: &mut Vec<PackedLightQueueEntry>,
     ) -> i32 {
-        self.try_propagate_skylight_inner(x, y, z, extrude_initialized, Some(delayed_increases))
+        self.try_propagate_skylight_inner(
+            x,
+            y,
+            z,
+            extrude_initialized,
+            SkySeedSink::Delayed(delayed_increases),
+        )
     }
 
     fn try_propagate_skylight_inner(
@@ -354,7 +520,7 @@ impl SkyLightPropagationContext<'_, '_, '_> {
         mut y: i32,
         z: i32,
         extrude_initialized: bool,
-        mut delayed_increases: Option<&mut Vec<PackedLightQueueEntry>>,
+        mut sink: SkySeedSink<'_>,
     ) -> i32 {
         if self.get_light_level_extruded(BlockPos::new(x, y + 1, z)) != MAX_LIGHT_LEVEL {
             return y;
@@ -397,24 +563,43 @@ impl SkyLightPropagationContext<'_, '_, '_> {
                 let Some(cached_block) = self.layout.cached_block(current_pos) else {
                     break;
                 };
-                let increase_entry = self.enqueue_increase(
-                    current_pos,
-                    MAX_LIGHT_LEVEL,
-                    LightDirectionSet::all_except(LightAxisDirection::PositiveY),
-                    Self::shape_flags(current_state),
-                );
+                let directions = LightDirectionSet::all_except(LightAxisDirection::PositiveY);
+                let flags = Self::shape_flags(current_state);
                 above_state = current_state;
 
-                if let Some(delayed_increases) = delayed_increases.as_deref_mut() {
-                    if let Some(entry) = increase_entry {
-                        delayed_increases.push(entry);
+                match &mut sink {
+                    SkySeedSink::Delayed(delayed_increases) => {
+                        if let Some(entry) =
+                            self.enqueue_increase(current_pos, MAX_LIGHT_LEVEL, directions, flags)
+                        {
+                            delayed_increases.push(entry);
+                        }
                     }
-                } else {
-                    self.light.set(cached_block, MAX_LIGHT_LEVEL);
+                    SkySeedSink::Buffered(buffer) => {
+                        let written = self.light.set(cached_block, MAX_LIGHT_LEVEL);
+                        if let Some(packed_pos) = self.layout.encode_block_pos(current_pos) {
+                            buffer.push(PackedLightQueueEntry::from_parts(
+                                packed_pos,
+                                MAX_LIGHT_LEVEL,
+                                directions,
+                                flags,
+                            ));
+                            if written {
+                                buffer.extend_run(y);
+                            } else {
+                                buffer.break_run();
+                            }
+                        } else {
+                            buffer.break_run();
+                        }
+                    }
                 }
             } else {
                 y &= !15;
                 above_state = Self::air();
+                if let SkySeedSink::Buffered(buffer) = &mut sink {
+                    buffer.break_run();
+                }
             }
 
             y -= 1;
