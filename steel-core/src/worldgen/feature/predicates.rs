@@ -1,5 +1,6 @@
 use glam::IVec3;
 
+use super::placed::BiomeFeatureFilter;
 use super::prelude::*;
 use super::runner::FeatureDecorationRunner;
 
@@ -16,28 +17,20 @@ impl FeatureDecorationRunner {
 
     pub(super) fn biome_allows_feature(
         region: &WorldGenRegion<'_>,
-        registry: &Registry,
         biome_zoom_seed: i64,
         origin: BlockPos,
-        biome_filter_feature_key: Option<&Identifier>,
+        biome_filter: Option<&BiomeFeatureFilter<'_>>,
     ) -> bool {
-        let biome_id = fuzzed_biome_at_block(biome_zoom_seed, origin, |quart| {
-            region.noise_biome_id(quart.x, quart.y, quart.z)
-        });
-        let Some(biome) = registry.biomes.by_id(usize::from(biome_id)) else {
-            panic!("biome filter resolved unknown biome id {biome_id}");
-        };
-        let Some(target_feature_key) = biome_filter_feature_key else {
+        let Some(filter) = biome_filter else {
             panic!(
                 "Tried to biome check an unregistered feature, or a feature that should not restrict the biome"
             );
         };
+        let biome_id = fuzzed_biome_at_block(biome_zoom_seed, origin, |quart| {
+            region.noise_biome_id(quart.x, quart.y, quart.z)
+        });
 
-        biome
-            .features
-            .iter()
-            .flatten()
-            .any(|feature_key| feature_key == target_feature_key)
+        filter.allows(usize::from(biome_id))
     }
 
     pub(super) fn test_block_predicate(

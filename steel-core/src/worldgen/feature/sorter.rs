@@ -12,6 +12,70 @@ pub(super) struct FeatureSorter {
     steps: Box<[FeatureStepData]>,
 }
 
+/// Which placed features each biome lists, as one bit per (biome, placed feature).
+///
+/// Vanilla's `GenerationSettings.hasFeature` -- our `biome_allows_feature` -- asks whether
+/// one biome's feature list mentions one placed feature. That list is `Vec<Vec<Identifier>>`
+/// and registry identity is key equality, so the scan cost two string compares per entry and
+/// ran the namespace compare on every one of them. Both sides are frozen registry entries
+/// with dense ids, so the same question is a bit test against a table built once per
+/// generator. At 66 biomes and 262 placed features the whole table is 2,640 bytes.
+#[derive(Debug)]
+pub(super) struct BiomeFeatureMembership {
+    bits: Box<[u64]>,
+    words_per_biome: usize,
+    biome_count: usize,
+}
+
+impl BiomeFeatureMembership {
+    const BITS: usize = u64::BITS as usize;
+
+    #[must_use]
+    pub(super) fn build(registry: &Registry) -> Self {
+        let biome_count = registry.biomes.len();
+        let words_per_biome = registry.placed_features.len().div_ceil(Self::BITS);
+        let mut bits = vec![0u64; biome_count * words_per_biome];
+
+        for biome_id in 0..biome_count {
+            let Some(biome) = registry.biomes.by_id(biome_id) else {
+                continue;
+            };
+
+            for feature_key in biome.features.iter().flatten() {
+                // `Registry::validate` already asserts every biome feature key resolves, so
+                // this never skips. It stays exact even if it did: the key we test against is
+                // always registered, and an unregistered key cannot equal a registered one.
+                let Some(feature_id) = registry.placed_features.id_from_key(feature_key) else {
+                    continue;
+                };
+                bits[biome_id * words_per_biome + feature_id / Self::BITS] |=
+                    1u64 << (feature_id % Self::BITS);
+            }
+        }
+
+        Self {
+            bits: bits.into_boxed_slice(),
+            words_per_biome,
+            biome_count,
+        }
+    }
+
+    /// Returns whether `biome_id` lists `feature_id` in any of its decoration steps.
+    ///
+    /// Panics on a biome id the registry does not know, which is the same condition the
+    /// `biomes.by_id` lookup this replaces used to panic on.
+    #[must_use]
+    pub(super) fn allows(&self, biome_id: usize, feature_id: usize) -> bool {
+        assert!(
+            biome_id < self.biome_count,
+            "biome filter resolved unknown biome id {biome_id}"
+        );
+
+        let row = &self.bits[biome_id * self.words_per_biome..][..self.words_per_biome];
+        row[feature_id / Self::BITS] & (1u64 << (feature_id % Self::BITS)) != 0
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct FeatureStepData {
     features: Box<[PlacedFeatureEntryRef]>,

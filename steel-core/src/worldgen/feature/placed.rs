@@ -5,10 +5,36 @@
 
 use super::prelude::*;
 use super::runner::FeatureDecorationRunner;
+use super::sorter::BiomeFeatureMembership;
+
+/// The `PlacementModifier::Biome` test for one in-flight top-level placed feature.
+///
+/// Carries the feature's registry id rather than its key, so the biome test is a bit lookup
+/// instead of a scan over the biome's feature identifiers.
+#[derive(Clone, Copy)]
+pub(super) struct BiomeFeatureFilter<'a> {
+    membership: &'a BiomeFeatureMembership,
+    feature_id: usize,
+}
+
+impl<'a> BiomeFeatureFilter<'a> {
+    #[must_use]
+    pub(super) const fn new(membership: &'a BiomeFeatureMembership, feature_id: usize) -> Self {
+        Self {
+            membership,
+            feature_id,
+        }
+    }
+
+    #[must_use]
+    pub(super) fn allows(&self, biome_id: usize) -> bool {
+        self.membership.allows(biome_id, self.feature_id)
+    }
+}
 
 #[derive(Clone, Copy)]
 enum BiomeFilterMode<'a> {
-    Check(Option<&'a Identifier>),
+    Check(Option<&'a BiomeFeatureFilter<'a>>),
     Ignore,
 }
 
@@ -20,19 +46,20 @@ impl FeatureDecorationRunner {
         origin: BlockPos,
         feature: PlacedFeatureEntryRef,
         biome_zoom_seed: i64,
+        membership: &BiomeFeatureMembership,
     ) -> bool {
-        assert!(
-            feature.try_id().is_some(),
-            "top-level placed feature {} is not registered",
-            feature.key
-        );
+        let Some(feature_id) = feature.try_id() else {
+            panic!("top-level placed feature {} is not registered", feature.key);
+        };
+        let filter = BiomeFeatureFilter::new(membership, feature_id);
+
         Self::place_placed_feature_data(
             region,
             registry,
             random,
             origin,
             &feature.data,
-            Some(&feature.key),
+            Some(&filter),
             biome_zoom_seed,
         )
     }
@@ -43,7 +70,7 @@ impl FeatureDecorationRunner {
         random: &mut WorldgenRandom,
         origin: BlockPos,
         feature: &PlacedFeatureData,
-        biome_filter: Option<&Identifier>,
+        biome_filter: Option<&BiomeFeatureFilter<'_>>,
         biome_zoom_seed: i64,
     ) -> bool {
         Self::place_placed_feature_from_modifier(
@@ -88,13 +115,9 @@ impl FeatureDecorationRunner {
         match modifier {
             PlacementModifier::Biome => {
                 let biome_allows = match biome_filter {
-                    BiomeFilterMode::Check(feature_key) => Self::biome_allows_feature(
-                        region,
-                        registry,
-                        biome_zoom_seed,
-                        origin,
-                        feature_key,
-                    ),
+                    BiomeFilterMode::Check(filter) => {
+                        Self::biome_allows_feature(region, biome_zoom_seed, origin, filter)
+                    }
                     BiomeFilterMode::Ignore => true,
                 };
 

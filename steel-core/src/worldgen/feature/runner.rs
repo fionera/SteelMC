@@ -5,7 +5,7 @@ use steel_registry::structure::StructureRef;
 use steel_utils::{BoundingBox, ChunkPos};
 
 use super::prelude::*;
-use super::sorter::{FeatureSorter, FeatureStepData};
+use super::sorter::{BiomeFeatureMembership, FeatureSorter, FeatureStepData};
 use crate::worldgen::structure::piece_placer::StructurePiecePlacer;
 #[cfg(test)]
 use steel_worldgen::structure::StructureReferenceMap;
@@ -16,6 +16,7 @@ use steel_worldgen::structure::StructureStart;
 pub(crate) struct FeatureDecorationRunner {
     pub(super) sorter: FeatureSorter,
     source_biome_lookup: Box<[bool]>,
+    biome_feature_membership: BiomeFeatureMembership,
 }
 
 impl FeatureDecorationRunner {
@@ -142,6 +143,7 @@ impl FeatureDecorationRunner {
         Self {
             sorter: FeatureSorter::build(&unique_biomes, registry),
             source_biome_lookup,
+            biome_feature_membership: BiomeFeatureMembership::build(registry),
         }
     }
 
@@ -183,6 +185,7 @@ impl FeatureDecorationRunner {
                 step_features,
                 &possible_biomes,
                 biome_zoom_seed,
+                &self.biome_feature_membership,
             );
         }
     }
@@ -369,6 +372,7 @@ impl FeatureDecorationRunner {
         step_features: &FeatureStepData,
         possible_biomes: &[usize],
         biome_zoom_seed: i64,
+        membership: &BiomeFeatureMembership,
     ) {
         let mut feature_indices = SmallVec::<[usize; 64]>::new();
 
@@ -399,6 +403,7 @@ impl FeatureDecorationRunner {
                 origin,
                 feature,
                 biome_zoom_seed,
+                membership,
             );
         }
     }
