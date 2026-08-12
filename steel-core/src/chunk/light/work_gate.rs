@@ -1,5 +1,6 @@
 //! Scheduling gate for light work cache windows.
 
+use std::mem;
 use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
@@ -44,6 +45,9 @@ struct GateState {
     active: FxHashMap<(i32, i32), Vec<ChunkPos>>,
     /// Reservers blocked behind a conflicting window, bucketed by grid cell.
     waiters: FxHashMap<(i32, i32), Vec<Waiter>>,
+    /// Scratch for [`GateState::grant_unblocked`], kept here so the hot path
+    /// reuses one allocation instead of making one per release.
+    nearby_active: Vec<ChunkPos>,
 }
 
 /// What a blocked reserver left behind to be run once its window is free.
@@ -237,9 +241,22 @@ impl GateState {
     /// Only waiters within the exclusion radius of the released center can have
     /// been unblocked by it, and those all live in the nine cells around it, so
     /// this never walks the whole waiter set.
+    ///
+    /// The blocked test is answered from a list gathered once per release rather
+    /// than by [`GateState::is_blocked`] per waiter, because that hashed probe
+    /// was the whole cost of this critical section. Under pregeneration the
+    /// waiter set runs to thousands of entries and a release walks ~51 of them,
+    /// so the old shape charged ~200 random `active` lookups to every release --
+    /// several microseconds of cache-missing work under the one global gate
+    /// mutex, which is what made a third of all acquisitions collide and pay a
+    /// park/wake round trip. See `nearby_active_for` for why the substitution is
+    /// exact.
     #[must_use]
     fn grant_unblocked(&mut self, released: ChunkPos) -> Vec<(ChunkPos, GrantContinuation)> {
         let mut granted = Vec::new();
+        // Taken out so the walk below can hold a borrow of `waiters` across the
+        // blocked test; handed back before returning.
+        let mut nearby = self.nearby_active_for(released);
         let (cx, cz) = LightWorkWindowGate::grid_cell(released);
         for dx in -1..=1 {
             for dz in -1..=1 {
@@ -250,23 +267,32 @@ impl GateState {
 
                 let mut index = 0;
                 while let Some(bucket) = self.waiters.get(&cell) {
-                    let Some(waiter) = bucket.get(index) else {
+                    // One lookup per *grant* rather than one per waiter: nothing
+                    // in this scan mutates `waiters`, so the borrow is sound and
+                    // the visit order is exactly the old one -- each waiter from
+                    // `index` on is tested once, and a grant leaves `index` on
+                    // the entry `swap_remove` moved into its place.
+                    let Some(rest) = bucket.get(index..) else {
                         break;
                     };
-                    let center = waiter.center;
-                    if !LightWorkWindowGate::windows_overlap(released, center)
-                        || self.is_blocked(center)
-                    {
-                        index += 1;
-                        continue;
-                    }
+                    let Some(offset) = rest.iter().position(|waiter| {
+                        LightWorkWindowGate::windows_overlap(released, waiter.center)
+                            && !Self::blocked_by(&nearby, waiter.center)
+                    }) else {
+                        break;
+                    };
+                    index += offset;
 
                     let waiter = self
                         .waiters
                         .get_mut(&cell)
                         .expect("waiter bucket vanished while granting")
                         .swap_remove(index);
+                    let center = waiter.center;
                     self.insert_active(center);
+                    // Keeps the gathered list an exact stand-in for `active` as
+                    // this release reserves windows of its own.
+                    nearby.push(center);
                     granted.push((center, waiter.grant));
                 }
 
@@ -275,7 +301,56 @@ impl GateState {
                 }
             }
         }
+        self.nearby_active = nearby;
         granted
+    }
+
+    /// Every active center that could block a waiter this release can unblock.
+    ///
+    /// Exact stand-in for [`GateState::is_blocked`] over those waiters: a waiter
+    /// `grant_unblocked` even considers is within the exclusion radius of
+    /// `released`, and anything blocking it is within that radius of *it*, so by
+    /// the triangle inequality every blocker lies within twice the radius of
+    /// `released`. Collecting that superset and applying the same
+    /// `windows_overlap` predicate to it therefore answers exactly what a
+    /// nine-cell hashed probe of `active` would have, per waiter, without
+    /// hashing anything.
+    ///
+    /// Twice the exclusion radius spans at most two grid cells either way, hence
+    /// the five-by-five sweep.
+    fn nearby_active_for(&mut self, released: ChunkPos) -> Vec<ChunkPos> {
+        let mut nearby = mem::take(&mut self.nearby_active);
+        nearby.clear();
+        let (cx, cz) = LightWorkWindowGate::grid_cell(released);
+        for dx in -2..=2 {
+            for dz in -2..=2 {
+                let Some(bucket) = self.active.get(&(cx + dx, cz + dz)) else {
+                    continue;
+                };
+                nearby.extend(
+                    bucket
+                        .iter()
+                        .copied()
+                        .filter(|&active| Self::within_blocker_range(released, active)),
+                );
+            }
+        }
+        nearby
+    }
+
+    /// Whether any window in `nearby` overlaps `center`.
+    fn blocked_by(nearby: &[ChunkPos], center: ChunkPos) -> bool {
+        nearby
+            .iter()
+            .any(|&active| LightWorkWindowGate::windows_overlap(center, active))
+    }
+
+    /// Whether `active` could block any waiter that releasing `released` frees.
+    const fn within_blocker_range(released: ChunkPos, active: ChunkPos) -> bool {
+        let dx = released.0.x.abs_diff(active.0.x);
+        let dz = released.0.y.abs_diff(active.0.y);
+        let reach = 2 * LIGHT_WORK_CENTER_EXCLUSION_RADIUS as u32;
+        dx <= reach && dz <= reach
     }
 }
 
@@ -312,6 +387,62 @@ mod tests {
     use tokio::{spawn, task::yield_now};
 
     use super::*;
+
+    /// The substitution `grant_unblocked` rests on: the list gathered once per
+    /// release must answer the blocked question exactly as a full nine-cell probe
+    /// of `active` would, for every center that release could unblock.
+    ///
+    /// Exhaustive over a dense random reservation set rather than a couple of
+    /// hand-picked positions, because the failure mode is a gather radius that is
+    /// one cell too small -- which shows up only for a blocker sitting at the far
+    /// corner of the reachable range, and would otherwise surface as a waiter
+    /// granted a window that overlaps a live one.
+    #[test]
+    fn gathered_blockers_answer_exactly_what_a_full_probe_would() {
+        let mut state = GateState::default();
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+
+        // A realistic `active` set: non-overlapping, and dense enough that the
+        // reachable range around most release points holds several blockers.
+        for _ in 0..400 {
+            let x = i32::try_from(next() % 61).expect("small") - 30;
+            let z = i32::try_from(next() % 61).expect("small") - 30;
+            let center = ChunkPos::new(x, z);
+            if !state.is_blocked(center) {
+                state.insert_active(center);
+            }
+        }
+        assert!(
+            state.active.values().map(Vec::len).sum::<usize>() > 20,
+            "test needs a populated active set to be meaningful"
+        );
+
+        let radius = LIGHT_WORK_CENTER_EXCLUSION_RADIUS;
+        for rx in -30..=30 {
+            for rz in -30..=30 {
+                let released = ChunkPos::new(rx, rz);
+                let nearby = state.nearby_active_for(released);
+                for dx in -radius..=radius {
+                    for dz in -radius..=radius {
+                        let center = ChunkPos::new(rx + dx, rz + dz);
+                        assert_eq!(
+                            GateState::blocked_by(&nearby, center),
+                            state.is_blocked(center),
+                            "gathered list disagreed with a full probe at {center:?} \
+                             for release {released:?}"
+                        );
+                    }
+                }
+                state.nearby_active = nearby;
+            }
+        }
+    }
 
     #[test]
     fn overlapping_windows_cannot_be_reserved_together() {
