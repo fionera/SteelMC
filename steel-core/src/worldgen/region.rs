@@ -105,6 +105,10 @@ impl WorldGenChunkRef<'_> {
         self.chunk.sections()
     }
 
+    pub(crate) fn structure_starts(&self) -> RwLockReadGuard<'_, StructureStartMap> {
+        self.chunk.structure_starts()
+    }
+
     pub(crate) fn structure_starts_mut(&self) -> RwLockWriteGuard<'_, StructureStartMap> {
         self.chunk.structure_starts_mut()
     }

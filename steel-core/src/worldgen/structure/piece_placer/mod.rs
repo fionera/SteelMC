@@ -24,6 +24,7 @@ use steel_registry::block_entity_type::BlockEntityTypeRef;
 use steel_registry::blocks::block_state_ext::BlockStateExt as _;
 use steel_registry::blocks::properties::BlockStateProperties;
 use steel_registry::structure::StructureRef;
+use steel_registry::template_pool::PoolElement;
 use steel_registry::{Registry, vanilla_block_entity_types, vanilla_blocks};
 use steel_utils::random::Random;
 use steel_utils::random::worldgen_random::WorldgenRandom;
@@ -33,6 +34,7 @@ use steel_utils::{
 };
 
 use crate::worldgen::region::WorldGenRegion;
+use steel_worldgen::structure::mineshaft::MineshaftPieceKind;
 use steel_worldgen::structure::{
     ProceduralPieceData, StructureMirror, StructurePiece, StructurePiecePayload,
 };
@@ -46,15 +48,81 @@ impl StructurePiecePlacer {
     /// Vanilla template-piece placement flags: `UPDATE_CLIENTS`.
     pub(crate) const TEMPLATE_UPDATE_FLAGS: UpdateFlags = UpdateFlags::UPDATE_CLIENTS;
 
+    /// Whether placing this piece touches state shared with the other chunks
+    /// that decorate the same [`StructureStart`](steel_worldgen::structure::StructureStart).
+    ///
+    /// Feature-stage placement runs once per decorating chunk whose writable box
+    /// intersects a piece, so one start is visited by many generation threads.
+    /// Most families only read the piece and write blocks into the visiting
+    /// chunk's own clip, which is disjoint between visitors, and can therefore
+    /// run under a shared borrow of the source chunk's start map. These cannot:
+    ///
+    /// * `Template`, `BuriedTreasure`, `DesertPyramid`, `JungleTemple` and
+    ///   `SwampHut` write [`StructurePiece::bounding_box`] and their payload's
+    ///   persisted ground-height adjustment.
+    /// * A mineshaft spider corridor reads and writes vanilla's
+    ///   `hasPlacedSpider` one-shot flag, and that read gates an RNG draw.
+    /// * Stronghold and nether fortress payloads carry vanilla's one-shot chest
+    ///   and spawner flags. Only two of their piece kinds actually use one, but
+    ///   both dispatches would have to be duplicated to separate them, for well
+    ///   under 1% of the measured lock hold, so the families stay exclusive.
+    /// * A jigsaw piece whose pool element places a *feature* writes through the
+    ///   region without clipping to the decorating chunk, so two visitors would
+    ///   no longer be writing disjoint block ranges.
+    ///
+    /// Every payload this reports `true` for is also one the shared dispatch in
+    /// [`Self::try_place_piece_shared`] declines, so a caller that honours this
+    /// never reaches that function's `unreachable!`.
+    pub(crate) fn piece_needs_exclusive_placement(piece: &StructurePiece) -> bool {
+        match &piece.payload {
+            StructurePiecePayload::Jigsaw(data) => {
+                Self::pool_element_places_feature(&data.pool_element)
+            }
+            StructurePiecePayload::Procedural(ProceduralPieceData::Mineshaft(data)) => matches!(
+                data.kind,
+                MineshaftPieceKind::Corridor {
+                    spider_corridor: true,
+                    ..
+                }
+            ),
+            StructurePiecePayload::Template(_)
+            | StructurePiecePayload::Procedural(
+                ProceduralPieceData::BuriedTreasure
+                | ProceduralPieceData::DesertPyramid(_)
+                | ProceduralPieceData::JungleTemple(_)
+                | ProceduralPieceData::NetherFortress(_)
+                | ProceduralPieceData::Stronghold(_)
+                | ProceduralPieceData::SwampHut(_),
+            ) => true,
+            StructurePiecePayload::Procedural(
+                ProceduralPieceData::OceanMonument(_) | ProceduralPieceData::Unimplemented,
+            ) => false,
+        }
+    }
+
+    /// Whether the element tree places a feature rather than a template.
+    ///
+    /// Template placement clips every write to the settings' bounding box, which
+    /// feature-stage placement sets to the decorating chunk. A feature element
+    /// runs an ordinary placed feature instead, which writes anywhere the
+    /// generation step's write radius allows.
+    fn pool_element_places_feature(element: &PoolElement) -> bool {
+        match element {
+            PoolElement::Feature { .. } => true,
+            PoolElement::List { elements, .. } => {
+                elements.iter().any(Self::pool_element_places_feature)
+            }
+            PoolElement::Single { .. } | PoolElement::LegacySingle { .. } | PoolElement::Empty => {
+                false
+            }
+        }
+    }
+
     /// Places one already-clipped structure piece.
     ///
     /// Returns whether the vanilla placement call succeeded. Later milestones
     /// must implement each remaining payload variant completely before it can
     /// return `true`.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "single dispatch boundary for all structure piece payload families"
-    )]
     pub(crate) fn place_piece(
         region: &mut WorldGenRegion<'_>,
         registry: &Registry,
@@ -64,21 +132,21 @@ impl StructurePiecePlacer {
         random: &mut WorldgenRandom,
         biome_zoom_seed: i64,
     ) -> bool {
+        if let Some(placed) = Self::try_place_piece_shared(
+            region,
+            registry,
+            piece,
+            reference_pos,
+            clip,
+            random,
+            biome_zoom_seed,
+        ) {
+            return placed;
+        }
+
         let mut piece_bounding_box = piece.bounding_box;
         let piece_orientation = piece.orientation;
         let placed = match &mut piece.payload {
-            StructurePiecePayload::Jigsaw(data) => Self::place_pool_element(
-                region,
-                registry,
-                &data.pool_element,
-                BlockPos::new(data.position.x, data.position.y, data.position.z),
-                reference_pos,
-                data.rotation,
-                clip,
-                random,
-                data.liquid_settings,
-                biome_zoom_seed,
-            ),
             StructurePiecePayload::Template(data) => Self::place_template_piece(
                 region,
                 registry,
@@ -89,7 +157,7 @@ impl StructurePiecePlacer {
                 random,
             ),
             StructurePiecePayload::Procedural(ProceduralPieceData::Mineshaft(data)) => {
-                Self::place_mineshaft_piece(
+                Self::place_mineshaft_spider_corridor(
                     region,
                     registry,
                     piece_bounding_box,
@@ -102,17 +170,6 @@ impl StructurePiecePlacer {
             }
             StructurePiecePayload::Procedural(ProceduralPieceData::NetherFortress(data)) => {
                 Self::place_nether_fortress_piece(
-                    region,
-                    registry,
-                    piece_bounding_box,
-                    piece_orientation,
-                    data,
-                    clip,
-                    random,
-                )
-            }
-            StructurePiecePayload::Procedural(ProceduralPieceData::OceanMonument(data)) => {
-                Self::place_ocean_monument_piece(
                     region,
                     registry,
                     piece_bounding_box,
@@ -169,16 +226,114 @@ impl StructurePiecePlacer {
                     random,
                 )
             }
-            StructurePiecePayload::Procedural(ProceduralPieceData::Unimplemented) => false,
+            StructurePiecePayload::Jigsaw(_)
+            | StructurePiecePayload::Procedural(
+                ProceduralPieceData::OceanMonument(_) | ProceduralPieceData::Unimplemented,
+            ) => unreachable!("shared payloads are placed by the shared dispatch above"),
         };
         piece.bounding_box = piece_bounding_box;
         placed
     }
 
+    /// Places one already-clipped structure piece through a shared borrow.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the payload needs exclusive access. Callers must skip the whole
+    /// start when [`Self::piece_needs_exclusive_placement`] reports any of its
+    /// pieces, which is strictly more than this dispatch declines.
+    pub(crate) fn place_piece_shared(
+        region: &mut WorldGenRegion<'_>,
+        registry: &Registry,
+        piece: &StructurePiece,
+        reference_pos: BlockPos,
+        clip: BoundingBox,
+        random: &mut WorldgenRandom,
+        biome_zoom_seed: i64,
+    ) -> bool {
+        let Some(placed) = Self::try_place_piece_shared(
+            region,
+            registry,
+            piece,
+            reference_pos,
+            clip,
+            random,
+            biome_zoom_seed,
+        ) else {
+            unreachable!(
+                "{} needs exclusive structure-start access",
+                piece.piece_type
+            )
+        };
+        placed
+    }
+
+    /// Placement for the payloads that only need a shared borrow of the piece.
+    ///
+    /// Returns `None` for the payloads that need `&mut` access, which
+    /// [`Self::place_piece`] then handles.
+    fn try_place_piece_shared(
+        region: &mut WorldGenRegion<'_>,
+        registry: &Registry,
+        piece: &StructurePiece,
+        reference_pos: BlockPos,
+        clip: BoundingBox,
+        random: &mut WorldgenRandom,
+        biome_zoom_seed: i64,
+    ) -> Option<bool> {
+        match &piece.payload {
+            StructurePiecePayload::Jigsaw(data) => Some(Self::place_pool_element(
+                region,
+                registry,
+                &data.pool_element,
+                BlockPos::new(data.position.x, data.position.y, data.position.z),
+                reference_pos,
+                data.rotation,
+                clip,
+                random,
+                data.liquid_settings,
+                biome_zoom_seed,
+            )),
+            StructurePiecePayload::Procedural(ProceduralPieceData::Mineshaft(data)) => {
+                Self::try_place_mineshaft_piece(
+                    region,
+                    registry,
+                    piece.bounding_box,
+                    piece.orientation,
+                    data,
+                    clip,
+                    random,
+                    biome_zoom_seed,
+                )
+            }
+            StructurePiecePayload::Procedural(ProceduralPieceData::OceanMonument(data)) => {
+                Some(Self::place_ocean_monument_piece(
+                    region,
+                    registry,
+                    piece.bounding_box,
+                    piece.orientation,
+                    data,
+                    clip,
+                    random,
+                ))
+            }
+            StructurePiecePayload::Procedural(ProceduralPieceData::Unimplemented) => Some(false),
+            StructurePiecePayload::Template(_)
+            | StructurePiecePayload::Procedural(
+                ProceduralPieceData::BuriedTreasure
+                | ProceduralPieceData::DesertPyramid(_)
+                | ProceduralPieceData::JungleTemple(_)
+                | ProceduralPieceData::NetherFortress(_)
+                | ProceduralPieceData::Stronghold(_)
+                | ProceduralPieceData::SwampHut(_),
+            ) => None,
+        }
+    }
+
     pub(crate) fn after_place_structure(
         region: &mut WorldGenRegion<'_>,
         structure: StructureRef,
-        pieces: &mut [StructurePiece],
+        pieces: &[StructurePiece],
         clip: BoundingBox,
     ) {
         if structure.structure_type == Identifier::new_static("minecraft", "desert_pyramid") {

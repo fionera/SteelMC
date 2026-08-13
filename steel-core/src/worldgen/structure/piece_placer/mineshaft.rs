@@ -25,11 +25,72 @@ const ABANDONED_MINESHAFT_LOOT: Identifier =
 const CAVE_SPIDER_ENTITY: &str = "minecraft:cave_spider";
 
 impl StructurePiecePlacer {
+    /// Places every mineshaft piece kind except a spider corridor.
+    ///
+    /// Returns `None` for a spider corridor: its vanilla `hasPlacedSpider` flag
+    /// is shared between the chunks decorating the same mineshaft, so it needs
+    /// [`Self::place_mineshaft_spider_corridor`] and exclusive access.
     #[expect(
         clippy::too_many_arguments,
         reason = "structure-piece placement carries vanilla postProcess inputs"
     )]
-    pub(super) fn place_mineshaft_piece(
+    pub(super) fn try_place_mineshaft_piece(
+        region: &mut WorldGenRegion<'_>,
+        registry: &Registry,
+        bounding_box: BoundingBox,
+        orientation: Option<Direction>,
+        data: &MineshaftPiecePayload,
+        clip: BoundingBox,
+        random: &mut WorldgenRandom,
+        biome_zoom_seed: i64,
+    ) -> Option<bool> {
+        if matches!(
+            data.kind,
+            MineshaftPieceKind::Corridor {
+                spider_corridor: true,
+                ..
+            }
+        ) {
+            return None;
+        }
+
+        let mineshaft_type = data.mineshaft_type;
+        let mut placer = MineshaftPlacer {
+            region,
+            registry,
+            bounding_box,
+            orientation,
+            clip,
+            mineshaft_type,
+            biome_zoom_seed,
+        };
+        if placer.is_in_invalid_location() {
+            return Some(false);
+        }
+
+        match &data.kind {
+            MineshaftPieceKind::Room {
+                child_entrance_boxes,
+            } => placer.place_room(child_entrance_boxes),
+            MineshaftPieceKind::Corridor {
+                has_rails,
+                num_sections,
+                ..
+            } => placer.place_corridor(random, mineshaft_type, *has_rails, None, *num_sections),
+            MineshaftPieceKind::Crossing { is_two_floored, .. } => {
+                placer.place_crossing(mineshaft_type, *is_two_floored);
+            }
+            MineshaftPieceKind::Stairs => placer.place_stairs(),
+        }
+        Some(true)
+    }
+
+    /// Places a spider corridor, the one mineshaft kind with mutable state.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "structure-piece placement carries vanilla postProcess inputs"
+    )]
+    pub(super) fn place_mineshaft_spider_corridor(
         region: &mut WorldGenRegion<'_>,
         registry: &Registry,
         bounding_box: BoundingBox,
@@ -40,6 +101,18 @@ impl StructurePiecePlacer {
         biome_zoom_seed: i64,
     ) -> bool {
         let mineshaft_type = data.mineshaft_type;
+        let MineshaftPieceKind::Corridor {
+            has_rails,
+            spider_corridor: true,
+            has_placed_spider,
+            num_sections,
+        } = &mut data.kind
+        else {
+            unreachable!("only a spider corridor needs exclusive mineshaft placement")
+        };
+        let has_rails = *has_rails;
+        let num_sections = *num_sections;
+
         let mut placer = MineshaftPlacer {
             region,
             registry,
@@ -53,28 +126,13 @@ impl StructurePiecePlacer {
             return false;
         }
 
-        match &mut data.kind {
-            MineshaftPieceKind::Room {
-                child_entrance_boxes,
-            } => placer.place_room(child_entrance_boxes),
-            MineshaftPieceKind::Corridor {
-                has_rails,
-                spider_corridor,
-                has_placed_spider,
-                num_sections,
-            } => placer.place_corridor(
-                random,
-                mineshaft_type,
-                *has_rails,
-                *spider_corridor,
-                has_placed_spider,
-                *num_sections,
-            ),
-            MineshaftPieceKind::Crossing { is_two_floored, .. } => {
-                placer.place_crossing(mineshaft_type, *is_two_floored);
-            }
-            MineshaftPieceKind::Stairs => placer.place_stairs(),
-        }
+        placer.place_corridor(
+            random,
+            mineshaft_type,
+            has_rails,
+            Some(has_placed_spider),
+            num_sections,
+        );
         true
     }
 }
@@ -129,15 +187,20 @@ impl MineshaftPlacer<'_, '_> {
         );
     }
 
+    /// Places one corridor segment.
+    ///
+    /// `spider` is `Some` exactly for vanilla's spider corridors, and carries
+    /// the shared `hasPlacedSpider` flag; a corridor without one draws neither
+    /// the cobwebs nor the spawner position, so the two are one parameter.
     fn place_corridor(
         &mut self,
         random: &mut WorldgenRandom,
         mineshaft_type: MineshaftType,
         has_rails: bool,
-        spider_corridor: bool,
-        has_placed_spider: &mut bool,
+        mut spider: Option<&mut bool>,
         num_sections: i32,
     ) {
+        let spider_corridor = spider.is_some();
         let length = num_sections * 5 - 1;
         let planks = Self::planks_state(mineshaft_type);
         self.generate_box(
@@ -201,7 +264,9 @@ impl MineshaftPlacer<'_, '_> {
                 self.create_chest(random, 0, 0, z + 1);
             }
 
-            if spider_corridor && !*has_placed_spider {
+            if let Some(has_placed_spider) = spider.as_deref_mut()
+                && !*has_placed_spider
+            {
                 let new_z = z - 1 + random.next_i32_bounded(3);
                 let pos = self.world_pos(1, 0, new_z);
                 if self.clip.contains_blockpos(pos) && self.is_interior(1, 0, new_z) {

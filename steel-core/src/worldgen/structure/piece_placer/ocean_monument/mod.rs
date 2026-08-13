@@ -23,7 +23,7 @@ impl StructurePiecePlacer {
         registry: &Registry,
         bounding_box: BoundingBox,
         orientation: Option<Direction>,
-        data: &mut OceanMonumentPieceData,
+        data: &OceanMonumentPieceData,
         clip: BoundingBox,
         random: &mut WorldgenRandom,
     ) -> bool {

@@ -6,6 +6,7 @@ use steel_utils::{BoundingBox, ChunkPos};
 
 use super::prelude::*;
 use super::sorter::{BiomeFeatureMembership, FeatureSorter, FeatureStepData};
+use crate::worldgen::region::WorldGenChunkRef;
 use crate::worldgen::structure::piece_placer::StructurePiecePlacer;
 #[cfg(test)]
 use steel_worldgen::structure::StructureReferenceMap;
@@ -308,39 +309,140 @@ impl FeatureDecorationRunner {
                 else {
                     continue;
                 };
-                let mut source_starts = source_chunk.structure_starts_mut();
-                let Some(start) = source_starts.get_mut(&structure.key) else {
-                    continue;
-                };
-                if start.chunk_pos != source_pos || start.pieces.is_empty() {
-                    continue;
-                }
-                let Some(reference_pos) = start.placement_reference_pos() else {
-                    continue;
-                };
-                for piece in &mut start.pieces {
-                    if piece.bounding_box.intersects(writable_box) {
-                        StructurePiecePlacer::place_piece(
-                            region,
-                            registry,
-                            piece,
-                            reference_pos,
-                            writable_box,
-                            random,
-                            biome_zoom_seed,
-                        );
-                    }
-                }
-                StructurePiecePlacer::after_place_structure(
+                if Self::place_structure_start_shared(
                     region,
+                    registry,
+                    source_chunk,
                     structure,
-                    &mut start.pieces,
+                    source_pos,
                     writable_box,
+                    random,
+                    biome_zoom_seed,
+                ) {
+                    continue;
+                }
+                Self::place_structure_start_exclusive(
+                    region,
+                    registry,
+                    source_chunk,
+                    structure,
+                    source_pos,
+                    writable_box,
+                    random,
+                    biome_zoom_seed,
                 );
-                start.bounding_box =
-                    StructureStart::compute_bounding_box(&start.pieces, start.bb_inflate);
             }
         }
+    }
+
+    /// Places a start's pieces under a shared borrow of the source chunk's map.
+    ///
+    /// One start is decorated once per chunk its pieces reach, so the write lock
+    /// this used to take unconditionally serialized every one of those visits
+    /// against each other and against the readers in structure-reference and
+    /// noise generation. A visit only needs exclusive access when one of the
+    /// pieces it places carries state shared between visitors; see
+    /// [`StructurePiecePlacer::piece_needs_exclusive_placement`]. Everything
+    /// else reads the start and writes blocks into this chunk's own clip, which
+    /// no other visitor writes.
+    ///
+    /// The check runs under the same guard as the placement, so the piece boxes
+    /// it tests are the ones the placement then uses: a piece whose box an
+    /// exclusive visitor moves is one this reports, and read and write borrows
+    /// exclude each other.
+    ///
+    /// Returns whether the start was handled; `false` means it needs
+    /// [`Self::place_structure_start_exclusive`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors the decoration loop state its caller already carries"
+    )]
+    fn place_structure_start_shared(
+        region: &mut WorldGenRegion<'_>,
+        registry: &Registry,
+        source_chunk: WorldGenChunkRef<'_>,
+        structure: StructureRef,
+        source_pos: ChunkPos,
+        writable_box: BoundingBox,
+        random: &mut WorldgenRandom,
+        biome_zoom_seed: i64,
+    ) -> bool {
+        let source_starts = source_chunk.structure_starts();
+        let Some(start) = source_starts.get(&structure.key) else {
+            return true;
+        };
+        if start.chunk_pos != source_pos || start.pieces.is_empty() {
+            return true;
+        }
+        let Some(reference_pos) = start.placement_reference_pos() else {
+            return true;
+        };
+        if start.pieces.iter().any(|piece| {
+            piece.bounding_box.intersects(writable_box)
+                && StructurePiecePlacer::piece_needs_exclusive_placement(piece)
+        }) {
+            return false;
+        }
+
+        for piece in &start.pieces {
+            if piece.bounding_box.intersects(writable_box) {
+                StructurePiecePlacer::place_piece_shared(
+                    region,
+                    registry,
+                    piece,
+                    reference_pos,
+                    writable_box,
+                    random,
+                    biome_zoom_seed,
+                );
+            }
+        }
+        StructurePiecePlacer::after_place_structure(region, structure, &start.pieces, writable_box);
+        // `start.bounding_box` is the union of the piece boxes, and no piece
+        // placed here can change its own box, so recomputing it would store the
+        // value already there.
+        true
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors the decoration loop state its caller already carries"
+    )]
+    fn place_structure_start_exclusive(
+        region: &mut WorldGenRegion<'_>,
+        registry: &Registry,
+        source_chunk: WorldGenChunkRef<'_>,
+        structure: StructureRef,
+        source_pos: ChunkPos,
+        writable_box: BoundingBox,
+        random: &mut WorldgenRandom,
+        biome_zoom_seed: i64,
+    ) {
+        let mut source_starts = source_chunk.structure_starts_mut();
+        let Some(start) = source_starts.get_mut(&structure.key) else {
+            return;
+        };
+        if start.chunk_pos != source_pos || start.pieces.is_empty() {
+            return;
+        }
+        let Some(reference_pos) = start.placement_reference_pos() else {
+            return;
+        };
+        for piece in &mut start.pieces {
+            if piece.bounding_box.intersects(writable_box) {
+                StructurePiecePlacer::place_piece(
+                    region,
+                    registry,
+                    piece,
+                    reference_pos,
+                    writable_box,
+                    random,
+                    biome_zoom_seed,
+                );
+            }
+        }
+        StructurePiecePlacer::after_place_structure(region, structure, &start.pieces, writable_box);
+        start.bounding_box = StructureStart::compute_bounding_box(&start.pieces, start.bb_inflate);
     }
 
     pub(super) fn set_structure_seed(

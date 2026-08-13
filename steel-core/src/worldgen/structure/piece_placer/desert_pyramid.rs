@@ -56,13 +56,13 @@ impl StructurePiecePlacer {
 
     pub(super) fn after_place_desert_pyramid(
         region: &mut WorldGenRegion<'_>,
-        pieces: &mut [StructurePiece],
+        pieces: &[StructurePiece],
         clip: BoundingBox,
     ) {
         let mut unique_sand_placements = Vec::new();
-        for piece in pieces.iter_mut() {
+        for piece in pieces {
             let StructurePiecePayload::Procedural(ProceduralPieceData::DesertPyramid(data)) =
-                &mut piece.payload
+                &piece.payload
             else {
                 continue;
             };
