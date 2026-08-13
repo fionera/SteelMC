@@ -121,6 +121,7 @@ struct Options {
     ram_only: bool,
     keep_storage: bool,
     digest: bool,
+    log: bool,
 }
 
 impl Options {
@@ -146,6 +147,7 @@ impl Options {
             ram_only: false,
             keep_storage: false,
             digest: false,
+            log: false,
         };
 
         // `cargo bench` passes its own flags through; ignore the ones libtest
@@ -171,6 +173,7 @@ impl Options {
                 "--ram-only" => options.ram_only = true,
                 "--keep-storage" => options.keep_storage = true,
                 "--digest" => options.digest = true,
+                "--log" => options.log = true,
                 "--bench" | "--test" => {}
                 "--help" | "-h" => {
                     print_usage();
@@ -222,6 +225,7 @@ Headless pregeneration benchmark.
   --ram-only         skip region-file persistence entirely
   --keep-storage     do not delete the per-run storage directory
   --digest           hash the generated chunk content (see the module docs)
+  --log              print the driver's scheduling-epoch breakdown to stderr
 "
     );
 }
@@ -508,6 +512,29 @@ impl Harness {
     }
 }
 
+/// Stderr logger for `--log`, deliberately not installed by default.
+///
+/// The pregeneration driver reports its scheduling-epoch breakdown through
+/// `log`, which is the only view of the single-threaded epoch stage that bounds
+/// throughput -- but a logger also costs formatting inside the measured run, so
+/// a throughput measurement has to be able to opt out of it. Without `--log`
+/// nothing is installed and the measured path is exactly what it was.
+struct BenchLogger;
+
+impl log::Log for BenchLogger {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.level() <= log::Level::Info
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if self.enabled(record.metadata()) {
+            eprintln!("[{}] {}", record.level(), record.args());
+        }
+    }
+
+    fn flush(&self) {}
+}
+
 fn main() {
     // Both before anything is built. The allocator because production does the
     // same before it generates anything, and the benchmark would otherwise
@@ -524,6 +551,15 @@ fn main() {
             process::exit(2);
         }
     };
+
+    if options.log {
+        static LOGGER: BenchLogger = BenchLogger;
+        if let Err(error) = log::set_logger(&LOGGER) {
+            eprintln!("error: could not install the logger: {error}");
+            process::exit(1);
+        }
+        log::set_max_level(log::LevelFilter::Info);
+    }
 
     ensure_globals();
 

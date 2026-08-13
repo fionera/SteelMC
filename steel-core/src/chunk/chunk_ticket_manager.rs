@@ -1,6 +1,7 @@
 //! Chunk ticket management for tracking chunk levels and propagation.
 #![expect(missing_docs, reason = "internal module; items are self-explanatory")]
 
+use std::collections::hash_map::Entry;
 use std::mem;
 
 use rustc_hash::{FxBuildHasher, FxHashMap};
@@ -98,24 +99,6 @@ impl ChunkTicketLevel {
     #[must_use]
     pub const fn is_entity_ticking(self) -> bool {
         self.0 <= Self::ENTITY_TICKING_CHUNK.0
-    }
-
-    #[must_use]
-    const fn with_distance(self, distance: u8) -> Option<Self> {
-        let level = self.0.saturating_add(distance);
-        Self::new(level)
-    }
-
-    #[must_use]
-    const fn distance_to_max(self) -> u8 {
-        MAX_LEVEL_RAW - self.0
-    }
-
-    #[must_use]
-    const fn distance_to_block_ticking(self) -> u8 {
-        ChunkTicketLevel::BLOCK_TICKING_CHUNK
-            .0
-            .saturating_sub(self.0)
     }
 }
 
@@ -506,6 +489,115 @@ pub struct LevelChange {
     pub new_simulation_level: Option<ChunkTicketLevel>,
 }
 
+/// The eight Chebyshev neighbours of a chunk position.
+///
+/// Chebyshev distance is exactly the 8-connected shortest-path distance, which
+/// is what lets [`LevelPropagation`] treat a ticket cone as unit-cost edges.
+const NEIGHBOR_OFFSETS: [(i32, i32); 8] = [
+    (-1, -1),
+    (0, -1),
+    (1, -1),
+    (-1, 0),
+    (1, 0),
+    (-1, 1),
+    (0, 1),
+    (1, 1),
+];
+
+/// Frontier buckets for one propagation pass, keyed on the level they carry.
+///
+/// A propagated level rises by exactly one per Chebyshev ring, so the frontier
+/// is already sorted by level and needs no priority queue: walking buckets in
+/// increasing order visits every cell once, at its final level.
+///
+/// This is what keeps propagation proportional to the *area* the tickets cover
+/// rather than to sources times cone area. Stamping each source's own square
+/// re-walks the whole overlap once per source, and a pregeneration window is
+/// thousands of adjacent sources whose squares are nearly identical -- the same
+/// field, at a small fraction of the writes.
+#[derive(Debug, Default)]
+struct LevelPropagation {
+    buckets: Vec<Vec<ChunkPos>>,
+}
+
+impl LevelPropagation {
+    /// Fills `field` with the minimum over `sources` of `level + chebyshev
+    /// distance`, dropping anything that would exceed `cutoff`.
+    ///
+    /// A source already at or past `cutoff` still claims its own position but
+    /// cannot reach a neighbour, which is how a simulation ticket weaker than
+    /// block-ticking stays confined to its own chunk.
+    ///
+    /// `field` is expected to be empty; every bucket is emptied again before
+    /// returning, so passes never see each other's frontier.
+    fn run(
+        &mut self,
+        field: &mut FxHashMap<ChunkPos, ChunkTicketLevel>,
+        cutoff: u8,
+        sources: impl IntoIterator<Item = (ChunkPos, ChunkTicketLevel)>,
+    ) {
+        // Only levels below the cutoff ever propagate, so that is the last
+        // bucket that can hold anything.
+        if self.buckets.len() < usize::from(cutoff) {
+            self.buckets.resize_with(usize::from(cutoff), Vec::new);
+        }
+
+        for (pos, level) in sources {
+            if Self::relax(field, pos, level) && level.0 < cutoff {
+                self.buckets[usize::from(level.0)].push(pos);
+            }
+        }
+
+        for level in 0..cutoff {
+            // Taken out so the next level's bucket stays reachable while this
+            // one is walked; the emptied allocation goes straight back.
+            let mut frontier = mem::take(&mut self.buckets[usize::from(level)]);
+            let current = ChunkTicketLevel(level);
+            let next = ChunkTicketLevel(level + 1);
+            let carries_further = next.0 < cutoff;
+
+            for &pos in &frontier {
+                // Superseded: a later relaxation moved this cell into an earlier
+                // bucket, and it has already propagated from there.
+                if field.get(&pos) != Some(&current) {
+                    continue;
+                }
+
+                for (dx, dy) in NEIGHBOR_OFFSETS {
+                    let neighbor = ChunkPos::new(pos.0.x + dx, pos.0.y + dy);
+                    if Self::relax(field, neighbor, next) && carries_further {
+                        self.buckets[usize::from(next.0)].push(neighbor);
+                    }
+                }
+            }
+
+            frontier.clear();
+            self.buckets[usize::from(level)] = frontier;
+        }
+    }
+
+    /// Lowers `field[pos]` to `level`, reporting whether it moved.
+    fn relax(
+        field: &mut FxHashMap<ChunkPos, ChunkTicketLevel>,
+        pos: ChunkPos,
+        level: ChunkTicketLevel,
+    ) -> bool {
+        match field.entry(pos) {
+            Entry::Occupied(mut entry) => {
+                if *entry.get() <= level {
+                    return false;
+                }
+                entry.insert(level);
+                true
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(level);
+                true
+            }
+        }
+    }
+}
+
 /// Chunk ticket propagation.
 /// Lower levels = higher priority. Multiple tickets per position supported.
 #[derive(Debug)]
@@ -516,6 +608,9 @@ pub struct ChunkTicketManager {
     dirty: bool,
     /// Tracks changes from the last `run_all_updates()` call.
     changes: Vec<LevelChange>,
+    /// Scratch frontier, kept between passes so a steady ticket load stops
+    /// reallocating it.
+    propagation: LevelPropagation,
 }
 
 impl Default for ChunkTicketManager {
@@ -533,6 +628,7 @@ impl ChunkTicketManager {
             simulation_levels: FxHashMap::default(),
             dirty: false,
             changes: Vec::new(),
+            propagation: LevelPropagation::default(),
         }
     }
 
@@ -612,69 +708,40 @@ impl ChunkTicketManager {
             return &self.changes;
         }
 
-        // Swap out old levels to compare against later, reusing capacity
-        let old_capacity = self.levels.capacity();
-        let old_levels = mem::replace(
-            &mut self.levels,
-            FxHashMap::with_capacity_and_hasher(old_capacity, FxBuildHasher),
-        );
-        let old_simulation_capacity = self.simulation_levels.capacity();
-        let old_simulation_levels = mem::replace(
-            &mut self.simulation_levels,
-            FxHashMap::with_capacity_and_hasher(old_simulation_capacity, FxBuildHasher),
-        );
+        // Built beside the live fields rather than into them: the diff below
+        // needs the previous pass intact, and starting from the old capacity
+        // keeps a steady ticket load off the allocator.
+        let mut levels = FxHashMap::with_capacity_and_hasher(self.levels.capacity(), FxBuildHasher);
+        let mut simulation_levels =
+            FxHashMap::with_capacity_and_hasher(self.simulation_levels.capacity(), FxBuildHasher);
 
         self.dirty = false;
 
-        // Propagate each ticket source
-        for (&source_pos, tickets) in &self.tickets {
-            let Some(source_level) = tickets.iter().map(|ticket| ticket.load_level()).min() else {
-                continue;
-            };
+        self.propagation.run(
+            &mut levels,
+            MAX_LEVEL_RAW,
+            self.tickets.iter().filter_map(|(&pos, tickets)| {
+                tickets
+                    .iter()
+                    .map(|ticket| ticket.load_level())
+                    .min()
+                    .map(|level| (pos, level))
+            }),
+        );
+        self.propagation.run(
+            &mut simulation_levels,
+            ChunkTicketLevel::BLOCK_TICKING_CHUNK.0,
+            self.tickets.iter().filter_map(|(&pos, tickets)| {
+                tickets
+                    .iter()
+                    .filter_map(|ticket| ticket.simulation_level())
+                    .min()
+                    .map(|level| (pos, level))
+            }),
+        );
 
-            let radius = i32::from(source_level.distance_to_max());
-            let sx = source_pos.0.x;
-            let sy = source_pos.0.y;
-
-            for dy in -radius..=radius {
-                for dx in -radius..=radius {
-                    let distance = dx.abs().max(dy.abs()) as u8;
-                    let Some(level) = source_level.with_distance(distance) else {
-                        continue;
-                    };
-
-                    let pos = ChunkPos::new(sx + dx, sy + dy);
-                    self.levels
-                        .entry(pos)
-                        .and_modify(|e| *e = (*e).min(level))
-                        .or_insert(level);
-                }
-            }
-
-            let Some(simulation_level) = tickets
-                .iter()
-                .filter_map(|ticket| ticket.simulation_level())
-                .min()
-            else {
-                continue;
-            };
-
-            let radius = i32::from(simulation_level.distance_to_block_ticking());
-            for dy in -radius..=radius {
-                for dx in -radius..=radius {
-                    let distance = dx.abs().max(dy.abs()) as u8;
-                    let Some(level) = simulation_level.with_distance(distance) else {
-                        continue;
-                    };
-
-                    let pos = ChunkPos::new(sx + dx, sy + dy);
-                    self.simulation_levels
-                        .entry(pos)
-                        .and_modify(|e| *e = (*e).min(level))
-                        .or_insert(level);
-                }
-            }
-        }
+        let old_levels = mem::replace(&mut self.levels, levels);
+        let old_simulation_levels = mem::replace(&mut self.simulation_levels, simulation_levels);
 
         // Find changed/added levels
         for (&pos, &new_level) in &self.levels {
@@ -794,6 +861,139 @@ impl ChunkTicketManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The propagation definition written the slow, obvious way: every source
+    /// stamps its own square.
+    ///
+    /// [`LevelPropagation`] computes the same two fields by walking a frontier,
+    /// which is a different algorithm reaching for the same answer, so the
+    /// definition is kept here and the two are compared directly.
+    fn reference_fields(
+        tickets: &FxHashMap<ChunkPos, TicketLevels>,
+    ) -> (
+        FxHashMap<ChunkPos, ChunkTicketLevel>,
+        FxHashMap<ChunkPos, ChunkTicketLevel>,
+    ) {
+        fn stamp(
+            field: &mut FxHashMap<ChunkPos, ChunkTicketLevel>,
+            source_pos: ChunkPos,
+            source_level: ChunkTicketLevel,
+            radius: u8,
+        ) {
+            let radius = i32::from(radius);
+            for dy in -radius..=radius {
+                for dx in -radius..=radius {
+                    let distance = dx.abs().max(dy.abs()) as u8;
+                    let Some(level) =
+                        ChunkTicketLevel::new(source_level.0.saturating_add(distance))
+                    else {
+                        continue;
+                    };
+
+                    let pos = ChunkPos::new(source_pos.0.x + dx, source_pos.0.y + dy);
+                    field
+                        .entry(pos)
+                        .and_modify(|e| *e = (*e).min(level))
+                        .or_insert(level);
+                }
+            }
+        }
+
+        let mut levels = FxHashMap::default();
+        let mut simulation_levels = FxHashMap::default();
+
+        for (&source_pos, tickets) in tickets {
+            let Some(source_level) = tickets.iter().map(|ticket| ticket.load_level()).min() else {
+                continue;
+            };
+            stamp(
+                &mut levels,
+                source_pos,
+                source_level,
+                MAX_LEVEL_RAW - source_level.0,
+            );
+
+            let Some(simulation_level) = tickets
+                .iter()
+                .filter_map(|ticket| ticket.simulation_level())
+                .min()
+            else {
+                continue;
+            };
+            stamp(
+                &mut simulation_levels,
+                source_pos,
+                simulation_level,
+                ChunkTicketLevel::BLOCK_TICKING_CHUNK
+                    .0
+                    .saturating_sub(simulation_level.0),
+            );
+        }
+
+        (levels, simulation_levels)
+    }
+
+    fn assert_field_eq(
+        actual: &FxHashMap<ChunkPos, ChunkTicketLevel>,
+        expected: &FxHashMap<ChunkPos, ChunkTicketLevel>,
+        field: &str,
+        case: &str,
+    ) {
+        if actual == expected {
+            return;
+        }
+
+        let mut differences = actual
+            .iter()
+            .filter(|(pos, level)| expected.get(pos) != Some(*level))
+            .map(|(&pos, &level)| (pos, Some(level), expected.get(&pos).copied()))
+            .chain(
+                expected
+                    .iter()
+                    .filter(|(pos, _)| !actual.contains_key(pos))
+                    .map(|(&pos, &level)| (pos, None, Some(level))),
+            )
+            .collect::<Vec<_>>();
+        differences.sort_by_key(|(pos, _, _)| (pos.0.x, pos.0.y));
+        differences.truncate(8);
+
+        panic!(
+            "{case}: {field} diverged from the square-stamped definition \
+             ({} positions propagated, {expected} expected); \
+             first (pos, actual, expected): {differences:?}",
+            actual.len(),
+            expected = expected.len(),
+        );
+    }
+
+    #[track_caller]
+    fn assert_matches_reference(manager: &mut ChunkTicketManager, case: &str) {
+        manager.run_all_updates();
+        let (levels, simulation_levels) = reference_fields(&manager.tickets);
+        assert_field_eq(&manager.levels, &levels, "load levels", case);
+        assert_field_eq(
+            &manager.simulation_levels,
+            &simulation_levels,
+            "simulation levels",
+            case,
+        );
+    }
+
+    /// xorshift64*, so the randomized ticket layouts are reproducible.
+    struct TestRng(u64);
+
+    impl TestRng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn below(&mut self, bound: u32) -> u32 {
+            (self.next() % u64::from(bound)) as u32
+        }
+    }
 
     fn add_portal_ticket(
         manager: &mut ChunkTicketManager,
@@ -1282,7 +1482,9 @@ mod tests {
         for index in 0..=ChunkStatus::Full.get_index() {
             let status = ChunkStatus::from_index(index).expect("index is in status range");
             let ticket_level = ticket_level_for_status(status);
-            let propagation_radius = usize::from(ticket_level.distance_to_max());
+            // A load ticket propagates until its level reaches the cutoff, so
+            // the rings it still covers are exactly that many.
+            let propagation_radius = usize::from(MAX_LEVEL_RAW - ticket_level.raw());
             let required_radius = GENERATION_PYRAMID
                 .get_step_to(status)
                 .accumulated_dependencies
@@ -1378,6 +1580,93 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn frontier_propagation_matches_square_stamping_for_random_ticket_churn() {
+        let mut rng = TestRng(0x9E37_79B9_7F4A_7C15);
+
+        for case in 0..24 {
+            let mut manager = ChunkTicketManager::new();
+            let mut live = Vec::new();
+
+            // Sources are drawn from a small span so the cones overlap heavily,
+            // which is the case the frontier walk collapses and also the one
+            // where a per-source stamp and a shared frontier could disagree.
+            for round in 0..4 {
+                for _ in 0..12 {
+                    let pos = ChunkPos::new(
+                        i32::try_from(rng.below(24)).expect("test span fits i32") - 12,
+                        i32::try_from(rng.below(24)).expect("test span fits i32") - 12,
+                    );
+                    let radius = u8::try_from(rng.below(5)).expect("test radius fits u8");
+                    let ticket = match rng.below(5) {
+                        0 => ChunkTicket::full_chunks(radius),
+                        1 => ChunkTicket::simulated_full_chunks(radius),
+                        2 => ChunkTicket::player(radius, radius / 2),
+                        3 => ChunkTicket::full_chunks_with_entity_ticking(radius, radius / 2),
+                        _ => ChunkTicket::loading(ChunkTicketLevel::for_full_chunk_radius(radius)),
+                    };
+                    manager.add_ticket(pos, ticket);
+                    live.push((pos, ticket));
+                }
+
+                // Removals matter on their own: they are the only direction that
+                // can raise a level, so they decide whether a stale cell survives.
+                for _ in 0..5 {
+                    if live.is_empty() {
+                        break;
+                    }
+                    let index = rng
+                        .below(u32::try_from(live.len()).expect("test ticket count fits u32"))
+                        as usize;
+                    let (pos, ticket) = live.swap_remove(index);
+                    assert!(manager.remove_ticket(pos, ticket));
+                }
+
+                assert_matches_reference(&mut manager, &format!("case {case} round {round}"));
+            }
+        }
+    }
+
+    #[test]
+    fn frontier_propagation_matches_square_stamping_at_the_propagation_cutoff() {
+        // The strongest level propagates the full `MAX_LEVEL_RAW` rings, so this
+        // is where the frontier has to stop for the same reason the stamped
+        // square did: one ring further would exceed the level cap.
+        let mut manager = ChunkTicketManager::new();
+        manager.add_ticket(
+            ChunkPos::new(0, 0),
+            ChunkTicket::loading(ChunkTicketLevel::STRONGEST),
+        );
+        assert_matches_reference(&mut manager, "single strongest ticket");
+
+        // Offset by less than two full cones, so the two fields interleave
+        // instead of merely abutting.
+        manager.add_ticket(
+            ChunkPos::new(i32::from(MAX_LEVEL_RAW), 3),
+            ChunkTicket::loading(ChunkTicketLevel::STRONGEST),
+        );
+        assert_matches_reference(&mut manager, "two overlapping strongest tickets");
+    }
+
+    #[test]
+    fn simulation_ticket_weaker_than_block_ticking_stays_on_its_own_chunk() {
+        // `simulated_full_chunks(0)` is the one ticket whose simulation level is
+        // past the block-ticking cutoff. It still claims its own position, but it
+        // must not reach a neighbour -- the frontier's "seed but do not
+        // propagate" case.
+        let mut manager = ChunkTicketManager::new();
+        let center = ChunkPos::new(0, 0);
+        manager.add_ticket(center, ChunkTicket::simulated_full_chunks(0));
+        assert_matches_reference(&mut manager, "simulation level past block ticking");
+
+        assert_eq!(
+            manager.get_simulation_level(center),
+            Some(ChunkTicketLevel::FULL_CHUNK)
+        );
+        assert!(!is_block_ticking(manager.get_simulation_level(center)));
+        assert_eq!(manager.get_simulation_level(ChunkPos::new(1, 0)), None);
     }
 
     #[test]
